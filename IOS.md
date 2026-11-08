@@ -85,12 +85,22 @@ BUNDLE_ID=com.fqapp.fqapp IPA=/tmp/pack/fqapp_ios_unsigned.ipa ./your-sign-scrip
 5. **听书音频走 `mode=plain`**：智能朗读 / 真人讲书的 playinfo
    (`/api/v1/audio/books/{id}/chapters/{cid}`) 同样只补 `key_hex`、返回上游
    加密直连地址。`audioContentMode` 在 iOS 传 `mode=plain`，Rust 的
-   `audio.rs::handle_chapter_info` 取第一条加密流，复用 `video.rs` 的
-   `download_and_save` 把整章缓存进 `src/`（音频是单文件 ISO-BMFF + `enca`
-   AAC 轨，CENC 解密代码原生支持 `enca→mp4a`），返回不带 `encrypt_info` 的
+   `audio.rs::handle_chapter_info` 复用 `video.rs` 的 `download_and_save` 把整章
+   缓存进 `src/`（音频是单文件 ISO-BMFF + `enca` AAC 轨，CENC 解密代码原生
+   支持 `enca→mp4a`），返回不带 `encrypt_info` 的
    `{"code":0,"data":[{"main_url":"/src/…"}]}`，`parsePlayinfoSource` 直接走
-   明文分支。明文流、密钥缺失或缓存失败都自动回退原响应；缓存 id 带
-   `tone_id`，避免不同音色串味。
+   明文分支。
+   - `encrypted_audio_candidates` 同时接受 `data[].video_model` 与
+     `data.video_model_datas[].video_model` 两种信封；只在 `media_type` 明确为
+     `video` 时跳过；`key_hex` 缺失时现场从 `spade_a` 再派生一次；并收集
+     `main_url` + `backup_url` 逐个重试（每个候选独立缓存 id）。真人讲书与
+     智能朗读只是 `tone_id` 不同，上游会返回不同结构的流，早期「只认第一条
+     且必须是 audio」的实现会让智能朗读漏匹配。
+   - 真正明文的流（无加密流候选）保留原响应直连播放。**找到加密流但全部
+     缓存失败时不再静默回退加密直连地址**——iOS 解不开，只会得到一句无意义
+     的「播放出错」——改为返回 `code 4903 / IOS_AUDIO_CACHE_FAILED`，
+     `audio_play_error.dart` 把它与 iOS 适配器的 4901 / 4902 一起映射成
+     可操作的具体文案。
 6. **图标与应用名**：`scripts/generate_ios_app_icon.py` 从 `assets/branding/app_icon_source.png` 生成 1024 无 alpha 图标（复用 Android 生成器的「去纸张外框」逻辑），`CFBundleDisplayName` 设为「什锦铺」。
 7. **关掉 Swift Package Manager**：`flutter config --no-enable-swift-package-manager`（Xcode 27 + SPM 有已知构建失败）。
 
@@ -105,11 +115,13 @@ BUNDLE_ID=com.fqapp.fqapp IPA=/tmp/pack/fqapp_ios_unsigned.ipa ./your-sign-scrip
   缓存完成（比 Android 慢）。若 Rust 缓存失败会回退成加密直连地址，此时
   适配器发 `errorCode 4901`，界面显示「该片源暂不支持」而不是笼统的
   「播放失败」（见 `playback_issue.dart`）。
-- **智能朗读 / 真人讲书**：真机提示「播放出错，请稍后重试」来自
-  `audio_playback_controller.dart` 的兜底，根因与短剧相同——加密音频被
-  iOS 适配器拒绝。现走 `mode=plain` 服务端解密，首次起播同样要等整章缓存完；
-  若缓存失败则回退原加密地址并显示 4901 对应提示。系统朗读（本地
-  `flutter_tts`）是独立链路，不依赖这条路径。
+- **智能朗读 / 真人讲书**：第二轮包（run 42505749165）真机反馈「真人讲书已能播，
+  智能朗读仍提示播放出错，只能用系统朗读」。两者共用同一条 playinfo 请求、
+  只是 `tone_id` 不同，因此最可能是上游对合成音色返回了另一形状 / 另一 CDN
+  的流，早期只取第一条加密流的匹配漏掉了它。第三轮已放宽信封与字段匹配、
+  补 `backup_url` 重试，并把 4901 / 4902 / 4903 映射成具体文案——**若仍有
+  问题，屏幕上的新文案可直接区分「服务端没解出来」与「播放器没加载出来」**。
+  首次起播需等整章缓存完。系统朗读（本地 `flutter_tts`）是独立链路。
 - **离线加密缓存仍不可用**：`file://` + keyHex 需要端上 CENC 解密，而
   `desktop_media` / `desktop_fetch` 被 `#[cfg(target_os = "windows")]` 门住，
   iOS 静态库里没有 `fq_desktop_media_open`。同样走 4901 明确提示。要补齐需

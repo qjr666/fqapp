@@ -88,15 +88,34 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
             .await?;
         patch_playinfo_keys(&mut payload);
         if plain_mode {
-            if let Some((url, key_hex)) = encrypted_audio_stream(&payload) {
-                if let Ok(key) = hex::decode(key_hex.as_str()) {
-                    if key.len() == 16 {
-                        let cache_id = audio_cache_id(&chapter_id, &tone_id);
-                        if let Ok(served) = crate::endpoints::video::download_and_save(
-                            ctx, &cache_id, &url, &key,
-                        )
+            let candidates = encrypted_audio_candidates(&payload);
+            if candidates.is_empty() {
+                // A genuinely clear stream needs no cache at all. Keeping the
+                // upstream answer lets iOS open the signed URL directly.
+                log::info!(
+                    "audio plain: chapter {} tone {} has no encrypted stream; keeping the upstream answer",
+                    chapter_id,
+                    tone_id
+                );
+            } else {
+                let base_id = audio_cache_id(&chapter_id, &tone_id);
+                let mut last_err = String::from("no candidate attempted");
+                for (index, (url, key_hex)) in candidates.iter().enumerate() {
+                    let Ok(key) = hex::decode(key_hex.as_str()) else {
+                        last_err = "undecodable key hex".to_string();
+                        continue;
+                    };
+                    if key.len() != 16 {
+                        last_err = format!("key length {}", key.len());
+                        continue;
+                    }
+                    // One id per candidate: a partial or undecodable download
+                    // must not be reused when the backup URL is tried next.
+                    let cache_id = format!("{base_id}_{index}");
+                    match crate::endpoints::video::download_and_save(ctx, &cache_id, url, &key)
                         .await
-                        {
+                    {
+                        Ok(served) => {
                             // `parsePlayinfoSource` walks the last envelope's
                             // `data` list. A bare `main_url` without
                             // `encrypt_info` hits its plain-stream branch, and
@@ -110,35 +129,98 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                                 }],
                             }));
                         }
+                        Err(err) => {
+                            log::warn!(
+                                "audio plain: chapter {} tone {} candidate {}/{} failed: {}",
+                                chapter_id,
+                                tone_id,
+                                index + 1,
+                                candidates.len(),
+                                err
+                            );
+                            last_err = err;
+                        }
                     }
                 }
+                // Falling back to the encrypted direct URL is worse than an
+                // explicit error: iOS has no on-device CENC decryption, so the
+                // player would fail with a meaningless generic message. The
+                // Dart side turns 4903 into an actionable hint.
+                log::warn!(
+                    "audio plain: chapter {} tone {} exhausted {} candidates (last: {})",
+                    chapter_id,
+                    tone_id,
+                    candidates.len(),
+                    last_err
+                );
+                return Ok(json!({
+                    "code": 0,
+                    "data": [{
+                        "item_id": chapter_id.clone(),
+                        "code": 4903,
+                        "message": "IOS_AUDIO_CACHE_FAILED",
+                    }],
+                }));
             }
-            // Plain streams, a missing key or a failed download all keep the
-            // original answer: never claim the cache succeeded when it did not.
         }
         Ok(payload)
     })
 }
 
-/// Picks the first CENC-encrypted stream from a patched playinfo answer.
+/// Collects every encrypted stream of a patched playinfo answer, paired with
+/// a usable 16-byte key, in the order the player should try them.
 ///
-/// Audio chapters are single-file ISO-BMFF with an `enca` AAC track, the same
-/// CENC AES-CTR scheme the video cache already serves. Returns `None` for a
-/// plain stream or an unfamiliar shape so the caller leaves the payload alone.
-fn encrypted_audio_stream(payload: &Value) -> Option<(String, String)> {
-    let rows = payload.get("data")?.as_array()?;
-    for row in rows {
-        let Some(entry) = row.as_object() else { continue; };
-        let Some(raw_model) = entry.get("video_model").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(model) = crate::endpoints::video::decode_video_model_str(raw_model) else {
-            continue;
-        };
-        if let Some(media_type) = model.get("media_type").and_then(|v| v.as_str()) {
-            if media_type != "audio" {
-                continue;
+/// The upstream switches envelope shape by book genre / tone: the chapter
+/// endpoint normally answers `data[].video_model`, while some 智能朗读 voices
+/// arrive in the mget-style `data.video_model_datas[].video_model`. Accepting
+/// both, tolerating an absent `media_type`, deriving the key from `spade_a`
+/// when `key_hex` is missing, and retrying `backup_url` is what keeps an
+/// unfamiliar voice from silently falling back to the encrypted direct URL
+/// that iOS cannot play.
+fn encrypted_audio_candidates(payload: &Value) -> Vec<(String, String)> {
+    let mut models: Vec<Map<String, Value>> = Vec::new();
+    match payload.get("data") {
+        Some(Value::Array(rows)) => {
+            for row in rows {
+                if let Some(raw) = row.get("video_model").and_then(|v| v.as_str()) {
+                    if let Some(model) = crate::endpoints::video::decode_video_model_str(raw) {
+                        models.push(model);
+                    }
+                }
             }
+        }
+        Some(Value::Object(data)) => {
+            if let Some(rows) = data
+                .get("video_model_datas")
+                .and_then(|v| v.as_array())
+            {
+                for row in rows {
+                    if let Some(raw) = row.get("video_model").and_then(|v| v.as_str()) {
+                        if let Some(model) =
+                            crate::endpoints::video::decode_video_model_str(raw)
+                        {
+                            models.push(model);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    for model in models {
+        // Only an explicitly video-flavoured answer is out of scope. TTS
+        // voices have been seen without `media_type`, and skipping those was
+        // what left 智能朗读 on the encrypted direct URL.
+        if model
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|kind| kind == "video")
+        {
+            continue;
         }
         let Some(list) = model.get("video_list").and_then(|v| v.as_array()) else {
             continue;
@@ -156,24 +238,37 @@ fn encrypted_audio_stream(payload: &Value) -> Option<(String, String)> {
                 continue;
             }
             // `patch_playinfo_keys` derives a 16-byte key from `spade_a`.
-            let Some(key) = info.get("key_hex").and_then(|v| v.as_str()) else {
-                continue;
+            // Some envelopes carry the key under a slightly different shape,
+            // so derive it here too instead of dropping the whole voice.
+            let key_hex = match info.get("key_hex").and_then(|v| v.as_str()) {
+                Some(raw) if raw.len() == 32 => raw.to_string(),
+                _ => {
+                    let spade = info
+                        .get("spade_a")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let derived = crate::endpoints::video::derive_spade_content_key(spade);
+                    if derived.len() != 16 {
+                        continue;
+                    }
+                    hex::encode(&derived)
+                }
             };
-            if key.len() != 32 {
-                continue;
+            for field in ["main_url", "backup_url"] {
+                let Some(url) = item.get(field).and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if url.is_empty() {
+                    continue;
+                }
+                let candidate = (url.to_string(), key_hex.clone());
+                if seen.insert(candidate.clone()) {
+                    out.push(candidate);
+                }
             }
-            let candidate = item
-                .get("main_url")
-                .and_then(|v| v.as_str())
-                .or_else(|| item.get("backup_url").and_then(|v| v.as_str()));
-            let Some(url) = candidate else { continue; };
-            if url.is_empty() {
-                continue;
-            }
-            return Some((url.to_string(), key.to_string()));
         }
     }
-    None
+    out
 }
 
 /// Cache entries live in `src_dir`; ids must stay inside one path segment.
