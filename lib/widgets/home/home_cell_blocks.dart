@@ -194,6 +194,7 @@ class _HomeRankCellState extends State<HomeRankCell> {
               height: HomeRankShelf.loadingHeight(
                 context,
                 constraints.maxWidth,
+                flat: true,
               ),
               child: Center(
                 child: SizedBox(
@@ -208,7 +209,14 @@ class _HomeRankCellState extends State<HomeRankCell> {
             ),
           )
         else
-          HomeRankShelf(books: books, onOpen: widget.onOpen, stepped: stepped),
+          HomeRankShelf(
+            books: books,
+            onOpen: widget.onOpen,
+            stepped: stepped,
+            // 立体书脊看不清封面：首页排行榜统一走纯封面轨道，
+            // 名次、信息行与翻页器由 _buildFlat 原样保留。
+            flat: true,
+          ),
       ],
     );
   }

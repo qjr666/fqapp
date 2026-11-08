@@ -1,8 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
+
 import '../models/media_item.dart';
 import 'api_client.dart';
+
+/// iOS 只能播放 Rust 服务端按 Range 解密后的 `/_session/<cap>/src/*` 明文流：
+/// media_kit 没有端上 CENC 解密能力，而 `mode=stream` 会让核心直接返回
+/// 上游直连的加密地址（video_url 是 https、key_hex 非空），iOS 解不开。
+/// 去掉 mode 后核心走 `download_and_save`，返回 `/src/<id>.mp4` 且不带
+/// key_hex，播放器再通过回环服务拿明文；代价是首次起播要等服务端缓存完。
+/// Android / Windows 有端上解密，继续用 stream 模式。
+String? get videoContentMode =>
+    (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) ? null : 'stream';
 
 class EpisodeVariant {
   final String name;

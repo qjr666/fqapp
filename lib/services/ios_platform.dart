@@ -19,10 +19,14 @@ bool get isIOSPlatform =>
 /// 让 `native_player.dart` 与 `system_tts.dart` 的 Android 通道契约原封不动
 /// 复用 —— 不需要写 Swift 插件，也不需要改这两个文件。
 ///
-/// 视频走 media_kit（iOS 原生库由 `media_kit_libs_ios_video` 提供），播放源
-/// 是 Rust 回环服务的 `/_session/<cap>/src/*`：服务端已按 Range 解密成明文，
-/// 播放器发普通 GET 即可。朗读走 `flutter_tts`（AVSpeechSynthesizer），
-/// 其 iOS pod 早已在 `ios/Podfile.lock` 里，无需新增原生代码。
+/// 视频走 media_kit（iOS 原生库由 `media_kit_libs_ios_video` 提供）。iOS 没有
+/// 端上 CENC 解密能力，所以取流侧（`episode_source_cache.dart` 的
+/// `videoContentMode`）在 iOS 上不带 `mode=stream`：Rust 先缓存整集，再由
+/// 回环服务把 `/_session/<cap>/src/*` 按 Range 解密成明文交给播放器。
+///
+/// 朗读走 `flutter_tts`（AVSpeechSynthesizer）。iOS 必须显式激活音频会话并
+/// 设为 playback，否则侧边静音键一开就完全无声；同时要按 FIFO 管理预排的
+/// 两句 utterance，否则 done 事件的 id 会错位、朗读状态机卡死。
 class IosPlatform {
   IosPlatform._();
   static final instance = IosPlatform._();
@@ -30,40 +34,73 @@ class IosPlatform {
   final _events = <String, StreamController<dynamic>>{};
   final _players = <int, _IosPlayer>{};
   final _tts = FlutterTts();
-  String? _utterance;
+
+  /// `SystemTtsPlayback` 一次预排两句，而 AVSpeechSynthesizer 会把 utterance
+  /// 入队。done / start / range 必须按先进先出还给正确的 id。
+  final _utteranceQueue = <String>[];
   int _nextId = 1000000;
   bool _initialized = false;
+  bool _mediaKitReady = false;
 
   Stream<dynamic> events(String name) =>
       (_events[name] ??= StreamController<dynamic>.broadcast()).stream;
 
   void _emit(String name, dynamic event) => _events[name]?.add(event);
 
+  void _ttsEvent(String type, {int? rangeStart}) {
+    if (_utteranceQueue.isEmpty) return;
+    final id = type == 'done'
+        ? _utteranceQueue.removeAt(0)
+        : _utteranceQueue.first;
+    _emit('fqapp/system_tts_events', <String, dynamic>{
+      'type': type,
+      'id': id,
+      if (rangeStart != null) 'start': rangeStart,
+    });
+  }
+
   Future<void> initialize() async {
     if (_initialized || !isIOSPlatform) return;
     // 先接管通道：即使 media_kit 的 iOS 原生库没装好，系统朗读仍能用。
     PlatformChannels.invoke = invoke;
     PlatformChannels.events = events;
-    // 与 Windows 适配器保持同一套事件协议：只发 done / error。
-    // SystemTtsPlayback 的定时泵会在 _begin 里自行调度，done 事件负责推进
-    // 下一句高亮与自动下一章，因此不发 start 也能完整工作。
-    _tts.setCompletionHandler(() {
-      final id = _utterance;
-      if (id != null) {
-        _utterance = null;
-        _emit('fqapp/system_tts_events', {'type': 'done', 'id': id});
-      }
+
+    // iOS 默认音频会话是 ambient，静音键会直接把朗读静音。必须激活共享
+    // 会话、设为 playback，并阻止每句念完自动 deactivate（第二句就哑了）。
+    try {
+      await _tts.setSharedInstance(true);
+      await _tts.setIosAudioCategory(
+        IosTextToSpeechAudioCategory.playback,
+        <IosTextToSpeechAudioCategoryOptions>[
+          IosTextToSpeechAudioCategoryOptions.duckOthers,
+          IosTextToSpeechAudioCategoryOptions.allowBluetoothA2DP,
+        ],
+      );
+      await _tts.autoStopSharedSession(false);
+    } catch (error) {
+      debugPrint('[ios-tts] audio session setup failed: $error');
+    }
+
+    _tts.setStartHandler(() => _ttsEvent('start'));
+    _tts.setCompletionHandler(() => _ttsEvent('done'));
+    // willSpeakRangeOfSpeechString：恢复精确到字的高亮（可选增强，缺了
+    // SystemTtsPlayback 会退化为整句高亮）。
+    _tts.setProgressHandler((String _text, int start, int _end, String _word) {
+      _ttsEvent('range', rangeStart: start);
     });
     _tts.setErrorHandler((dynamic _) {
-      final id = _utterance;
-      _utterance = null;
+      if (_utteranceQueue.isEmpty) return;
+      final id = _utteranceQueue.removeAt(0);
       _emit('fqapp/system_tts_events', {'type': 'error', 'id': id});
     });
+
     try {
       MediaKit.ensureInitialized();
-    } catch (_) {
-      // 视频原生库不可用不该让整个启动装配失败：此时 native_player 的
-      // create 会抛错并按 error 事件降级，阅读与朗读保持可用。
+      _mediaKitReady = true;
+    } catch (error) {
+      // 不再静默吞掉：真机上原生库缺失时 create 会给出可诊断的错误码。
+      _mediaKitReady = false;
+      debugPrint('[ios-player] MediaKit init failed: $error');
     }
     _initialized = true;
   }
@@ -123,6 +160,7 @@ class IosPlatform {
             args['cdnUrl'] as String,
             args['keyHex'] as String,
             (args['startPositionMs'] as num?)?.toInt() ?? 0,
+            _mediaKitReady,
           ),
         );
         return {'playerId': id};
@@ -185,13 +223,21 @@ class IosPlatform {
           ],
         };
       case 'initialize':
+        // 先清队列再 stop：stop 有可能触发 completion 回调，顺序反了会把
+        // 上一句的 done 误发给新一句。
+        _utteranceQueue.clear();
         await _tts.stop();
-        _utterance = null;
         final engine = args['engine'];
         if (engine is String && engine.startsWith('{')) {
           final voice = (jsonDecode(engine) as Map).cast<String, String>();
           await _tts.setVoice(voice);
         } else {
+          final available = await _tts.isLanguageAvailable('zh-CN');
+          if (available != true) {
+            // 少数设备没预装中文语音；不抛错（入口会变成「不支持朗读」），
+            // 只留日志，让系统用默认 voice 尽力读。
+            debugPrint('[ios-tts] zh-CN voice unavailable: $available');
+          }
           await _tts.setLanguage('zh-CN');
         }
         // AVSpeechUtterance.rate 的取值是 0..1，默认 0.5；Windows SAPI 那边
@@ -201,10 +247,18 @@ class IosPlatform {
         await _tts.setSpeechRate((rate * .5).clamp(0.0, 1.0));
         return 300;
       case 'speak':
-        _utterance = args['id'] as String;
+        // Android 的 QUEUE_FLUSH / QUEUE_ADD：flutter_tts 的 setQueueMode 是
+        // Android only，iOS 用「首句先 stop，后续交给 AVSpeechSynthesizer
+        // 自身入队」来模拟。忽略 queue 会让两句的 done 全部记到后一句上。
+        if (args['queue'] != true) {
+          _utteranceQueue.clear();
+          await _tts.stop();
+        }
+        final id = args['id'] as String;
+        _utteranceQueue.add(id);
         final result = await _tts.speak(args['text'] as String);
         if (result == 0) {
-          _utterance = null;
+          _utteranceQueue.remove(id);
           throw PlatformException(
             code: 'tts_failed',
             message: 'iOS 语音不可用，请在系统设置里安装中文语音',
@@ -216,7 +270,7 @@ class IosPlatform {
       case 'shutdown':
         // iOS 没有 Android 那套音频焦点机制，pause 与 stop 等价：停引擎但
         // 不动 session，SystemTtsPlayback.resume() 会重新起播同一句。
-        _utterance = null;
+        _utteranceQueue.clear();
         await _tts.stop();
         return null;
       case 'settings':
@@ -259,20 +313,44 @@ class _IosPlayer {
   final ready = Completer<void>();
   bool disposed = false;
 
-  Future<void> open(String url, String key, int startMs) async {
+  void _fail(int code, String message) {
+    if (!ready.isCompleted) ready.completeError(StateError(message));
+    if (!disposed) {
+      emit({
+        'playerId': id,
+        'type': 'error',
+        'value': {
+          'message': message,
+          // playback_issue.dart 用私有错误码映射成安全、可操作的文案，
+          // 原始 message 永不上屏（可能含签名地址）。
+          'errorCode': code,
+          'httpStatusCode': null,
+        },
+      });
+    }
+  }
+
+  Future<void> open(
+    String url,
+    String key,
+    int startMs,
+    bool mediaKitReady,
+  ) async {
     ready.future.ignore();
     try {
-      // Rust 的 /_session/<cap>/src/* 回环服务是按 Range 在服务端解密的，
-      // 交给播放器的是明文流。响应里始终带 key_hex（见 video.rs:182），
-      // 但这条路径**必须忽略它**，否则会去找一个 iOS 上不存在的解密后端。
+      if (!mediaKitReady) {
+        _fail(4902, 'iOS 播放组件未加载');
+        return;
+      }
+      // 主路径：Rust 回环服务已按 Range 解密成明文（URL 同时带
+      // /_session/ 与 /src/）。其它形态 —— 上游直连加密 URL、file://
+      // 离线缓存 —— 都需要端上 CENC 解密，而 Rust 的 desktop_media /
+      // desktop_fetch 只在 Windows 编译，iOS 静态库里没有对应符号。
       final serverDecrypted =
           url.contains('/_session/') && url.contains('/src/');
       if (key.isNotEmpty && !serverDecrypted) {
-        // 上游直连加密源与 file:// 离线缓存都需要端上 CENC 解密。Rust 的
-        // desktop_media / desktop_fetch 被 #[cfg(target_os = "windows")] 门住，
-        // 且依赖只在 Windows 启用的 reqwest/blocking，iOS 静态库里没有
-        // fq_desktop_media_open 符号。明确提示，不要静默播出一堆乱码。
-        throw StateError('该加密片源在 iOS 上暂不支持，请切换清晰度或稍后重试');
+        _fail(4901, '该加密片源需要端上解密');
+        return;
       }
       if (disposed) return;
       await player.open(Media(url), play: false);
@@ -286,20 +364,7 @@ class _IosPlayer {
       emit({'playerId': id, 'type': 'created', 'value': id});
       _size();
     } catch (error) {
-      if (!ready.isCompleted) ready.completeError(StateError('无法打开媒体'));
-      if (!disposed) {
-        emit({
-          'playerId': id,
-          'type': 'error',
-          'value': {
-            'message': error is StateError
-                ? error.message
-                : '媒体加载失败，请检查网络或重试',
-            'errorCode': null,
-            'httpStatusCode': null,
-          },
-        });
-      }
+      if (!disposed) _fail(4902, '媒体加载失败，请检查网络或重试');
     }
   }
 

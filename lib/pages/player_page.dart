@@ -271,7 +271,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
             ApiClient.instance.content(
               episode.itemId,
               tab: '短剧',
-              mode: 'stream',
+              mode: videoContentMode,
             )),
       ),
     );

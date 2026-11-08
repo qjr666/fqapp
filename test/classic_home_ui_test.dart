@@ -338,7 +338,7 @@ void main() {
         ),
       );
       expect(find.byType(HomeRankShelf), findsOneWidget);
-      expect(find.byKey(const Key('home_rank_flat_rail')), findsNothing);
+      expect(find.byKey(const Key('home_rank_flat_rail')), findsOneWidget);
       expect(find.text('01 / RANKING'), findsOneWidget);
       final cellState = tester.state(find.byType(HomeRankCell));
       await tester.tap(find.text('完本榜'));
@@ -368,7 +368,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(tester.state(find.byType(HomeRankCell)), same(cellState));
       expect(find.byType(HomeRankShelf), findsOneWidget);
-      expect(find.byKey(const Key('home_rank_flat_rail')), findsNothing);
+      expect(find.byKey(const Key('home_rank_flat_rail')), findsOneWidget);
       expect(find.text('完本1'), findsOneWidget);
       style.value = AppThemeStyle.classic;
       await tester.pumpAndSettle();

@@ -193,10 +193,14 @@ class HomeRankShelf extends StatefulWidget {
     );
   }
 
-  static double loadingHeight(BuildContext context, double width) {
+  static double loadingHeight(
+    BuildContext context,
+    double width, {
+    bool flat = false,
+  }) {
     final geometry = _geometryFor(context, width);
     final scaler = MediaQuery.textScalerOf(context);
-    return (degraded ? geometry.flatHeight : geometry.height) +
+    return (flat || degraded ? geometry.flatHeight : geometry.height) +
         _InfoRow.heightFor(scaler) +
         _Pager.heightFor(scaler);
   }

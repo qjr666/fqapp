@@ -16,6 +16,14 @@ enum PlaybackIssue {
   unavailable('视频暂时无法播放', '播放地址可能已失效，可以重试获取新地址，或切换其他剧集。'),
   service('播放服务暂时不可用', '请稍后重试，或先观看其他剧集。'),
   decoding('视频解析失败', '视频格式可能不受支持，可以重试或切换其他剧集。'),
+  iosEncrypted(
+    '该片源暂不支持',
+    '此片源需要端上解密，iPhone 上暂无法播放；可重试或换其他剧集。',
+  ),
+  iosPlayerUnavailable(
+    '播放器未就绪',
+    '播放组件加载失败，请重启应用后重试。',
+  ),
   unknown('播放失败', '请重试，或切换其他剧集。'),
   empty('暂无可播放剧集', '返回后试试其他作品。');
 
@@ -28,6 +36,10 @@ enum PlaybackIssue {
     if (error is OfflineEpisodeUnavailable) return offline;
     if (error is TimeoutException) return timeout;
     if (error is NativePlaybackException) {
+      // iOS 适配器用私有错误码标记可诊断的失败；原始 message 可能带签名
+      // 地址或后端响应体，只映射成固定文案，绝不上屏。
+      if (error.errorCode == 4901) return iosEncrypted;
+      if (error.errorCode == 4902) return iosPlayerUnavailable;
       final status = error.httpStatusCode;
       // The native crypto reader also reports successful 200/206 responses.
       // Those describe the last transfer, not the cause of a decoder failure.

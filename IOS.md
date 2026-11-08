@@ -64,36 +64,51 @@ BUNDLE_ID=com.fqapp.fqapp IPA=/tmp/pack/fqapp_ios_unsigned.ipa ./your-sign-scrip
 3. **视频与听书走进程内适配器**：iOS 不写 Swift 插件，而是沿用 Windows 的
    `PlatformChannels.invoke/events` 注入点（`lib/services/platform_channel.dart`），
    由 `lib/services/ios_platform.dart` 在 `runApp` 之前接管两条自定义通道：
-   - `fqapp/native_player` → media_kit（`media_kit_libs_ios_video` 提供 iOS 原生库），
-     播放源是 Rust 回环服务的 `/_session/<cap>/src/*` 明文流；
-   - `fqapp/system_tts` → `flutter_tts`（AVSpeechSynthesizer），pod 早已在
-     `ios/Podfile.lock` 里。
+   - `fqapp/native_player` → media_kit（`media_kit_libs_ios_video` 提供 iOS 原生库，
+     CI 产物里可见 `Payload/Runner.app/Frameworks/Mpv.framework`）；
+   - `fqapp/system_tts` → `flutter_tts`（AVSpeechSynthesizer）。iOS 必须显式
+     `setSharedInstance(true)` + `setIosAudioCategory(playback, …)` +
+     `autoStopSharedSession(false)`，否则静音键一开朗读完全无声；还要按 FIFO
+     管理预排的两句 utterance，否则 `done` 事件 id 错位会让朗读卡住。
    `native_player.dart` / `system_tts.dart` 的契约一行未改，渲染由
    `lib/services/video_surface.dart` 按平台分派（Android 用 `Texture`，
    Windows / iOS 用 media_kit 的 `Video`）。
-4. **图标与应用名**：`scripts/generate_ios_app_icon.py` 从 `assets/branding/app_icon_source.png` 生成 1024 无 alpha 图标（复用 Android 生成器的「去纸张外框」逻辑），`CFBundleDisplayName` 设为「什锦铺」。
-5. **关掉 Swift Package Manager**：`flutter config --no-enable-swift-package-manager`（Xcode 27 + SPM 有已知构建失败）。
+4. **iOS 取流不带 `mode=stream`**：`episode_source_cache.dart` 的
+   `videoContentMode` 在 iOS 返回 `null`。带 `mode=stream` 时 Rust 会把**上游直连
+   的 CENC 加密地址 + key_hex** 原样返回（`video.rs:180-193`），而 iOS 没有端上
+   解密能力，播放必然失败。去掉 mode 后 Rust 走 `download_and_save`，返回
+   `/src/<id>.mp4`（无 key_hex），`ApiClient.absoluteUrl` 补上
+   `/_session/<cap>/` 前缀，`serve_src_file` 按 Range 解密成明文再交给播放器。
+   代价是**首次起播要等服务端把整集缓存完**；Android / Windows 仍用 stream。
+5. **图标与应用名**：`scripts/generate_ios_app_icon.py` 从 `assets/branding/app_icon_source.png` 生成 1024 无 alpha 图标（复用 Android 生成器的「去纸张外框」逻辑），`CFBundleDisplayName` 设为「什锦铺」。
+6. **关掉 Swift Package Manager**：`flutter config --no-enable-swift-package-manager`（Xcode 27 + SPM 有已知构建失败）。
 
 ## 已知限制
 
-> 下面这套 iOS 播放/朗读实现是照既有 Windows 适配器的契约写的，**尚未经过
-> iOS 编译与真机验证**。首次构建请以 `.github/workflows/ios-ipa.yml` 的日志为准。
+> 首个 IPA（run 42497981164）已在 Xcode 27.2 / `xcode-27` runner 上**编译通过**
+> 并成功真机自签安装；以下限制来自该次真机反馈后的修复，**仍需再跑一轮 CI
+> 与真机复测**确认。
 
-- **视频与系统朗读已接入**，但以下能力在 iOS 没有原生实现，适配器返回中性值或
-  走既有降级：悬浮窗、SMTC / 前台媒体卡片、亮度与音量手势、系统朗读设置跳转、
-  WSOLA 变速引擎（改走 media_kit 内建变速与 `AVSpeechUtterance.rate`）。
-- **加密片源不可用**：上游直连加密 URL 与 `file://` 离线缓存需要端上 CENC
-  解密，而 Rust 的 `desktop_media` / `desktop_fetch` 被
-  `#[cfg(target_os = "windows")]` 门住，还依赖只在 Windows 启用的
-  `reqwest/blocking`，iOS 静态库里没有 `fq_desktop_media_open`。适配器会
-  明确提示「该加密片源在 iOS 上暂不支持」。在线主路径 `/_session/<cap>/src/*`
-  由服务端解密成明文，不受影响。要补齐需先在 Rust 侧放开这两个 cfg，并给
-  iOS target 启用 `reqwest` 的 blocking feature。
-- `media_kit_libs_ios_video` 固定在 1.1.4（2023 年的预编译 xcframework），
-  Xcode 27 / iOS 27 SDK 的兼容性需在 CI 上确认；链接失败时不要改用
-  `media_kit_libs_video` umbrella，那会破坏 Android 包体约束。
+- **在线短剧**：已改走服务端缓存 + 按 Range 解密的明文流，首次起播需等整集
+  缓存完成（比 Android 慢）。若 Rust 缓存失败会回退成加密直连地址，此时
+  适配器发 `errorCode 4901`，界面显示「该片源暂不支持」而不是笼统的
+  「播放失败」（见 `playback_issue.dart`）。
+- **离线加密缓存仍不可用**：`file://` + keyHex 需要端上 CENC 解密，而
+  `desktop_media` / `desktop_fetch` 被 `#[cfg(target_os = "windows")]` 门住，
+  iOS 静态库里没有 `fq_desktop_media_open`。同样走 4901 明确提示。要补齐需
+  在 Rust 侧放开这两个 cfg 并给 iOS target 启用相应 feature。
+- **系统朗读**：已配置 AVAudioSession（静音键不再静音）、按 FIFO 发
+  `start` / `range` / `done`；但 WSOLA 变速引擎、系统朗读设置跳转、音频焦点
+  事件仍走既有降级，改由 `AVSpeechUtterance.rate` 与 media_kit 内建变速承担。
+- **其余降级**：悬浮窗、SMTC / 前台媒体卡片、亮度与音量手势在 iOS 返回中性值。
 - `Info.plist` 已加 `NSAllowsLocalNetworking`（Rust 回环 HTTP）与
-  `UIBackgroundModes: audio`（后台听书），后台行为仍需真机验证。
+  `UIBackgroundModes: audio`；App 挂起后 tokio listener 会停止 accept，
+  后台连续播放/朗读仍可能断流。
+- `ios/Podfile.lock` 已同步为 CI 生成的版本（含 `media_kit_libs_ios_video 1.0.4`）。
+  `media_kit_libs_ios_video` 的 pub 版本固定在 1.1.4；不要改用
+  `media_kit_libs_video` umbrella，那会把全平台 libmpv 打进 Android APK。
+- 首页「推荐 / 小说」排行榜已强制走 `HomeRankShelf(flat: true)`，直接显示
+  圆角封面，`NO.00N` 名次、信息行与翻页器保留。
 - 分享、导入导出、LAN 分享、番茄书架导入等只在 Android 上验证过。
 - 免费 Apple ID 签名 7 天过期，过期后 App 闪退，重跑一次自签脚本即可。
 

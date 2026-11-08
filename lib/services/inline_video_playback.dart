@@ -241,7 +241,11 @@ class InlineVideoPlayback {
   Future<Map<String, dynamic>> _content(String itemId) {
     final loader = contentLoader;
     if (loader != null) return loader(itemId, _tab);
-    return ApiClient.instance.content(itemId, tab: _tab, mode: 'stream');
+    return ApiClient.instance.content(
+      itemId,
+      tab: _tab,
+      mode: videoContentMode,
+    );
   }
 
   /// The series directory, cached once per page session. A single-episode
