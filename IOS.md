@@ -61,15 +61,40 @@ BUNDLE_ID=com.fqapp.fqapp IPA=/tmp/pack/fqapp_ios_unsigned.ipa ./your-sign-scrip
      - `-Wl,-export_dynamic`，主可执行文件默认不导出全局符号，dlsym 会找不到 Rust 入口；
    - `lib/services/rust_bootstrap_io.dart` 在 iOS 上改用 `ExternalLibrary.process()`（接缝在 `lib/services/backend_transport.dart` 的 `runtimeInitializer`）。
 2. **桌面专用依赖**（`webview_windows` / `smtc_windows` / `window_manager` / `screen_retriever`）不需要条件导入：它们都能在 iOS 上编译，运行时只在 `isWindowsDesktop` 分支调用。
-3. **视频/听书入口降级**：iOS 没有 `fqapp/native_player`（ExoPlayer）通道实现，`lib/services/platform_capabilities.dart` 的 `supportsVideoPlayback` 在 iOS 为 false，`main.dart` 把短剧页换成「暂不支持」占位，避免触发缺失插件。阅读页的亮度/常亮/墨水屏通道缺失时已有 `MissingPluginException` 降级，不需要 Swift。
+3. **视频与听书走进程内适配器**：iOS 不写 Swift 插件，而是沿用 Windows 的
+   `PlatformChannels.invoke/events` 注入点（`lib/services/platform_channel.dart`），
+   由 `lib/services/ios_platform.dart` 在 `runApp` 之前接管两条自定义通道：
+   - `fqapp/native_player` → media_kit（`media_kit_libs_ios_video` 提供 iOS 原生库），
+     播放源是 Rust 回环服务的 `/_session/<cap>/src/*` 明文流；
+   - `fqapp/system_tts` → `flutter_tts`（AVSpeechSynthesizer），pod 早已在
+     `ios/Podfile.lock` 里。
+   `native_player.dart` / `system_tts.dart` 的契约一行未改，渲染由
+   `lib/services/video_surface.dart` 按平台分派（Android 用 `Texture`，
+   Windows / iOS 用 media_kit 的 `Video`）。
 4. **图标与应用名**：`scripts/generate_ios_app_icon.py` 从 `assets/branding/app_icon_source.png` 生成 1024 无 alpha 图标（复用 Android 生成器的「去纸张外框」逻辑），`CFBundleDisplayName` 设为「什锦铺」。
 5. **关掉 Swift Package Manager**：`flutter config --no-enable-swift-package-manager`（Xcode 27 + SPM 有已知构建失败）。
 
 ## 已知限制
 
-- **视频不可用**：短剧/漫剧页显示「暂不支持」。要补需要接 `media_kit` + `media_kit_libs_ios_video`（播放走 Rust 的 `/src/*` 回环解密），或写 AVPlayer 插件。
-- **听书不可用**：`fqapp/system_tts`（Android TextToSpeech + WSOLA）没有 iOS 实现，界面上会提示「当前平台不支持系统朗读」；可以接 `flutter_tts`（AVSpeechSynthesizer）补上。
-- 分享、导入导出、后台播放、LAN 分享、番茄书架导入等只在 Android 上验证过。
+> 下面这套 iOS 播放/朗读实现是照既有 Windows 适配器的契约写的，**尚未经过
+> iOS 编译与真机验证**。首次构建请以 `.github/workflows/ios-ipa.yml` 的日志为准。
+
+- **视频与系统朗读已接入**，但以下能力在 iOS 没有原生实现，适配器返回中性值或
+  走既有降级：悬浮窗、SMTC / 前台媒体卡片、亮度与音量手势、系统朗读设置跳转、
+  WSOLA 变速引擎（改走 media_kit 内建变速与 `AVSpeechUtterance.rate`）。
+- **加密片源不可用**：上游直连加密 URL 与 `file://` 离线缓存需要端上 CENC
+  解密，而 Rust 的 `desktop_media` / `desktop_fetch` 被
+  `#[cfg(target_os = "windows")]` 门住，还依赖只在 Windows 启用的
+  `reqwest/blocking`，iOS 静态库里没有 `fq_desktop_media_open`。适配器会
+  明确提示「该加密片源在 iOS 上暂不支持」。在线主路径 `/_session/<cap>/src/*`
+  由服务端解密成明文，不受影响。要补齐需先在 Rust 侧放开这两个 cfg，并给
+  iOS target 启用 `reqwest` 的 blocking feature。
+- `media_kit_libs_ios_video` 固定在 1.1.4（2023 年的预编译 xcframework），
+  Xcode 27 / iOS 27 SDK 的兼容性需在 CI 上确认；链接失败时不要改用
+  `media_kit_libs_video` umbrella，那会破坏 Android 包体约束。
+- `Info.plist` 已加 `NSAllowsLocalNetworking`（Rust 回环 HTTP）与
+  `UIBackgroundModes: audio`（后台听书），后台行为仍需真机验证。
+- 分享、导入导出、LAN 分享、番茄书架导入等只在 Android 上验证过。
 - 免费 Apple ID 签名 7 天过期，过期后 App 闪退，重跑一次自签脚本即可。
 
 ## 与 Android 构建的关系

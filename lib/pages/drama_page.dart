@@ -1,5 +1,6 @@
 import '../widgets/video_player_chrome.dart';
 import '../services/desktop_platform.dart';
+import '../services/video_surface.dart';
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -3995,17 +3996,10 @@ class _InlineVideoLayer extends StatelessWidget {
                     rect: layout.video,
                     child: RotatedBox(
                       quarterTurns: playback.rotation.value,
-                      child: isWindowsDesktop
-                          ? DesktopPlatform.instance.videoSurface(
-                              textureId,
-                              key: ValueKey('drama_inline_${item.id}'),
-                            )
-                          : Texture(
-                              key: ValueKey(
-                                'drama_inline_texture_${item.kind}_${item.id}',
-                              ),
-                              textureId: textureId,
-                            ),
+                      child: platformVideoSurface(
+                        textureId,
+                        key: ValueKey('drama_inline_${item.id}'),
+                      ),
                     ),
                   ),
                 // A first-frame event may beat the size event. Never expose a

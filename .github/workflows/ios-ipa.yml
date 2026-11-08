@@ -1,0 +1,313 @@
+# iOS IPA —— 在 GitHub 托管的 macOS runner 上编译 fqapp 的 iOS 版。
+#
+# 为什么需要这个文件：仓库已有 android-apk.yml / windows.yml，但 iOS 端只有
+# IOS.md 里的手工步骤，没有 CI。Windows 本机无法产出 IPA（Xcode / codesign
+# 只在 macOS），所以把「编译 + 打包」放到云端 runner，Windows 侧只负责 push。
+#
+# 版本依据（见 IOS.md）：Flutter 3.47.9、Rust 1.99.1、CocoaPods 1.17.0、
+# Xcode 27.2。actions/runner-images 的 xcode-27-arm64 镜像恰好预装了这几项。
+#
+# ── 默认行为：产出「未签名 IPA」，零配置 ────────────────────────────────
+#   Actions → iOS IPA → Run workflow，跑完在 Artifacts 里下载
+#   fqapp-ios-unsigned-<sha>.ipa。未签名 IPA 不能直接装进 iPhone，但可以在
+#   Windows 上用 Sideloadly / AltStore 配合免费 Apple ID 自签后安装
+#   （7 天有效，过期重签一次）。这是不买 Apple Developer Program 的唯一路径。
+#
+# ── 可选：产出「已签名 IPA」 ────────────────────────────────────────────
+#   勾上 signed=true 并配置以下 Repository Secrets（Settings → Secrets and
+#   variables → Actions）。缺任意一个会自动回退到未签名构建，不会让 job 失败：
+#     IOS_P12_BASE64        Distribution/Development 证书 .p12 的 base64
+#     IOS_P12_PASSWORD      .p12 导出密码
+#     IOS_PROVISION_BASE64  .mobileprovision 的 base64
+#     IOS_TEAM_ID           Apple Developer Team ID，形如 ABCDE12345
+#     IOS_PROFILE_NAME      描述文件在 Apple 后台显示的名称
+#     IOS_SIGN_IDENTITY     证书名，如 "Apple Distribution" 或 "Apple Development"
+#     IOS_EXPORT_METHOD     development / ad-hoc / app-store
+#   注意：Bundle ID 固定在 ios/Runner.xcodeproj 里是 com.fqapp.fqapp，
+#   描述文件必须匹配这个 ID；要换 ID 请先改工程文件再生成描述文件。
+#
+# ── 费用 ────────────────────────────────────────────────────────────────
+#   公开仓库的标准 macOS runner 免费；私有仓库的 macOS 分钟按约 10 倍系数
+#   扣额度（2026 年约 $0.062/分钟），一次构建大致 10–20 分钟。
+#   默认只在手动触发和 ios-v* tag 时运行，避免每次 push 都烧分钟；
+#   想改常驻触发，把下面 push.branches 那两行取消注释即可。
+
+name: iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'macOS runner 镜像（xcode-27 自带 Xcode 27.2 / Rust 1.99.1）'
+        type: choice
+        options:
+          - xcode-27
+          - macos-26
+          - macos-15
+        default: xcode-27
+      signed:
+        description: '产出已签名 IPA（需要配置签名 Secrets，缺失时自动回退未签名）'
+        type: boolean
+        default: false
+  push:
+    # branches: [master]
+    tags: ['ios-v*']
+  # 想让 iOS 相关改动在 PR 上也验证，取消下面这段注释；注意会消耗 macOS 分钟。
+  # pull_request:
+  #   paths:
+  #     - 'ios/**'
+  #     - 'lib/**'
+  #     - 'rust/**'
+  #     - 'scripts/build_rust_ios.sh'
+  #     - 'pubspec.lock'
+  #     - '.github/workflows/ios-ipa.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: '3.47.9'
+  FRB_VERSION: '2.13.0'
+  RUST_VERSION: '1.99.1'
+  RUST_TARGET: 'aarch64-apple-ios'
+  XCODE_APP: '/Applications/Xcode_27.2.app'
+  BUNDLE_ID: 'com.fqapp.fqapp'
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: '2'
+  COCOAPODS_DISABLE_STATS: 'true'
+
+jobs:
+  ipa:
+    name: Build iOS IPA
+    runs-on: ${{ inputs.runner || 'xcode-27' }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # 镜像里 27.1 是默认 Xcode，而 IOS.md 要求 27.2（Flutter 3.47 的适配
+      # 补丁针对 Xcode 27）。先显式选中，再打印版本，方便日志里核对工具链。
+      - name: Select Xcode and print toolchain
+        run: |
+          app="$XCODE_APP"
+          if [ ! -d "$app" ]; then
+            app="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1 || true)"
+          fi
+          if [ -z "$app" ] || [ ! -d "$app" ]; then
+            app='/Applications/Xcode.app'
+          fi
+          echo "Using $app"
+          sudo xcode-select -s "$app/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          echo "DEVELOPER_DIR=$app/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Pin Rust and add the iOS target
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$RUST_TARGET"
+          rustup default "$RUST_VERSION"
+          rustc --version
+          cargo --version
+          rustup target list --installed | grep "$RUST_TARGET"
+
+      - name: Cache Cargo registry and Rust build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ios-rust-${{ env.RUST_VERSION }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: ios-rust-${{ env.RUST_VERSION }}-
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      # IOS.md 第 5 条：Xcode 27 + Swift Package Manager 有已知构建失败，
+      # 这个工程走 CocoaPods，必须显式关掉 SPM。
+      - name: Configure Flutter
+        run: |
+          flutter config --no-enable-swift-package-manager --no-analytics
+          flutter --version
+          pod --version
+
+      - name: Resolve Dart dependencies
+        run: flutter pub get --enforce-lockfile
+
+      # 新增 media_kit_libs_ios_video 后，插件的 .symlinks 由 pub get 生成。
+      # 显式跑一次 pod install 让新 pod 进 Podfile.lock；flutter build ios 也会
+      # 做这件事，但提前跑能把依赖解析的失败和 Xcode 链接失败区分开。
+      - name: Resolve iOS pods
+        run: |
+          cd ios
+          pod install || { pod repo update && pod install; }
+
+      # Secrets 在 fork PR 里不可用；把它们先放进 env 再判断，缺料时静默
+      # 回退未签名，而不是让整个 job 挂掉。
+      - name: Decide build mode
+        id: mode
+        env:
+          REQUESTED: ${{ inputs.signed }}
+          P12: ${{ secrets.IOS_P12_BASE64 }}
+          P12_PW: ${{ secrets.IOS_P12_PASSWORD }}
+          PROVISION: ${{ secrets.IOS_PROVISION_BASE64 }}
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          if [ "$REQUESTED" = "true" ] \
+             && [ -n "$P12" ] && [ -n "$P12_PW" ] \
+             && [ -n "$PROVISION" ] && [ -n "$TEAM_ID" ]; then
+            echo 'signed=true' >> "$GITHUB_OUTPUT"
+            echo 'Mode: signed IPA'
+          else
+            echo 'signed=false' >> "$GITHUB_OUTPUT"
+            echo 'Mode: unsigned IPA (no signing secrets / not requested)'
+          fi
+
+      - name: Import signing material
+        if: steps.mode.outputs.signed == 'true'
+        env:
+          P12: ${{ secrets.IOS_P12_BASE64 }}
+          P12_PW: ${{ secrets.IOS_P12_PASSWORD }}
+          PROVISION: ${{ secrets.IOS_PROVISION_BASE64 }}
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          KEYCHAIN_PW: 'ios-ci-keychain'
+        run: |
+          security create-keychain -p "$KEYCHAIN_PW" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PW" build.keychain
+          echo "$P12" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k build.keychain \
+            -P "$P12_PW" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PW" build.keychain > /dev/null
+          security list-keychains -d user -s build.keychain login.keychain
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$PROVISION" | base64 -d > \
+            "$HOME/Library/MobileDevice/Provisioning Profiles/ci.mobileprovision"
+          # 仓库不入库 Signing.xcconfig（ios/.gitignore 已忽略），CI 里临时生成。
+          printf 'DEVELOPMENT_TEAM = %s\n' "$TEAM_ID" > ios/Flutter/Signing.xcconfig
+          security find-identity -v -p codesigning
+
+      # ios/Flutter/Release.xcconfig 用 -force_load 链接这个静态库，
+      # 第一次 clone 不跑脚本会在链接阶段报找不到 libfqapi_core.a。
+      - name: Build the Rust static library for iOS
+        run: bash scripts/build_rust_ios.sh
+
+      - name: Verify the static library
+        run: |
+          lib='ios/Frameworks/libfqapi_core.a'
+          test -s "$lib" || { echo "missing $lib" >&2; exit 1; }
+          ls -lh "$lib"
+          lipo -info "$lib"
+
+      - name: Build unsigned Runner.app
+        if: steps.mode.outputs.signed != 'true'
+        run: flutter build ios --release --no-codesign
+
+      - name: Pack unsigned IPA
+        if: steps.mode.outputs.signed != 'true'
+        run: |
+          mkdir -p out
+          app='build/ios/iphoneos/Runner.app'
+          test -d "$app" || { echo "missing $app" >&2; exit 1; }
+          pack="$RUNNER_TEMP/ipa-pack"
+          rm -rf "$pack" && mkdir -p "$pack/Payload"
+          ditto "$app" "$pack/Payload/Runner.app"
+          (cd "$pack" && zip -qry "$GITHUB_WORKSPACE/out/fqapp-ios-unsigned.ipa" Payload)
+          ls -lh out/
+
+      - name: Write ExportOptions for the signed build
+        if: steps.mode.outputs.signed == 'true'
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          PROFILE_NAME: ${{ secrets.IOS_PROFILE_NAME }}
+          SIGN_IDENTITY: ${{ secrets.IOS_SIGN_IDENTITY }}
+          EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
+        run: |
+          method="${EXPORT_METHOD:-development}"
+          identity="${SIGN_IDENTITY:-Apple Development}"
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>${method}</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>${identity}</string>
+            <key>provisioningProfiles</key>
+            <dict><key>${BUNDLE_ID}</key><string>${PROFILE_NAME}</string></dict>
+            <key>stripSwiftSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # YAML 块标量会剥掉公共缩进，传给 shell 时结束标记 PLIST 正好顶格，
+          # heredoc 才能闭合；内容行留下的两空格缩进 plutil 完全接受。
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Build signed IPA
+        if: steps.mode.outputs.signed == 'true'
+        run: |
+          mkdir -p out
+          flutter build ipa --release \
+            --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
+          cp build/ios/ipa/*.ipa out/ 2>/dev/null || {
+            echo 'flutter build ipa did not emit an .ipa under build/ios/ipa/' >&2
+            find build/ios -maxdepth 3 -name '*.ipa' -o -name '*.xcarchive' >&2
+            exit 1
+          }
+          ls -lh out/
+
+      - name: Verify IPA
+        run: |
+          ipa="$(ls out/*.ipa | head -1)"
+          test -s "$ipa" || { echo 'no IPA produced' >&2; exit 1; }
+          unzip -t "$ipa" | tail -3
+          unzip -l "$ipa" | grep -E 'Payload/Runner.app/Runner|Info.plist' | head -5
+          echo "IPA=$ipa" >> "$GITHUB_ENV"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: fqapp-ios-${{ steps.mode.outputs.signed == 'true' && 'signed' || 'unsigned' }}-${{ github.sha }}
+          path: out/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      # pod install 可能更新 Podfile.lock（新加的 media_kit_libs_ios_video）。
+      # 把锁文件一并传出来，下载后提交回仓库，Android / Windows CI 的
+      # --enforce-lockfile 才不会与新依赖打架。
+      - name: Upload refreshed lock files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-lockfiles-${{ github.sha }}
+          path: |
+            pubspec.lock
+            ios/Podfile.lock
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Summary
+        run: |
+          echo "### iOS IPA 构建完成" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 模式：${{ steps.mode.outputs.signed == 'true' && '已签名' || '未签名（需自签后安装）' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runner：\`${{ inputs.runner || 'xcode-27' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Xcode：\`$(xcodebuild -version | head -1)\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 产物：\`$(basename "$IPA")\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "已知功能限制见 IOS.md：短剧/漫剧视频与系统听书在 iOS 上暂不可用。" >> "$GITHUB_STEP_SUMMARY"

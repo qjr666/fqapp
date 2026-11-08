@@ -2,6 +2,7 @@ import 'services/audio_downloader.dart';
 import 'widgets/desktop_app_frame.dart';
 import 'services/native_player.dart';
 import 'services/desktop_platform.dart';
+import 'services/ios_platform.dart';
 import 'services/platform_capabilities.dart';
 import 'services/platform_channel.dart';
 import 'package:flutter/material.dart';
@@ -79,6 +80,10 @@ Future<void> main() async {
 Future<void> _prepareRuntime() async {
   registerPortedUiLicenses();
   if (isWindowsDesktop) await DesktopPlatform.instance.initialize();
+  // iOS 的 media_kit / flutter_tts 进程内适配器必须在 runApp 之前装好，
+  // 否则 native_player 与 system_tts 会去找不存在的 Swift 插件并抛
+  // MissingPluginException。装配失败由 main() 的 try/catch 兜住，不挡界面。
+  if (isIOSPlatform) await IosPlatform.instance.initialize();
   // 应用内日志：接管 debugPrint 与 FlutterError.onError，未处理异步异常由
   // [main] 的 runZonedGuarded 捕获；文件持久化异步开启，失败只退回内存模式。
   AppLog.instance.install();
@@ -670,8 +675,8 @@ class _RootShellState extends State<RootShell> {
               scrollController: _homeScroll,
               cueLoader: ApiClient.instance.searchCue,
             ),
-            // iOS 首版没有原生播放器实现：把短剧页换成「暂不支持」占位，
-            // 避免进入播放页时触发缺失的 fqapp/native_player 通道。
+            // iOS 已由 IosPlatform 的进程内 media_kit 适配器实现
+            // fqapp/native_player；这里保留占位只兜底 web 等无播放器平台。
             if (supportsVideoPlayback)
               const DramaPage()
             else

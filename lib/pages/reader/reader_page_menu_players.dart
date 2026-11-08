@@ -8,8 +8,8 @@ extension _ReaderPageMenuPlayers on _ReaderPageState {
     bookId: widget.bookId,
     builder: (context, currentBook) {
       final match = _videoMatch;
-      // iOS 首版没有原生播放器（见 platform_capabilities.dart），观影入口点了
-      // 只会推出一个起不来的播放页，所以与短剧 tab 一致整体不展示。
+      // iOS 的 media_kit 进程内适配器已实现 native_player 契约，观影入口与
+      // 短剧 tab 一起由 supportsVideoPlayback 统一放开。
       final video = supportsVideoPlayback &&
           _preferences.showVideoButton &&
           match != null &&
