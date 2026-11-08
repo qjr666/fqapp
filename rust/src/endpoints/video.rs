@@ -1269,9 +1269,13 @@ async fn unsigned_get(ctx: &Ctx, url: &str, user_agent: &str, max_bytes: usize) 
 /// or an endless body from filling the disk or memory.
 const MAX_VIDEO_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Total timeout for one video download, matching the 15 s the shared
-/// upstream transport applies to the old whole-body download.
-const VIDEO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
+/// Total timeout for one whole-file cache download. The 15 s that matched the
+/// old whole-body upstream request is not enough for the iOS path: without
+/// on-device CENC decryption the core must download the *entire* episode / audio
+/// chapter into `src/` before it can serve a single decrypted range. A short
+/// deadline made `download_and_save` fail and silently fall back to the raw
+/// encrypted upstream URL, which iOS cannot play at all.
+const VIDEO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A plain reqwest client for streaming video downloads. The shared upstream
 /// transport (`upstream/http.rs`) only exposes a whole-body API, so the
@@ -1356,7 +1360,11 @@ async fn stream_download_to_file_with_cap(
 }
 
 /// Downloads the MP4, saves it to src/, and returns the served path.
-async fn download_and_save(
+///
+/// Also used by `endpoints::audio` for encrypted AAC chapters: the CENC
+/// machinery below handles `enca` tracks as well as `encv`, and the cached
+/// bytes stay encrypted while `serve_src_file` decrypts ranges on demand.
+pub(crate) async fn download_and_save(
     ctx: &Ctx,
     video_id: &str,
     video_url: &str,

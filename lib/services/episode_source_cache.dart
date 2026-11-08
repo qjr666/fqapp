@@ -15,6 +15,13 @@ import 'api_client.dart';
 String? get videoContentMode =>
     (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) ? null : 'stream';
 
+/// 智能朗读 / 真人讲书的音频同样是上游 CENC 加密直连流：playinfo 只补
+/// `key_hex`，iOS 没有端上解密。带上 `mode=plain` 让核心把整章缓存进
+/// `src/`，返回 `/_session/<cap>/src/*`，由回环服务按 Range 解密成明文。
+/// Android / Windows 不带该参数，继续把加密直连地址交给原生播放器。
+String? get audioContentMode =>
+    (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) ? 'plain' : null;
+
 class EpisodeVariant {
   final String name;
   final String url;

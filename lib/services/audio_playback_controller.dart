@@ -706,13 +706,25 @@ class _AudioPlaybackController extends ChangeNotifier
   /// 404/403 和业务错误码（NO_THIS_TONE、审核失败）再试也是同一个结果，
   /// 只有网络中断、HTTP 408/429/5xx 值得再来一次——否则一次失败最坏要拖
   /// 近三分钟才告诉用户。
-  Future<AudioSource> _fetchSource(String itemId, String toneId) =>
-      retryTransient(
-        () => ApiClient.instance
-            .audioSource(itemId, bookId: _bookId, toneId: toneId)
-            .timeout(const Duration(seconds: 30)),
-        shouldRetry: isTransientNetworkFailure,
-      );
+  Future<AudioSource> _fetchSource(String itemId, String toneId) {
+    final mode = audioContentMode;
+    // iOS 取流要等核心把整章缓存并按 Range 解密，30 秒会在下载中途掐断；
+    // 其他平台只是取一个地址，保持原来的短超时。
+    final timeout = mode == null
+        ? const Duration(seconds: 30)
+        : iosCacheFetchTimeout;
+    return retryTransient(
+      () => ApiClient.instance
+          .audioSource(
+            itemId,
+            bookId: _bookId,
+            toneId: toneId,
+            mode: mode,
+          )
+          .timeout(timeout),
+      shouldRetry: isTransientNetworkFailure,
+    );
+  }
 
   /// 离线命中：当前音色下这一章已下载完成时直接用本地文件。
   ///

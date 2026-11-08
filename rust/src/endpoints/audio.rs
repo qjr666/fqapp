@@ -64,11 +64,15 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
             ));
         }
         let tone_id = default_val(&params.get_str("tone_id"), "0");
+        // iOS has no on-device CENC decryption. Callers that need a plain
+        // stream ask for `mode=plain`; Android / Windows omit it and keep the
+        // direct upstream URL + key_hex contract unchanged.
+        let plain_mode = params.get_str("mode") == "plain";
 
         let mut p = reading_724_params();
         set_param(&mut p, "book_id", book_id);
-        set_param(&mut p, "item_ids", chapter_id);
-        set_param(&mut p, "tone_id", tone_id);
+        set_param(&mut p, "item_ids", chapter_id.clone());
+        set_param(&mut p, "tone_id", tone_id.clone());
         set_param(&mut p, "req_type", "0");
         set_param(&mut p, "is_local_book", "false");
 
@@ -83,8 +87,108 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
             })
             .await?;
         patch_playinfo_keys(&mut payload);
+        if plain_mode {
+            if let Some((url, key_hex)) = encrypted_audio_stream(&payload) {
+                if let Ok(key) = hex::decode(key_hex.as_str()) {
+                    if key.len() == 16 {
+                        let cache_id = audio_cache_id(&chapter_id, &tone_id);
+                        if let Ok(served) = crate::endpoints::video::download_and_save(
+                            ctx, &cache_id, &url, &key,
+                        )
+                        .await
+                        {
+                            // `parsePlayinfoSource` walks the last envelope's
+                            // `data` list. A bare `main_url` without
+                            // `encrypt_info` hits its plain-stream branch, and
+                            // `_mediaUrl` expands `/src/...` into the loopback
+                            // URL that `serve_src_file` decrypts per Range.
+                            return Ok(json!({
+                                "code": 0,
+                                "data": [{
+                                    "item_id": chapter_id.clone(),
+                                    "main_url": served,
+                                }],
+                            }));
+                        }
+                    }
+                }
+            }
+            // Plain streams, a missing key or a failed download all keep the
+            // original answer: never claim the cache succeeded when it did not.
+        }
         Ok(payload)
     })
+}
+
+/// Picks the first CENC-encrypted stream from a patched playinfo answer.
+///
+/// Audio chapters are single-file ISO-BMFF with an `enca` AAC track, the same
+/// CENC AES-CTR scheme the video cache already serves. Returns `None` for a
+/// plain stream or an unfamiliar shape so the caller leaves the payload alone.
+fn encrypted_audio_stream(payload: &Value) -> Option<(String, String)> {
+    let rows = payload.get("data")?.as_array()?;
+    for row in rows {
+        let Some(entry) = row.as_object() else { continue; };
+        let Some(raw_model) = entry.get("video_model").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(model) = crate::endpoints::video::decode_video_model_str(raw_model) else {
+            continue;
+        };
+        if let Some(media_type) = model.get("media_type").and_then(|v| v.as_str()) {
+            if media_type != "audio" {
+                continue;
+            }
+        }
+        let Some(list) = model.get("video_list").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for stream in list {
+            let Some(item) = stream.as_object() else { continue; };
+            let Some(info) = item.get("encrypt_info").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            if !info
+                .get("encrypt")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            // `patch_playinfo_keys` derives a 16-byte key from `spade_a`.
+            let Some(key) = info.get("key_hex").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if key.len() != 32 {
+                continue;
+            }
+            let candidate = item
+                .get("main_url")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("backup_url").and_then(|v| v.as_str()));
+            let Some(url) = candidate else { continue; };
+            if url.is_empty() {
+                continue;
+            }
+            return Some((url.to_string(), key.to_string()));
+        }
+    }
+    None
+}
+
+/// Cache entries live in `src_dir`; ids must stay inside one path segment.
+/// The tone is part of the id because different voices are different files.
+fn audio_cache_id(chapter_id: &str, tone_id: &str) -> String {
+    format!("audio_{chapter_id}_{tone_id}")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Derives key_hex for every encrypted stream inside an embedded

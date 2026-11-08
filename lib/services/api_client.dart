@@ -37,6 +37,10 @@ import 'request_gate.dart';
 export '../models/homepage_page.dart';
 part 'reader_video_api.dart';
 
+/// iOS 取流要等 Rust 把整集 / 整章缓存并按 Range 解密，默认 20 秒的 API
+/// 超时会在下载中途把请求取消。只用于视频和音频这两条取流路径。
+const Duration iosCacheFetchTimeout = Duration(seconds: 180);
+
 /// API client talking to the local Rust core.
 ///
 /// Uses the same `/api/*` bridge the web UI uses, so responses are already
@@ -502,8 +506,13 @@ class ApiClient {
     String? toneId,
     String? mode,
   }) async {
+    // iOS 视频取流是唯一省略 mode 的短剧调用（见 episode_source_cache.dart
+    // 的 videoContentMode）：核心此时要先下载整集再按 Range 解密，普通
+    // 20 秒超时必然赶不上。其他平台显式传 'stream'，走原来的短超时。
+    final caching = mode == null && (tab == '短剧' || tab == '漫剧');
     final r = await _get(
       _contentUrl(itemId, tab: tab, toneId: toneId, mode: mode),
+      timeout: caching ? iosCacheFetchTimeout : null,
     );
     return _decodeAsync(r);
   }
@@ -518,6 +527,7 @@ class ApiClient {
     String itemId, {
     String? toneId,
     String? bookId,
+    String? mode,
   }) async {
     final trimmedBookId = bookId?.trim() ?? '';
     if (trimmedBookId.isEmpty) {
@@ -535,12 +545,15 @@ class ApiClient {
     // tone_id — the legacy video_model/mget bridge ignores it, which made
     // switching 智能朗读 a no-op. A pure-TTS book answers NO_THIS_TONE for
     // tone 0, so the caller falls back to the first selectable voice.
+    // `mode=plain` 只在 iOS 上出现：核心把加密音频缓存进 src/，返回可按
+    // Range 解密的回环流。此时请求要等整章下载完，不能套用 20 秒超时。
     final response = await _get(
       _url(
         '/api/v1/audio/books/${Uri.encodeComponent(trimmedBookId)}'
         '/chapters/${Uri.encodeComponent(itemId)}',
-        {'tone_id': selectedTone},
+        {'tone_id': selectedTone, 'mode': ?mode},
       ),
+      timeout: mode == 'plain' ? iosCacheFetchTimeout : null,
     );
     final statusCode = response.statusCode;
     final bodyBytes = response.bodyBytes;

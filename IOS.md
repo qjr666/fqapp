@@ -80,19 +80,36 @@ BUNDLE_ID=com.fqapp.fqapp IPA=/tmp/pack/fqapp_ios_unsigned.ipa ./your-sign-scrip
    `/src/<id>.mp4`（无 key_hex），`ApiClient.absoluteUrl` 补上
    `/_session/<cap>/` 前缀，`serve_src_file` 按 Range 解密成明文再交给播放器。
    代价是**首次起播要等服务端把整集缓存完**；Android / Windows 仍用 stream。
-5. **图标与应用名**：`scripts/generate_ios_app_icon.py` 从 `assets/branding/app_icon_source.png` 生成 1024 无 alpha 图标（复用 Android 生成器的「去纸张外框」逻辑），`CFBundleDisplayName` 设为「什锦铺」。
-6. **关掉 Swift Package Manager**：`flutter config --no-enable-swift-package-manager`（Xcode 27 + SPM 有已知构建失败）。
+   `VIDEO_DOWNLOAD_TIMEOUT` 相应从 15 秒放宽到 120 秒，`ApiClient` 对这条取流
+   用 180 秒超时——否则整集还没下完请求就被取消，Rust 会静默回退成加密直连。
+5. **听书音频走 `mode=plain`**：智能朗读 / 真人讲书的 playinfo
+   (`/api/v1/audio/books/{id}/chapters/{cid}`) 同样只补 `key_hex`、返回上游
+   加密直连地址。`audioContentMode` 在 iOS 传 `mode=plain`，Rust 的
+   `audio.rs::handle_chapter_info` 取第一条加密流，复用 `video.rs` 的
+   `download_and_save` 把整章缓存进 `src/`（音频是单文件 ISO-BMFF + `enca`
+   AAC 轨，CENC 解密代码原生支持 `enca→mp4a`），返回不带 `encrypt_info` 的
+   `{"code":0,"data":[{"main_url":"/src/…"}]}`，`parsePlayinfoSource` 直接走
+   明文分支。明文流、密钥缺失或缓存失败都自动回退原响应；缓存 id 带
+   `tone_id`，避免不同音色串味。
+6. **图标与应用名**：`scripts/generate_ios_app_icon.py` 从 `assets/branding/app_icon_source.png` 生成 1024 无 alpha 图标（复用 Android 生成器的「去纸张外框」逻辑），`CFBundleDisplayName` 设为「什锦铺」。
+7. **关掉 Swift Package Manager**：`flutter config --no-enable-swift-package-manager`（Xcode 27 + SPM 有已知构建失败）。
 
 ## 已知限制
 
 > 首个 IPA（run 42497981164）已在 Xcode 27.2 / `xcode-27` runner 上**编译通过**
-> 并成功真机自签安装；以下限制来自该次真机反馈后的修复，**仍需再跑一轮 CI
-> 与真机复测**确认。
+> 并成功真机自签安装；真机反馈「短剧全部播放失败 / 没法听书」后的两轮修复
+> **仍需再跑一轮 CI 与真机复测**确认。第二轮含 Rust 改动，未经本机编译
+> （Windows 无 Rust / Flutter 工具链），以 CI 日志为准。
 
 - **在线短剧**：已改走服务端缓存 + 按 Range 解密的明文流，首次起播需等整集
   缓存完成（比 Android 慢）。若 Rust 缓存失败会回退成加密直连地址，此时
   适配器发 `errorCode 4901`，界面显示「该片源暂不支持」而不是笼统的
   「播放失败」（见 `playback_issue.dart`）。
+- **智能朗读 / 真人讲书**：真机提示「播放出错，请稍后重试」来自
+  `audio_playback_controller.dart` 的兜底，根因与短剧相同——加密音频被
+  iOS 适配器拒绝。现走 `mode=plain` 服务端解密，首次起播同样要等整章缓存完；
+  若缓存失败则回退原加密地址并显示 4901 对应提示。系统朗读（本地
+  `flutter_tts`）是独立链路，不依赖这条路径。
 - **离线加密缓存仍不可用**：`file://` + keyHex 需要端上 CENC 解密，而
   `desktop_media` / `desktop_fetch` 被 `#[cfg(target_os = "windows")]` 门住，
   iOS 静态库里没有 `fq_desktop_media_open`。同样走 4901 明确提示。要补齐需
