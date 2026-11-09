@@ -460,6 +460,8 @@ struct Candidate {
     id: String,
     /// 智能朗读的音色 id（`tts_tones`）。
     tts_tones: Vec<String>,
+    /// App 真正会拿去请求的音色：可选集非空时等于可选集。
+    probe_tones: Vec<String>,
     /// 真人讲书主播的 abook_id（`audio_tones`）。
     narrators: Vec<String>,
     /// 智能朗读实际要用的原著书号（TTS 走原著的章节 id）。
@@ -507,12 +509,21 @@ async fn resolve_candidates(srv: &Arc<Server>) -> Vec<Candidate> {
         };
         let data = data_of(&detail);
         let tts = tone_ids(&detail, "tts_tones");
+        let offline = tone_ids(&detail, "offline_tts_tones");
         let narrators = narrator_ids(&detail);
         let novel = related_novel_id(&detail);
         println!(
             "=== book {id}: tts_tones={:?} narrators={:?} related_novel={:?}",
             tts, narrators, novel
         );
+        // App 的 `_selectableTone` 会把离线音色和主播 id 排除在可选列表外。
+        // 如果可选集是空的，智能朗读面板就没有任何可选的声音——真机看到
+        // 的「无法使用」其实是「根本没得选」。
+        let selectable: Vec<&String> = tts
+            .iter()
+            .filter(|tone| !offline.contains(*tone) && !narrators.contains(*tone))
+            .collect();
+        println!("[tones] offline_tts_tones={:?} selectable={:?}", offline, selectable);
         println!(
             "[tones] tts_tones[0] = {}",
             json_line(data.get("tts_tones").and_then(|v| v.as_array()).and_then(|l| l.first()))
@@ -534,12 +545,113 @@ async fn resolve_candidates(srv: &Arc<Server>) -> Vec<Candidate> {
         }
         out.push(Candidate {
             id: id.clone(),
+            probe_tones: if selectable.is_empty() {
+                tts.clone()
+            } else {
+                selectable.iter().map(|tone| (*tone).clone()).collect()
+            },
             tts_tones: tts,
             narrators,
             related_novel: novel,
         });
     }
     out
+}
+
+/// 递归找第一个同名键。
+fn find_first(value: &Value, key: &str, depth: usize) -> Option<Value> {
+    if depth > 6 {
+        return None;
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map.get(key) {
+                return Some(found.clone());
+            }
+            for child in map.values() {
+                if let Some(found) = find_first(child, key, depth + 1) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(found) = find_first(item, key, depth + 1) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// 一条章节的 id。
+fn chapter_id(value: &Value) -> Option<String> {
+    let map = value.as_object()?;
+    for key in ["item_id", "itemId"] {
+        match map.get(key) {
+            Some(Value::String(text)) if !text.is_empty() => return Some(text.clone()),
+            Some(Value::Number(num)) => return Some(num.to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 按 **App 的读法** 取目录里的章节 id。
+///
+/// App 走 `/api/v1/books/{id}/directory`，Dart 侧 `parseDirectory` 先找
+/// `chapterListWithVolume`（每卷一个 `chapterList`），再退回
+/// `episodes` / `item_data_list` / `lists` / `item_list`。探针必须用同一套
+/// 读法：否则验的是 App 根本不会请求的章节 id，绿灯也是假的。
+fn app_directory_chapters(value: &Value) -> Vec<String> {
+    if let Some(Value::Array(volumes)) = find_first(value, "chapterListWithVolume", 0) {
+        let mut out = Vec::new();
+        for volume in volumes {
+            let Some(volume) = volume.as_object() else {
+                continue;
+            };
+            let list = volume
+                .get("chapterList")
+                .or_else(|| volume.get("chapter_list"));
+            let Some(Value::Array(chapters)) = list else {
+                continue;
+            };
+            for chapter in chapters {
+                if let Some(id) = chapter_id(chapter) {
+                    out.push(id);
+                }
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    for key in ["episodes", "item_data_list", "lists", "item_list"] {
+        if let Some(Value::Array(items)) = find_first(value, key, 0) {
+            let out: Vec<String> = items.iter().filter_map(chapter_id).collect();
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// App 打开一本书时拿到的第一个章节 id。
+async fn app_first_chapter(srv: &Arc<Server>, book_id: &str) -> Option<String> {
+    let directory = srv.handler("directory")?;
+    let params = Params::from_pairs(vec![("book_id".to_string(), book_id.to_string())]);
+    let value = directory(&srv.ctx, &params).await.ok()?;
+    let chapters = app_directory_chapters(&value);
+    println!(
+        "[directory] {book_id}: {} chapters (app parser), first={:?}",
+        chapters.len(),
+        chapters.first()
+    );
+    chapters.first().cloned()
 }
 
 /// 取一本书的第一章 id。
@@ -648,17 +760,22 @@ async fn live_audio_cache_probe() {
     // ---- 智能朗读：TTS 走的是**原著**的章节 id，音色取 tts_tones ----
     // App 选中智能朗读后会切到关联原著，用原著的章节 id 请求，tone_id 是
     // tts_tones 里的 id（绝不会是 0——0 属于真人讲书那一支）。
-    for candidate in candidates.iter().filter(|c| !c.tts_tones.is_empty()) {
+    for candidate in candidates.iter().filter(|c| !c.probe_tones.is_empty()) {
         let tts_book = candidate
             .related_novel
             .clone()
             .unwrap_or_else(|| candidate.id.clone());
-        let tts_chapter = first_chapter(&srv, &tts_book).await;
+        // 先用 App 的取法（阅读目录），拿不到再退回其它上游——两者给出的
+        // 章节 id 不一样时，App 只会用前者。
+        let tts_chapter = match app_first_chapter(&srv, &tts_book).await {
+            Some(chapter) => Some(chapter),
+            None => first_chapter(&srv, &tts_book).await,
+        };
         println!("=== 智能朗读 book={tts_book} chapter={tts_chapter:?}");
         let Some(chapter_id) = tts_chapter else {
             continue;
         };
-        for tone in candidate.tts_tones.iter().take(3) {
+        for tone in candidate.probe_tones.iter().take(3) {
             probe_case(
                 &srv,
                 &lb,
@@ -676,7 +793,10 @@ async fn live_audio_cache_probe() {
     // ---- 真人讲书：主播那一本的章节 id，音色是 0（App 就是这么问的）----
     for candidate in candidates.iter() {
         for narrator in candidate.narrators.iter().take(2) {
-            let abook_chapter = first_chapter(&srv, narrator).await;
+            let abook_chapter = match app_first_chapter(&srv, narrator).await {
+                Some(chapter) => Some(chapter),
+                None => first_chapter(&srv, narrator).await,
+            };
             println!("=== 真人讲书 book={narrator} chapter={abook_chapter:?}");
             let Some(chapter_id) = abook_chapter else {
                 continue;
