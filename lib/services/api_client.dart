@@ -559,22 +559,27 @@ class ApiClient {
         mode: mode,
       );
     } on ApiException catch (error) {
-      // iOS 上服务端缓存解密失败时核心会回 4903。但上游给的那个加密直连
-      // 地址在 iPhone 上其实是能播的 —— 真人讲书的「加密」标记早已失效，
-      // 走苹果网络栈的播放器能直接拉下来。早期版本就是靠这条兜底工作的，
-      // 把它换成硬报错等于把能播的路堵死（真机反馈「真人讲书从能播变成
-      // 不能播」正是这个回归）。所以这里退回不带 mode 的原始答案再试一次。
+      // iOS 上服务端缓存解密失败时核心会回 4903。退回不带 mode 的原始
+      // 答案曾让真人讲书重新出声 —— 但那条路只在直连流是**明文**时才成立。
+      // 上游给的音频是真正的 CENC 加密流（容器里带 enca/tenc/schm），
+      // iPhone 没有端上解密能力，把播放器指向它只会得到一句「这个声音
+      // 需要解码」，把服务端给出的真实原因顶掉。现在只有直连流确实不
+      // 带密钥时才兜底；带密钥就原样抛出真实原因。
       if (mode != 'plain' ||
           !error.message.contains('IOS_AUDIO_CACHE_FAILED')) {
         rethrow;
       }
       try {
-        return await _audioSourceFrom(
+        final fallback = await _audioSourceFrom(
           path,
           itemId: itemId,
           selectedTone: selectedTone,
           mode: null,
         );
+        if (fallback.keyHex.isNotEmpty) {
+          throw error;
+        }
+        return fallback;
       } catch (_) {
         // 兜底也失败：把服务端给出的真实原因（已脱敏）抛回去，它比笼统的
         // 「播放出错，请稍后重试」有用得多。

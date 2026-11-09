@@ -56,6 +56,55 @@ fn handle_book_detail<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Api
 /// Audio chapter playinfo: GET /api/v1/audio/books/{id}/chapters/{cid}.
 const AUDIO_CHAPTER_INFO_PATH: &str = "/reading/reader/audio/playinfo/";
 
+/// Fetches the chapter playinfo, retrying when the upstream answers with an
+/// empty body.
+///
+/// The upstream intermittently replies `200` with **zero bytes** for this
+/// endpoint — a hiccup of the origin, not a missing chapter. The JSON parse
+/// then fails with `EOF while parsing a value`, and the user only sees
+/// 「播放出错，请稍后重试」, which says nothing about the cause. Asking again
+/// answers normally; every attempt takes the next device from the pool, so a
+/// device the origin is currently unhappy about is not asked twice.
+async fn fetch_playinfo_with_retry(
+    ctx: &Ctx,
+    params: Vec<(String, String)>,
+    attempts: usize,
+) -> ApiResult<Value> {
+    let mut last_error: Option<ApiError> = None;
+    for attempt in 0..attempts.max(1) {
+        let spec = UpstreamRequestSpec {
+            mode: UpstreamMode::DeviceSigned,
+            host: HOST_FQNOVEL.to_string(),
+            path: AUDIO_CHAPTER_INFO_PATH.to_string(),
+            params: params.clone(),
+            headers: dragon_read_headers(),
+            ..Default::default()
+        };
+        match Upstream::new(ctx.up.clone()).json(&spec).await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                let empty_body = match &err {
+                    ApiError::Internal(message) => {
+                        message.starts_with("parse upstream json: EOF")
+                    }
+                    _ => false,
+                };
+                if !empty_body || attempt + 1 >= attempts {
+                    return Err(err);
+                }
+                log::warn!(
+                    "audio playinfo: empty upstream body, retrying ({}/{})",
+                    attempt + 1,
+                    attempts
+                );
+                last_error = Some(err);
+                tokio::time::sleep(Duration::from_millis(400 * (attempt as u64 + 1))).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| ApiError::Internal("playinfo failed".to_string())))
+}
+
 fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult<Value>> {
     Box::pin(async move {
         let book_id = params.get_str("book_id");
@@ -78,16 +127,7 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
         set_param(&mut p, "req_type", "0");
         set_param(&mut p, "is_local_book", "false");
 
-        let mut payload = Upstream::new(ctx.up.clone())
-            .json(&UpstreamRequestSpec {
-                mode: UpstreamMode::DeviceSigned,
-                host: HOST_FQNOVEL.to_string(),
-                path: AUDIO_CHAPTER_INFO_PATH.to_string(),
-                params: p,
-                headers: dragon_read_headers(),
-                ..Default::default()
-            })
-            .await?;
+        let mut payload = fetch_playinfo_with_retry(ctx, p, 3).await?;
         // 不同音色上游会回不同形状的信封，先统一成一种，下游只处理一种。
         normalize_audio_envelope(&mut payload);
         patch_playinfo_keys(&mut payload);
@@ -220,8 +260,9 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                         "item_id": chapter_id.clone(),
                         "code": 4903,
                         "message": format!(
-                            "IOS_AUDIO_CACHE_FAILED: {}",
-                            sanitize_cache_error(&last_err)
+                            "IOS_AUDIO_CACHE_FAILED: {}（已尝试 {} 个候选）",
+                            sanitize_cache_error(&last_err),
+                            attempts.len()
                         ),
                     }],
                 }));

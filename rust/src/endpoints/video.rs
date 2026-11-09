@@ -1670,7 +1670,17 @@ pub(crate) async fn download_and_save_with_timeout(
             let _ = std::fs::remove_file(&part_path);
             return Err(err.to_string());
         }
-        if !key.is_empty() && cache_cenc_state(&key_path) == CacheCencState::Encrypted {
+        if cache_cenc_state(&key_path) == CacheCencState::Encrypted {
+            if key.is_empty() {
+                // The bytes turned out to be CENC-encrypted although this
+                // attempt carried no key. Caching them anyway would leave a
+                // file the serve path cannot decrypt — it answers 503 for a
+                // missing key sidecar — so the player would report a load
+                // error instead of the real reason. Drop the entry and say
+                // what happened.
+                let _ = std::fs::remove_file(&key_path);
+                return Err("encrypted stream cached without a content key".to_string());
+            }
             if let Err(err) = write_key_sidecar(&key_path, &key) {
                 let _ = std::fs::remove_file(&key_path);
                 return Err(err);

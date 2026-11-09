@@ -3,19 +3,22 @@
 //! `audio_live_probe` 回答了「上游给的音频是不是 CENC 加密、密钥在不在」，
 //! 但没有回答真机最关键的问题：**iOS 走的那条路到底能不能成**。
 //!
-//! 真机只给得出「这个声音需要解码」「音频加载失败」，答不出失败发生在
-//! 哪一步：取流、下载、缓存，还是按 Range 解密。iOS 的 `mode=plain` 让核心
-//! 把整章缓存进 `src/` 再按 Range 解密成明文，这条路上任何一步断了，
-//! Dart 都会退回带密钥的直连地址 —— iPhone 解不开，就变成 4901。
+//! 真机只给得出「这个声音需要解码」「音频加载失败」「播放出错」，答不出
+//! 失败发生在哪一步：取流、下载、缓存，还是按 Range 解密。iOS 的
+//! `mode=plain` 让核心把整章缓存进 `src/` 再按 Range 解密成明文，这条路上
+//! 任何一步断了，Dart 都会退回带密钥的直连地址 —— iPhone 解不开，就变成
+//! 4901。
 //!
 //! 这条探针把那条路完整跑一遍：
 //!
-//! 1. 从真实上游取一章音频；
-//! 2. 请求 `mode=plain`，打印核心的完整回答（成功给 `/src/*.mp4`，失败给
-//!    4903 与脱敏后的真实原因）与耗时；
+//! 1. 找到真机上正在听的那本书，分别取出它的「智能朗读」音色 id 与
+//!    「真人讲书」主播的 abook_id；
+//! 2. 对每一种听法请求 `mode=plain`，打印核心的完整回答（成功给
+//!    `/src/*.mp4`，失败给 4903 与脱敏后的真实原因）与耗时；
 //! 3. 回答是 `/src/*.mp4` 时，从回环服务按 Range 取一段明文，与上游同一段
 //!    原始字节逐字节对比 —— 证明「真的解密了」，而不是「把加密原样转发」；
-//! 4. 检查 sample entry 是否从 `enca` 改写成了 `mp4a`。
+//! 4. 重复取同一个音色若干次，统计上游返回空 body 的比例 —— 上游对某个
+//!    设备身份会偶发回一个零字节的 200，不重试就只是一句「播放出错」。
 //!
 //! ```text
 //! cargo test --manifest-path rust/Cargo.toml --test audio_cache_probe -- --ignored --nocapture
@@ -26,7 +29,7 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{build_server, pool_json, start_loopback, TempDir};
+use common::{build_server, pool_json, start_loopback, Loopback, TempDir};
 use fqapi_core::endpoints::{Params, Server};
 use serde_json::Value;
 
@@ -42,10 +45,11 @@ const ITEM_KEYS: &[&str] = &[
     "itemIds",
 ];
 
-/// 已确认上游会回 `data[].video_model` 形状的有声书。用它当首选，省掉一次
-/// 首页扫描；它失效了再退回扫描。
+/// 真机上正在测试的那本书。用标题去搜，避免把 id 写死在探针里。
+const TARGET_TITLE: &str = "入赘三年";
+
+/// 已确认上游会回 `data[].video_model` 形状的有声书，作为对照组。
 const KNOWN_BOOK: &str = "7361653460183288894";
-const KNOWN_CHAPTER: &str = "7361654302949311038";
 
 /// 递归收集所有指定键下的字符串值。
 fn collect_strings(value: &Value, keys: &[&str], out: &mut Vec<String>) {
@@ -69,6 +73,67 @@ fn collect_strings(value: &Value, keys: &[&str], out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// 拆开 `data` 包装，取出真正放数据的对象。
+fn data_of(value: &Value) -> &Value {
+    match value.get("data") {
+        Some(inner) if inner.is_object() => data_of(inner),
+        _ => value,
+    }
+}
+
+/// 从一个音色列表里取出音色 id。
+fn tone_ids(value: &Value, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(Value::Array(list)) = data_of(value).get(key) else {
+        return out;
+    };
+    for entry in list {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        for id_key in ["id", "tone_id"] {
+            if let Some(Value::String(text)) = obj.get(id_key) {
+                if !text.is_empty() {
+                    out.push(text.clone());
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 从 `audio_tones` 里取出真人讲书主播的 abook_id。
+fn narrator_ids(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(Value::Array(list)) = data_of(value).get("audio_tones") else {
+        return out;
+    };
+    for entry in list {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        let mut found: Option<String> = None;
+        for id_key in ["abook_id_str", "book_id"] {
+            if let Some(Value::String(text)) = obj.get(id_key) {
+                if !text.is_empty() {
+                    found = Some(text.clone());
+                    break;
+                }
+            }
+        }
+        if found.is_none() {
+            if let Some(Value::Number(num)) = obj.get("abook_id") {
+                found = Some(num.to_string());
+            }
+        }
+        if let Some(id) = found {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// 从回答里取出所有可播放的音频地址，并标记它是否带加密信息。
@@ -103,6 +168,26 @@ fn audio_urls(value: &Value) -> Vec<(String, bool)> {
         }
     }
     out
+}
+
+/// 打印上游信封的形状：数组型 `data[]` 还是 mget 型 `data{...}`。
+fn envelope_shape(value: &Value) -> String {
+    match value.get("data") {
+        Some(Value::Array(rows)) => format!("data[] len={}", rows.len()),
+        Some(Value::Object(obj)) => {
+            let mut parts: Vec<String> = Vec::new();
+            for (key, item) in obj {
+                let kind = match item {
+                    Value::Array(list) => format!("array({})", list.len()),
+                    Value::Object(_) => "object".to_string(),
+                    _ => "scalar".to_string(),
+                };
+                parts.push(format!("{key}:{kind}"));
+            }
+            format!("data{{{}}}", parts.join(","))
+        }
+        _ => "no data".to_string(),
+    }
 }
 
 /// 把回答里的签名地址换成域名，避免探针日志留下可用的临时凭证。
@@ -174,13 +259,222 @@ async fn fetch_range(url: &str, end: u64) -> Result<(u16, Vec<u8>), String> {
     Ok((status, buf))
 }
 
-/// 找一本真正的有声书和它的第一章。
+/// 一条待验证的取流路径。
+struct Case {
+    label: String,
+    book_id: String,
+    chapter_id: String,
+    tone_id: String,
+}
+
+/// 对一条路径跑完整的「服务端缓存 + Range 解密」验证。
+async fn probe_case(srv: &Arc<Server>, lb: &Loopback, case: &Case) {
+    println!("\n----- {} -----", case.label);
+    println!(
+        "book_id={} chapter_id={} tone_id={}",
+        case.book_id, case.chapter_id, case.tone_id
+    );
+
+    let chapter_info = srv.handler("audio_chapter_info").expect("route");
+
+    // 直连答案：用来取原始字节做对比，也用来确认上游这次答了什么。
+    let direct = match chapter_info(
+        &srv.ctx,
+        &Params::from_pairs(vec![
+            ("book_id".to_string(), case.book_id.clone()),
+            ("chapter_id".to_string(), case.chapter_id.clone()),
+            ("tone_id".to_string(), case.tone_id.clone()),
+        ]),
+    )
+    .await
+    {
+        Ok(value) => Some(value),
+        Err(err) => {
+            println!("[direct] failed: {err:?}");
+            None
+        }
+    };
+    let urls = match &direct {
+        Some(value) => {
+            println!("[direct] envelope: {}", envelope_shape(value));
+            audio_urls(value)
+        }
+        None => Vec::new(),
+    };
+    println!("[direct] streams: {}", urls.len());
+    for (url, encrypted) in urls.iter().take(4) {
+        println!(
+            "[direct]   encrypted={encrypted} url={}",
+            sanitize(url)
+        );
+    }
+
+    // 服务端缓存 + 解密。
+    let started = Instant::now();
+    let plain = chapter_info(
+        &srv.ctx,
+        &Params::from_pairs(vec![
+            ("book_id".to_string(), case.book_id.clone()),
+            ("chapter_id".to_string(), case.chapter_id.clone()),
+            ("tone_id".to_string(), case.tone_id.clone()),
+            ("mode".to_string(), "plain".to_string()),
+        ]),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let plain = match plain {
+        Ok(value) => value,
+        Err(err) => {
+            println!("[plain] failed after {elapsed:?}: {err:?}");
+            return;
+        }
+    };
+    println!(
+        "[plain] took {elapsed:?}; answer: {}",
+        sanitize(&plain.to_string())
+    );
+
+    let served = plain
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("main_url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !served.starts_with("/src/") {
+        println!("[plain] no cached stream; the answer above says why");
+        return;
+    }
+
+    let (status, decrypted) = match fetch_range(&lb.url(&served), 65535).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            println!("[plain] loopback fetch failed: {err}");
+            return;
+        }
+    };
+    println!(
+        "[plain] loopback status={status} bytes={}",
+        decrypted.len()
+    );
+
+    let Some((raw_url, _)) = urls
+        .iter()
+        .find(|(url, encrypted)| *encrypted && url.starts_with("https://"))
+    else {
+        println!("[plain] no encrypted upstream url to compare against");
+        return;
+    };
+    let (raw_status, raw) = match fetch_range(raw_url, 65535).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            println!("[plain] upstream fetch failed: {err}");
+            return;
+        }
+    };
+    println!("[plain] upstream status={raw_status} bytes={}", raw.len());
+    println!(
+        "[plain] identical bytes: {} (false means the bytes were decrypted)",
+        raw == decrypted
+    );
+    for marker in ["enca", "mp4a", "encv", "hvc1", "senc"] {
+        println!(
+            "[plain] marker {marker:?}: raw={:?} decrypted={:?}",
+            find_bytes(&raw, marker.as_bytes()),
+            find_bytes(&decrypted, marker.as_bytes())
+        );
+    }
+}
+
+/// 同一个音色连续取若干次，统计上游回空 body 的比例。
+async fn probe_flakiness(srv: &Arc<Server>, book_id: &str, chapter_id: &str, tone_id: &str) {
+    println!("\n----- flakiness (tone {tone_id}) -----");
+    let chapter_info = srv.handler("audio_chapter_info").expect("route");
+    let mut empty = 0usize;
+    let mut ok = 0usize;
+    for round in 1..=4 {
+        let started = Instant::now();
+        let result = chapter_info(
+            &srv.ctx,
+            &Params::from_pairs(vec![
+                ("book_id".to_string(), book_id.to_string()),
+                ("chapter_id".to_string(), chapter_id.to_string()),
+                ("tone_id".to_string(), tone_id.to_string()),
+            ]),
+        )
+        .await;
+        match result {
+            Ok(_) => {
+                ok += 1;
+                println!("[round {round}] ok in {:?}", started.elapsed());
+            }
+            Err(err) => {
+                let message = err.message().to_string();
+                if message.starts_with("parse upstream json: EOF") {
+                    empty += 1;
+                }
+                println!("[round {round}] failed in {:?}: {message}", started.elapsed());
+            }
+        }
+    }
+    println!("[flakiness] ok={ok} empty_body={empty}");
+}
+
+/// 找出真机上那本书的「智能朗读」音色与「真人讲书」主播。
+async fn resolve_target(srv: &Arc<Server>) -> Option<(String, Vec<String>, Vec<String>)> {
+    let search = srv.handler("search")?;
+    let book = srv.handler("book")?;
+    let directory = srv.handler("directory")?;
+
+    let params = Params::from_pairs(vec![("query".to_string(), TARGET_TITLE.to_string())]);
+    let mut ids: Vec<String> = Vec::new();
+    match search(&srv.ctx, &params).await {
+        Ok(value) => {
+            collect_strings(&value, &["book_id", "bookId"], &mut ids);
+            println!("=== search '{TARGET_TITLE}' found {} ids", ids.len());
+        }
+        Err(err) => println!("search failed: {err:?}"),
+    }
+    if ids.is_empty() {
+        return None;
+    }
+
+    for id in ids.iter().take(6) {
+        let params = Params::from_pairs(vec![("book_id".to_string(), id.clone())]);
+        let detail = match book(&srv.ctx, &params).await {
+            Ok(value) => value,
+            Err(err) => {
+                println!("book {id} failed: {err:?}");
+                continue;
+            }
+        };
+        let tts = tone_ids(&detail, "tts_tones");
+        let narrators = narrator_ids(&detail);
+        println!("=== book {id}: tts_tones={:?} narrators={:?}", tts, narrators);
+        if tts.is_empty() && narrators.is_empty() {
+            continue;
+        }
+        let mut chapters: Vec<String> = Vec::new();
+        if let Ok(value) = directory(&srv.ctx, &params).await {
+            collect_strings(&value, ITEM_KEYS, &mut chapters);
+        }
+        let Some(first) = chapters.first().cloned() else {
+            println!("book {id} has no chapter id");
+            continue;
+        };
+        return Some((id.clone(), tts, narrators));
+    }
+    None
+}
+
+/// 找一本真正的有声书和它的第一章，当对照组。
 async fn resolve_audio_book(srv: &Arc<Server>) -> Option<(String, String)> {
     let detail = srv.handler("audio_book_detail")?;
     let directory = srv.handler("directory")?;
     let home = srv.handler("homepage_recommend")?;
 
-    let mut ids: Vec<String> = Vec::new();
+    let mut ids: Vec<String> = vec![KNOWN_BOOK.to_string()];
     for tab_type in ["0", "2", "3"] {
         let params = Params::from_pairs(vec![("tab_type".to_string(), tab_type.to_string())]);
         if let Ok(value) = home(&srv.ctx, &params).await {
@@ -193,7 +487,6 @@ async fn resolve_audio_book(srv: &Arc<Server>) -> Option<(String, String)> {
             }
         }
     }
-    ids.insert(0, KNOWN_BOOK.to_string());
 
     for id in ids.iter().take(12) {
         let params = Params::from_pairs(vec![("book_id".to_string(), id.clone())]);
@@ -218,120 +511,84 @@ async fn resolve_audio_book(srv: &Arc<Server>) -> Option<(String, String)> {
 async fn live_audio_cache_probe() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = TempDir::new("audio-cache");
-    let srv = build_server(&dir, None, &[], &[], &pool_json(1)).await;
+    // An empty pool makes the core register real devices with the upstream,
+    // the same way the app does on a fresh install. A hand-written pool of
+    // fake identities would not rotate the way the app's does, and the
+    // rotation is exactly what the empty-body retry depends on.
+    let srv = build_server(&dir, None, &[], &[], &pool_json(0)).await;
     let lb = start_loopback(srv.clone()).await;
+    println!("=== device pool size: {}", srv.ctx.pool.count().await);
 
-    let Some((book_id, chapter_id)) = resolve_audio_book(&srv).await else {
-        println!("=== no audio book could be resolved; nothing to probe");
-        return;
-    };
-    println!("=== probing book_id={book_id} chapter_id={chapter_id}");
+    // ---- 对照组：一本有声书 ----
+    if let Some((book_id, chapter_id)) = resolve_audio_book(&srv).await {
+        for tone in ["2", "0"] {
+            probe_case(
+                &srv,
+                &lb,
+                &Case {
+                    label: format!("有声书 {book_id} tone {tone}"),
+                    book_id: book_id.clone(),
+                    chapter_id: chapter_id.clone(),
+                    tone_id: tone.to_string(),
+                },
+            )
+            .await;
+        }
+        probe_flakiness(&srv, &book_id, &chapter_id, "2").await;
+    }
 
-    let chapter_info = srv.handler("audio_chapter_info").expect("route");
-
-    for tone in ["1", "2", "0"] {
-        println!("\n===== tone {tone} =====");
-
-        // 直连答案：用来取原始字节做对比。
-        let direct = chapter_info(
-            &srv.ctx,
-            &Params::from_pairs(vec![
-                ("book_id".to_string(), book_id.clone()),
-                ("chapter_id".to_string(), chapter_id.clone()),
-                ("tone_id".to_string(), tone.to_string()),
-            ]),
-        )
-        .await;
-        let direct = match direct {
-            Ok(value) => value,
-            Err(err) => {
-                println!("[tone {tone}] direct failed: {err:?}");
-                continue;
-            }
+    // ---- 目标书：真机上正在听的那本 ----
+    if let Some((book_id, tts_tones, narrators)) = resolve_target(&srv).await {
+        let directory = srv.handler("directory").expect("route");
+        let params = Params::from_pairs(vec![("book_id".to_string(), book_id.clone())]);
+        let mut chapters: Vec<String> = Vec::new();
+        if let Ok(value) = directory(&srv.ctx, &params).await {
+            collect_strings(&value, ITEM_KEYS, &mut chapters);
+        }
+        let Some(chapter_id) = chapters.first().cloned() else {
+            println!("=== target book has no chapter id");
+            return;
         };
-        let urls = audio_urls(&direct);
-        println!("[tone {tone}] direct streams: {}", urls.len());
-        for (url, encrypted) in urls.iter().take(4) {
-            println!(
-                "[tone {tone}]   encrypted={encrypted} url={}",
-                sanitize(url)
-            );
+
+        for tone in tts_tones.iter().take(3) {
+            probe_case(
+                &srv,
+                &lb,
+                &Case {
+                    label: format!("智能朗读 {book_id} tone {tone}"),
+                    book_id: book_id.clone(),
+                    chapter_id: chapter_id.clone(),
+                    tone_id: tone.clone(),
+                },
+            )
+            .await;
         }
 
-        // 服务端缓存 + 解密。
-        let started = Instant::now();
-        let plain = chapter_info(
-            &srv.ctx,
-            &Params::from_pairs(vec![
-                ("book_id".to_string(), book_id.clone()),
-                ("chapter_id".to_string(), chapter_id.clone()),
-                ("tone_id".to_string(), tone.to_string()),
-                ("mode".to_string(), "plain".to_string()),
-            ]),
-        )
-        .await;
-        let elapsed = started.elapsed();
-        let plain = match plain {
-            Ok(value) => value,
-            Err(err) => {
-                println!("[tone {tone}] mode=plain failed after {elapsed:?}: {err:?}");
-                continue;
+        // 真人讲书：主播的 abook_id 是另一本书，章节也换成它自己的。
+        for narrator in narrators.iter().take(2) {
+            let detail = srv.handler("audio_book_detail").expect("route");
+            let params = Params::from_pairs(vec![("book_id".to_string(), narrator.clone())]);
+            let mut items: Vec<String> = Vec::new();
+            if let Ok(value) = detail(&srv.ctx, &params).await {
+                collect_strings(&value, ITEM_KEYS, &mut items);
             }
-        };
-        println!(
-            "[tone {tone}] mode=plain took {elapsed:?}; answer: {}",
-            sanitize(&plain.to_string())
-        );
-
-        let served = plain
-            .get("data")
-            .and_then(|d| d.as_array())
-            .and_then(|rows| rows.first())
-            .and_then(|row| row.get("main_url"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !served.starts_with("/src/") {
-            println!("[tone {tone}] no cached stream; the answer above says why");
-            continue;
-        }
-
-        let (status, decrypted) = match fetch_range(&lb.url(&served), 65535).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                println!("[tone {tone}] loopback fetch failed: {err}");
+            let Some(abook_chapter) = items.first().cloned() else {
+                println!("=== narrator {narrator} has no chapter id");
                 continue;
+            };
+            for tone in ["0", "1"] {
+                probe_case(
+                    &srv,
+                    &lb,
+                    &Case {
+                        label: format!("真人讲书 {narrator} tone {tone}"),
+                        book_id: narrator.clone(),
+                        chapter_id: abook_chapter.clone(),
+                        tone_id: tone.to_string(),
+                    },
+                )
+                .await;
             }
-        };
-        println!(
-            "[tone {tone}] loopback status={status} bytes={}",
-            decrypted.len()
-        );
-
-        let Some((raw_url, _)) = urls.iter().find(|(url, encrypted)| {
-            *encrypted && url.starts_with("https://")
-        }) else {
-            println!("[tone {tone}] no encrypted upstream url to compare against");
-            continue;
-        };
-        let (raw_status, raw) = match fetch_range(raw_url, 65535).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                println!("[tone {tone}] upstream fetch failed: {err}");
-                continue;
-            }
-        };
-        println!("[tone {tone}] upstream status={raw_status} bytes={}", raw.len());
-        println!(
-            "[tone {tone}] identical bytes: {} (false means the bytes were decrypted)",
-            raw == decrypted
-        );
-        for marker in ["enca", "mp4a", "encv", "hvc1", "senc"] {
-            println!(
-                "[tone {tone}] marker {marker:?}: raw={:?} decrypted={:?}",
-                find_bytes(&raw, marker.as_bytes()),
-                find_bytes(&decrypted, marker.as_bytes())
-            );
         }
     }
 }
