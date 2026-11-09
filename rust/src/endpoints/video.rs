@@ -1277,6 +1277,13 @@ const MAX_VIDEO_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// encrypted upstream URL, which iOS cannot play at all.
 const VIDEO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Client-level ceiling for the streaming download client.
+///
+/// The effective deadline is set per request (a whole audio chapter needs
+/// more than a short-drama clip) and a request-level timeout overrides this
+/// one; this only keeps a runaway request from living forever.
+const CLIENT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// A plain reqwest client for streaming video downloads. The shared upstream
 /// transport (`upstream/http.rs`) only exposes a whole-body API, so the
 /// download path keeps its own client; it sends the same unsigned GET with
@@ -1290,7 +1297,7 @@ fn streaming_client() -> Option<&'static reqwest::Client> {
     STREAMING_CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
-                .timeout(VIDEO_DOWNLOAD_TIMEOUT)
+                .timeout(CLIENT_DOWNLOAD_TIMEOUT)
                 .build()
                 .ok()
         })
@@ -1305,8 +1312,16 @@ async fn stream_download_to_file(
     url: &str,
     user_agent: &str,
     part_path: &Path,
+    timeout: Duration,
 ) -> Result<u64, String> {
-    stream_download_to_file_with_cap(url, user_agent, part_path, MAX_VIDEO_DOWNLOAD_BYTES).await
+    stream_download_to_file_with_cap(
+        url,
+        user_agent,
+        part_path,
+        MAX_VIDEO_DOWNLOAD_BYTES,
+        timeout,
+    )
+    .await
 }
 
 async fn stream_download_to_file_with_cap(
@@ -1314,11 +1329,12 @@ async fn stream_download_to_file_with_cap(
     user_agent: &str,
     part_path: &Path,
     cap_bytes: u64,
+    timeout: Duration,
 ) -> Result<u64, String> {
     let client = streaming_client().ok_or_else(|| "streaming client unavailable".to_string())?;
     let mut resp = client
         .get(url)
-        .timeout(crate::upstream::budget::cap_timeout(VIDEO_DOWNLOAD_TIMEOUT))
+        .timeout(crate::upstream::budget::cap_timeout(timeout))
         .header(reqwest::header::USER_AGENT, user_agent)
         .send()
         .await
@@ -1369,6 +1385,23 @@ pub(crate) async fn download_and_save(
     video_id: &str,
     video_url: &str,
     content_key: &[u8],
+) -> Result<String, String> {
+    download_and_save_with_timeout(ctx, video_id, video_url, content_key, VIDEO_DOWNLOAD_TIMEOUT)
+        .await
+}
+
+/// Same as [`download_and_save`] with a caller-chosen deadline.
+///
+/// A whole listening chapter is an order of magnitude larger than a
+/// short-drama clip, so the audio route needs a longer budget than the shared
+/// video default. The loopback server grants that budget for the audio
+/// chapter route (see `request_budget` in `server.rs`).
+pub(crate) async fn download_and_save_with_timeout(
+    ctx: &Ctx,
+    video_id: &str,
+    video_url: &str,
+    content_key: &[u8],
+    timeout: Duration,
 ) -> Result<String, String> {
     let src_dir = if ctx.src_dir.is_empty() {
         "src".to_string()
@@ -1438,7 +1471,7 @@ pub(crate) async fn download_and_save(
         // the codec-gate download tests would never see the request.
         let download_url = ctx.up.effective_url(video_url);
         if let Err(err) =
-            stream_download_to_file(&download_url, UA_WINDOWS_BROWSER, &part_path).await
+            stream_download_to_file(&download_url, UA_WINDOWS_BROWSER, &part_path, timeout).await
         {
             let _ = tokio::fs::remove_file(&part_path).await;
             return Err(err);

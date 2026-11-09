@@ -169,6 +169,30 @@ fn refuse(status: StatusCode, message: &str) -> Response {
         .unwrap_or_else(|_| status.into_response())
 }
 
+/// Deadline for the routes that must cache a whole file before answering.
+///
+/// iOS has no on-device CENC decryption, so the core has to download the
+/// entire episode / audio chapter into `src/` before the player can ask for a
+/// decrypted range. A short-drama clip happens to fit the generic budget; a
+/// whole listening chapter on a phone network routinely needs minutes, and the
+/// generic budget kills it mid-download — the request then answers 504, or
+/// the download reports a timeout and the route says the cache failed. These
+/// routes get their own, much longer budget; every other request keeps the
+/// short one so a slow request cannot occupy the loopback server.
+const CACHE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Picks the deadline for one request from its local route path.
+fn request_budget(path: &str) -> std::time::Duration {
+    let is_video = path.contains("/api/v1/videos/");
+    let is_audio_chapter =
+        path.contains("/api/v1/audio/books/") && path.contains("/chapters/");
+    if is_video || is_audio_chapter {
+        CACHE_FETCH_TIMEOUT
+    } else {
+        crate::upstream::budget::HTTP_REQUEST_TIMEOUT
+    }
+}
+
 async fn handler(State(state): State<AppState>, req: axum::extract::Request) -> Response {
     use crate::api::{race_dispatch, RaceOutcome};
     use futures::StreamExt;
@@ -178,7 +202,7 @@ async fn handler(State(state): State<AppState>, req: axum::extract::Request) -> 
     // The returned stream observes shutdown, not a whole-file time limit.
     match race_dispatch(
         &token,
-        Some(crate::upstream::budget::HTTP_REQUEST_TIMEOUT),
+        Some(request_budget(req.uri().path())),
         handle_request(state, req),
     )
     .await

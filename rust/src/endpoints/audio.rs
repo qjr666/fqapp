@@ -3,6 +3,8 @@
 
 use futures::future::BoxFuture;
 use serde_json::{json, Map, Value};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::endpoints::base::{
     dragon_read_headers, dragon_read_json_headers, Upstream, UpstreamMode, UpstreamRequestSpec,
@@ -88,6 +90,11 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
             .await?;
         patch_playinfo_keys(&mut payload);
         if plain_mode {
+            // 章节答案有两种信封：`data[].video_model` 与
+            // `data.video_model_datas[].video_model`。key 派生之前只覆盖了
+            // 前者，智能朗读因此拿不到 key_hex —— 核心与 Dart 两侧都会把它
+            // 当成「没有可播的流」。两种信封都要补 key。
+            patch_encrypted_audio_keys(&mut payload);
             let candidates = encrypted_audio_candidates(&payload);
             if candidates.is_empty() {
                 // A genuinely clear stream needs no cache at all. Keeping the
@@ -100,20 +107,26 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
             } else {
                 let base_id = audio_cache_id(&chapter_id, &tone_id);
                 let mut last_err = String::from("no candidate attempted");
-                for (index, (url, key_hex)) in candidates.iter().enumerate() {
-                    let Ok(key) = hex::decode(key_hex.as_str()) else {
-                        last_err = "undecodable key hex".to_string();
-                        continue;
+                let mut attempts: Vec<String> = Vec::new();
+
+                // 第一轮：带密钥的候选。第一个候选沿用旧 id —— 设备上还可能
+                // 留着上一版缓存的同名文件，命中它就不用重新下载整章。
+                let keyed: Vec<&AudioCandidate> =
+                    candidates.iter().filter(|c| !c.key.is_empty()).collect();
+                for (index, candidate) in keyed.iter().enumerate() {
+                    let cache_id = if index == 0 {
+                        base_id.clone()
+                    } else {
+                        format!("{base_id}_{index}")
                     };
-                    if key.len() != 16 {
-                        last_err = format!("key length {}", key.len());
-                        continue;
-                    }
-                    // One id per candidate: a partial or undecodable download
-                    // must not be reused when the backup URL is tried next.
-                    let cache_id = format!("{base_id}_{index}");
-                    match crate::endpoints::video::download_and_save(ctx, &cache_id, url, &key)
-                        .await
+                    match crate::endpoints::video::download_and_save_with_timeout(
+                        ctx,
+                        &cache_id,
+                        &candidate.url,
+                        &candidate.key,
+                        AUDIO_DOWNLOAD_TIMEOUT,
+                    )
+                    .await
                     {
                         Ok(served) => {
                             // `parsePlayinfoSource` walks the last envelope's
@@ -121,13 +134,7 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                             // `encrypt_info` hits its plain-stream branch, and
                             // `_mediaUrl` expands `/src/...` into the loopback
                             // URL that `serve_src_file` decrypts per Range.
-                            return Ok(json!({
-                                "code": 0,
-                                "data": [{
-                                    "item_id": chapter_id.clone(),
-                                    "main_url": served,
-                                }],
-                            }));
+                            return Ok(cached_audio_payload(&chapter_id, served, &attempts));
                         }
                         Err(err) => {
                             log::warn!(
@@ -135,17 +142,49 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                                 chapter_id,
                                 tone_id,
                                 index + 1,
-                                candidates.len(),
+                                keyed.len(),
                                 err
                             );
+                            attempts.push(format!("带密钥候选 {}: {}", index + 1, err));
                             last_err = err;
                         }
                     }
                 }
-                // Falling back to the encrypted direct URL is worse than an
-                // explicit error: iOS has no on-device CENC decryption, so the
-                // player would fail with a meaningless generic message. The
-                // Dart side turns 4903 into an actionable hint.
+
+                // 第二轮：明文兜底。有些音色标称 encrypt=true，实际内容并没有
+                // 加密；用空 key 下载一次，缓存里不写 key sidecar，播放器就能
+                // 直接播放原始字节。只试第一个地址，避免把时间耗在同一个
+                // 文件的副本上。
+                if let Some(candidate) = candidates.first() {
+                    let plain_id = format!("{base_id}_plain");
+                    match crate::endpoints::video::download_and_save_with_timeout(
+                        ctx,
+                        &plain_id,
+                        &candidate.url,
+                        &[],
+                        AUDIO_DOWNLOAD_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(served) => {
+                            return Ok(cached_audio_payload(&chapter_id, served, &attempts));
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "audio plain: chapter {} tone {} plain fallback failed: {}",
+                                chapter_id,
+                                tone_id,
+                                err
+                            );
+                            attempts.push(format!("明文兜底: {}", err));
+                            last_err = err;
+                        }
+                    }
+                }
+
+                // 服务端确实没能拿到可解密的音频。给出带原因的业务码：iOS 端
+                // 没有端上解密能力，把加密直连地址塞回去只会得到一句没有
+                // 信息量的「播放出错」。
                 log::warn!(
                     "audio plain: chapter {} tone {} exhausted {} candidates (last: {})",
                     chapter_id,
@@ -158,7 +197,10 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                     "data": [{
                         "item_id": chapter_id.clone(),
                         "code": 4903,
-                        "message": "IOS_AUDIO_CACHE_FAILED",
+                        "message": format!(
+                            "IOS_AUDIO_CACHE_FAILED: {}",
+                            sanitize_cache_error(&last_err)
+                        ),
                     }],
                 }));
             }
@@ -177,7 +219,52 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
 /// when `key_hex` is missing, and retrying `backup_url` is what keeps an
 /// unfamiliar voice from silently falling back to the encrypted direct URL
 /// that iOS cannot play.
-fn encrypted_audio_candidates(payload: &Value) -> Vec<(String, String)> {
+/// 整章有声书的缓存下载预算。短剧一集只有几 MB，120 秒绰绰有余；一章
+/// 真人讲书动辄十几分钟音频、几十 MB，手机网络下 120 秒经常下不完，缓存
+/// 于是被判失败。回环服务对音频章节路由也放宽了同样的预算。
+const AUDIO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One playable stream discovered in a patched playinfo answer.
+struct AudioCandidate {
+    url: String,
+    /// The 16-byte CENC content key. Empty when the envelope carried none,
+    /// which means the stream can only be cached as plain bytes.
+    key: Vec<u8>,
+}
+
+/// The answer the Dart side expects for a server-decrypted stream: a bare
+/// `main_url` that the backend expands into the loopback URL.
+fn cached_audio_payload(chapter_id: &str, served: String, attempts: &[String]) -> Value {
+    json!({
+        "code": 0,
+        "data": [{
+            "item_id": chapter_id,
+            "main_url": served,
+            "diag": { "attempts": attempts },
+        }],
+    })
+}
+
+/// Strips signed URLs out of an error before it can reach the screen: the
+/// download errors carry the full request URL, and that URL is a credential.
+fn sanitize_cache_error(err: &str) -> String {
+    static URL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = URL_RE.get_or_init(|| regex::Regex::new(r"https?://\S+").expect("url regex"));
+    let cleaned = re.replace_all(err, "<url>").to_string();
+    cleaned.chars().take(120).collect()
+}
+
+/// Collects every encrypted stream of a patched playinfo answer, paired with
+/// a usable 16-byte key, in the order the player should try them.
+///
+/// The upstream switches envelope shape by book genre / tone: the chapter
+/// endpoint normally answers `data[].video_model`, while some 智能朗读 voices
+/// arrive in the mget-style `data.video_model_datas[].video_model`. Accepting
+/// both, tolerating an absent `media_type`, deriving the key from `spade_a`
+/// when `key_hex` is missing, and retrying `backup_url` is what keeps an
+/// unfamiliar voice from silently falling back to the encrypted direct URL
+/// that iOS cannot play.
+fn encrypted_audio_candidates(payload: &Value) -> Vec<AudioCandidate> {
     let mut models: Vec<Map<String, Value>> = Vec::new();
     match payload.get("data") {
         Some(Value::Array(rows)) => {
@@ -208,8 +295,8 @@ fn encrypted_audio_candidates(payload: &Value) -> Vec<(String, String)> {
         _ => {}
     }
 
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String)> =
+    let mut out: Vec<AudioCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, Vec<u8>)> =
         std::collections::HashSet::new();
     for model in models {
         // Only an explicitly video-flavoured answer is out of scope. TTS
@@ -237,21 +324,28 @@ fn encrypted_audio_candidates(payload: &Value) -> Vec<(String, String)> {
             {
                 continue;
             }
-            // `patch_playinfo_keys` derives a 16-byte key from `spade_a`.
-            // Some envelopes carry the key under a slightly different shape,
-            // so derive it here too instead of dropping the whole voice.
-            let key_hex = match info.get("key_hex").and_then(|v| v.as_str()) {
-                Some(raw) if raw.len() == 32 => raw.to_string(),
+            // `patch_playinfo_keys` / `patch_encrypted_audio_keys` derive a
+            // 16-byte key from `spade_a`. Derive it here too when neither
+            // envelope shape carried a `key_hex`, so a voice with an
+            // unfamiliar shape is still cached instead of dropped. A stream
+            // whose key cannot be derived stays in the list with an empty
+            // key: it is then worth caching as plain bytes.
+            let key = match info.get("key_hex").and_then(|v| v.as_str()) {
+                Some(raw) if raw.len() == 32 => match hex::decode(raw) {
+                    Ok(bytes) if bytes.len() == 16 => bytes,
+                    _ => Vec::new(),
+                },
                 _ => {
                     let spade = info
                         .get("spade_a")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let derived = crate::endpoints::video::derive_spade_content_key(spade);
-                    if derived.len() != 16 {
-                        continue;
+                    if derived.len() == 16 {
+                        derived
+                    } else {
+                        Vec::new()
                     }
-                    hex::encode(&derived)
                 }
             };
             for field in ["main_url", "backup_url"] {
@@ -261,9 +355,12 @@ fn encrypted_audio_candidates(payload: &Value) -> Vec<(String, String)> {
                 if url.is_empty() {
                     continue;
                 }
-                let candidate = (url.to_string(), key_hex.clone());
-                if seen.insert(candidate.clone()) {
-                    out.push(candidate);
+                let marker = (url.to_string(), key.clone());
+                if seen.insert(marker) {
+                    out.push(AudioCandidate {
+                        url: url.to_string(),
+                        key: key.clone(),
+                    });
                 }
             }
         }
@@ -582,6 +679,47 @@ mod key_vectors {
         assert_eq!(
             parsed["video_list"][0]["encrypt_info"]["key_hex"],
             "0f7a32fda0f04388ba27cf1d0a95b024"
+        );
+    }
+
+    #[test]
+    fn finds_candidates_in_the_mget_envelope_shape() {
+        // 智能朗读的章节答案用的是 mget 形状（data.video_model_datas[]）。
+        // key 必须能从 spade_a 派生出来，否则核心与 Dart 两侧都会认为这一章
+        // 没有可播的流 —— 这正是智能朗读一直播不了的原因。
+        let model = audio_model(
+            "l7wZ+1azG8pUsS7NVIcYzWKCGvlWhCrVV5sa1lWsK+NnqC+2tg==",
+            "692e7c06f8818b927094fff40092363a",
+        );
+        let mut value = json!({
+            "code": 0,
+            "data": { "video_model_datas": [ { "item_id": "1", "video_model": model } ] }
+        });
+        patch_encrypted_audio_keys(&mut value);
+        let candidates = encrypted_audio_candidates(&value);
+        assert_eq!(candidates.len(), 2, "main_url and backup_url");
+        assert_eq!(
+            candidates[0].key,
+            hex::decode("61826b7eceb342a9ad4fd9d7556be625").expect("key")
+        );
+    }
+
+    #[test]
+    fn finds_candidates_in_the_chapter_envelope_shape() {
+        let model = audio_model(
+            "nbwTwF23F/5phBHDb4Qjz3KBC/lBtzrJcLI4y2qGEc9dhRWhoQ==",
+            "677752d8f8818bb4b2223c0e00f7a81a",
+        );
+        let mut value = json!({
+            "code": 0,
+            "data": [ { "item_id": "1", "video_model": model } ]
+        });
+        patch_playinfo_keys(&mut value);
+        let candidates = encrypted_audio_candidates(&value);
+        assert_eq!(candidates.len(), 2, "main_url and backup_url");
+        assert_eq!(
+            candidates[0].key,
+            hex::decode("0f7a32fda0f04388ba27cf1d0a95b024").expect("key")
         );
     }
 }

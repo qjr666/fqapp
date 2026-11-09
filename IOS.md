@@ -93,9 +93,26 @@ BUNDLE_ID=com.fqapp.fqapp IPA=/tmp/pack/fqapp_ios_unsigned.ipa ./your-sign-scrip
    - `encrypted_audio_candidates` 同时接受 `data[].video_model` 与
      `data.video_model_datas[].video_model` 两种信封；只在 `media_type` 明确为
      `video` 时跳过；`key_hex` 缺失时现场从 `spade_a` 再派生一次；并收集
-     `main_url` + `backup_url` 逐个重试（每个候选独立缓存 id）。真人讲书与
-     智能朗读只是 `tone_id` 不同，上游会返回不同结构的流，早期「只认第一条
-     且必须是 audio」的实现会让智能朗读漏匹配。
+     `main_url` + `backup_url` 逐个重试。真人讲书与智能朗读只是 `tone_id`
+     不同，上游会返回不同结构的流，早期「只认第一条且必须是 audio」的
+     实现会让智能朗读漏匹配。
+   - **两种信封都必须补 `key_hex`**：`patch_playinfo_keys` 只处理 `data[]`，
+     `patch_encrypted_audio_keys` 只处理 `data.video_model_datas[]`，章节接口
+     两者都要跑。只做其中之一时，另一种信封的音色拿不到 `key_hex`，核心与
+     Dart 两侧都会认为「没有可播的流」。
+   - **回环服务的取流预算**：`server.rs` 给每个请求 20 秒的通用预算，而取流
+     必须先把整集 / 整章下载并落盘（iOS 没有端上 CENC 解密）。短剧一集勉强
+     够，整章有声书必然下不完，于是被判缓存失败。`/api/v1/videos/` 与
+     `/api/v1/audio/books/…/chapters/` 两条路由改用 300 秒预算，其余请求
+     保持 20 秒；音频的下载超时同样从 120 秒放宽到 300 秒。
+   - **缓存 id 复用**：第一个候选沿用旧 id（`audio_<chapter>_<tone>`），设备上
+     还留着上一版缓存的同名文件时直接命中；后续候选才带序号后缀。
+   - **明文兜底**：带密钥的候选全部失败后，用空密钥再下载一次。有些音色标称
+     `encrypt=true` 实际并未加密，空密钥缓存不写 key sidecar，播放器可以直接
+     播放原始字节。
+   - **失败带原因**：4903 的 message 现在带脱敏后的真实原因
+     （如 `IOS_AUDIO_CACHE_FAILED: download video: HTTP 403`），
+     `audio_play_error.dart` 直接显示原因，真机反馈能一眼定位。
    - 真正明文的流（无加密流候选）保留原响应直连播放。**找到加密流但全部
      缓存失败时不再静默回退加密直连地址**——iOS 解不开，只会得到一句无意义
      的「播放出错」——改为返回 `code 4903 / IOS_AUDIO_CACHE_FAILED`，
@@ -115,13 +132,21 @@ BUNDLE_ID=com.fqapp.fqapp IPA=/tmp/pack/fqapp_ios_unsigned.ipa ./your-sign-scrip
   缓存完成（比 Android 慢）。若 Rust 缓存失败会回退成加密直连地址，此时
   适配器发 `errorCode 4901`，界面显示「该片源暂不支持」而不是笼统的
   「播放失败」（见 `playback_issue.dart`）。
-- **智能朗读 / 真人讲书**：第二轮包（run 42505749165）真机反馈「真人讲书已能播，
-  智能朗读仍提示播放出错，只能用系统朗读」。两者共用同一条 playinfo 请求、
-  只是 `tone_id` 不同，因此最可能是上游对合成音色返回了另一形状 / 另一 CDN
-  的流，早期只取第一条加密流的匹配漏掉了它。第三轮已放宽信封与字段匹配、
-  补 `backup_url` 重试，并把 4901 / 4902 / 4903 映射成具体文案——**若仍有
-  问题，屏幕上的新文案可直接区分「服务端没解出来」与「播放器没加载出来」**。
-  首次起播需等整章缓存完。系统朗读（本地 `flutter_tts`）是独立链路。
+- **智能朗读 / 真人讲书**：第三轮包（run 42544196720）真机反馈「真人讲书从能播
+  变成不能播（4903），智能朗读仍提示播放出错，只能用系统朗读」。查下来是两个
+  独立问题：
+  1. **回环服务给每个请求只有 20 秒预算**（`server.rs`），而取流必须先把整章
+     下载并落盘——短剧一集勉强够，整章有声书必然下不完，于是被判缓存失败。
+     第四轮把 `/api/v1/videos/` 与 `/api/v1/audio/books/…/chapters/` 放宽到
+     300 秒，音频下载超时也从 120 秒放宽到 300 秒。
+  2. **两种信封只有一种补了 `key_hex`**：`patch_playinfo_keys` 处理 `data[]`，
+     `patch_encrypted_audio_keys` 处理 `data.video_model_datas[]`，而章节接口
+     原来只调用前者——智能朗读走的是后者，于是拿不到密钥、被 Dart 侧判成
+     「没有可播的流」，最终落到笼统的「播放出错」。第四轮在章节接口里两种都
+     跑，并补了针对两种信封的回归测试。
+  此外第四轮还：复用旧缓存 id（设备上可能还留着能播的那份）、加空密钥的明文
+  兜底、失败时把脱敏后的真实原因带给界面。首次起播需等整章缓存完。系统朗读
+  （本地 `flutter_tts`）是独立链路。
 - **离线加密缓存仍不可用**：`file://` + keyHex 需要端上 CENC 解密，而
   `desktop_media` / `desktop_fetch` 被 `#[cfg(target_os = "windows")]` 门住，
   iOS 静态库里没有 `fq_desktop_media_open`。同样走 4901 明确提示。要补齐需

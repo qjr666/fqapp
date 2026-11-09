@@ -39,7 +39,9 @@ part 'reader_video_api.dart';
 
 /// iOS 取流要等 Rust 把整集 / 整章缓存并按 Range 解密，默认 20 秒的 API
 /// 超时会在下载中途把请求取消。只用于视频和音频这两条取流路径。
-const Duration iosCacheFetchTimeout = Duration(seconds: 180);
+/// 取流类请求要等核心把整集 / 整章下载并落盘，20 秒的通用超时必然赶不上；
+/// 核心侧的回环预算同样放宽到了 300 秒，这里留出余量。
+const Duration iosCacheFetchTimeout = Duration(seconds: 420);
 
 /// API client talking to the local Rust core.
 ///
