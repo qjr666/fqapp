@@ -3998,7 +3998,12 @@ class _InlineVideoLayer extends StatelessWidget {
                       quarterTurns: playback.rotation.value,
                       child: platformVideoSurface(
                         textureId,
-                        key: ValueKey('drama_inline_${item.id}'),
+                        // 这个 key 是官方短剧播放器的约定：卡片上只允许有
+                        // 一块纹理，多一块就说明播放器没有回收。改名字会让
+                        // 上层的复用判断失效。
+                        key: ValueKey(
+                          'drama_inline_texture_${item.kind}_${item.id}',
+                        ),
                       ),
                     ),
                   ),

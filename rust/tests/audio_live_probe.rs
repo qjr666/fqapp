@@ -348,18 +348,14 @@ async fn live_audio_probe() {
     // 有声书 id 优先；实在没有才退回普通 book_id（可能是小说）。
     let mut candidates: Vec<String> = Vec::new();
     for (key, value) in &tagged {
-        if key == "audio_book_id" || key == "audio_id" {
-            if !candidates.contains(value) {
-                candidates.push(value.clone());
-            }
+        if (key == "audio_book_id" || key == "audio_id") && !candidates.contains(value) {
+            candidates.push(value.clone());
         }
     }
     let audio_candidates = candidates.len();
     for (key, value) in &tagged {
-        if key == "book_id" || key == "bookId" {
-            if !candidates.contains(value) {
-                candidates.push(value.clone());
-            }
+        if (key == "book_id" || key == "bookId") && !candidates.contains(value) {
+            candidates.push(value.clone());
         }
     }
     println!(

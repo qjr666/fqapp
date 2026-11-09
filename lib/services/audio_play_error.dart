@@ -58,6 +58,14 @@ String? _cacheFailureReason(String message) {
 
 /// 上游业务错误 / 解析失败的具体原因。没有原因的失败才回落通用文案。
 String? _errorDetail(Object error) {
+  // HTTP 层的失败沿用官方的通用文案：上游正文（「章节不存在」之类）是给
+  // 接口看的，不是给用户看的提示。官方在这一步显示的是 f4
+  // 「播放出错，请稍后重试」。
+  if (error is ApiException &&
+      error.statusCode != null &&
+      error.statusCode != 200) {
+    return null;
+  }
   final raw = error is FormatException
       ? error.message.toString()
       : (error is ApiException ? error.message : '');
