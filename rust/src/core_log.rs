@@ -1,9 +1,10 @@
-// Rust 核心日志：Android 上 logcat + 落盘副本双写。
+// Rust 核心日志：Android 上 logcat + 落盘副本双写，iOS 上只有落盘副本。
 //
 // 为什么要有落盘副本：`log` 宏原先只经 `android_logger` 写 logcat，而 Android 应用
 // **读不到自己的 logcat**（READ_LOGS 是系统权限），真机上排障等于没有观测面。落盘
 // 文件放在 `init` 传入的运行时目录（Dart 侧 `BackendService` 用的是同一个目录），
-// 由 Dart 日志页的「Rust」视图读取。
+// 由 Dart 日志页的「Rust」视图读取。iOS 既没有 logcat 也没有控制台，落盘副本是
+// 那里唯一的观测面，所以同样要装。
 //
 // 行格式与 Dart 侧 `app.log` 同形（`[级别] ISO标签: 消息`），Dart 因此可以复用同一个
 // 解析器；标签固定为 `core`（冒号无关），模块路径放进消息里，避免被解析截断。

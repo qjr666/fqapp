@@ -342,6 +342,38 @@ async fn probe_case(srv: &Arc<Server>, lb: &Loopback, case: &Case) {
         );
     }
 
+    // 上游是按客户端下发 CDN 域名的：换一台设备再问一次，看域名会不会变。
+    // 会变的话，「第一台给的域名解析不了」就有第二条路可走。
+    for round in 1..=2 {
+        let repeat = chapter_info(
+            &srv.ctx,
+            &Params::from_pairs(vec![
+                ("book_id".to_string(), case.book_id.clone()),
+                ("chapter_id".to_string(), case.chapter_id.clone()),
+                ("tone_id".to_string(), case.tone_id.clone()),
+            ]),
+        )
+        .await;
+        match repeat {
+            Ok(value) => {
+                let hosts: Vec<String> = audio_urls(&value)
+                    .into_iter()
+                    .map(|(url, _)| {
+                        url.split("://")
+                            .nth(1)
+                            .unwrap_or("")
+                            .split('/')
+                            .next()
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect();
+                println!("[hosts] round {round}: {}", hosts.join(", "));
+            }
+            Err(err) => println!("[hosts] round {round}: failed: {err:?}"),
+        }
+    }
+
     // 服务端缓存 + 解密。
     let started = Instant::now();
     let plain = chapter_info(
@@ -411,12 +443,43 @@ async fn probe_case(srv: &Arc<Server>, lb: &Loopback, case: &Case) {
         "[plain] identical bytes: {} (false means the bytes were decrypted)",
         raw == decrypted
     );
-    for marker in ["enca", "mp4a", "encv", "hvc1", "senc"] {
+    for marker in ["enca", "mp4a", "Opus", "encv", "hvc1", "senc"] {
         println!(
             "[plain] marker {marker:?}: raw={:?} decrypted={:?}",
             find_bytes(&raw, marker.as_bytes()),
             find_bytes(&decrypted, marker.as_bytes())
         );
+    }
+
+    // CDN 降级阶梯：上游按客户端下发域名，真机拿到的那个可能公网根本解析
+    // 不了。这里把阶梯上的每个主机都试一遍，验证「换一个主机，同一条路径
+    // 仍然取得到同一份字节」——这是真机能不能出声的前提。
+    probe_cdn_ladder(raw_url).await;
+}
+
+/// 逐个试 CDN 阶梯上的主机，打印谁真的能服务这条路径。
+///
+/// 打印的只有主机名与状态码：地址里的路径与签名是凭据，不能进日志。
+async fn probe_cdn_ladder(raw_url: &str) {
+    let candidates = fqapi_core::endpoints::video::cdn_host_candidates(raw_url);
+    println!("[cdn] {} candidates", candidates.len());
+    for candidate in candidates {
+        let host = candidate
+            .split("://")
+            .nth(1)
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("?")
+            .to_string();
+        match fetch_range(&candidate, 1023).await {
+            Ok((status, bytes)) => {
+                println!("[cdn] {host} -> status={status} bytes={}", bytes.len());
+            }
+            Err(err) => {
+                println!("[cdn] {host} -> failed: {err}");
+            }
+        }
     }
 }
 

@@ -278,79 +278,66 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                     tone_id
                 );
             } else {
-                let base_id = audio_cache_id(&chapter_id, &tone_id);
-                let mut last_err = String::from("no candidate attempted");
                 let mut attempts: Vec<String> = Vec::new();
 
-                // 第一轮：带密钥的候选。第一个候选沿用旧 id —— 设备上还可能
-                // 留着上一版缓存的同名文件，命中它就不用重新下载整章。
-                let keyed: Vec<&AudioCandidate> =
-                    candidates.iter().filter(|c| !c.key.is_empty()).collect();
-                for (index, candidate) in keyed.iter().enumerate() {
-                    let cache_id = if index == 0 {
-                        base_id.clone()
-                    } else {
-                        format!("{base_id}_{index}")
-                    };
-                    match crate::endpoints::video::download_and_save_with_timeout(
-                        ctx,
-                        &cache_id,
-                        &candidate.url,
-                        &candidate.key,
-                        AUDIO_DOWNLOAD_TIMEOUT,
-                    )
+                // 第一轮：按上游给的地址下载。
+                match cache_audio_chapter(ctx, &chapter_id, &tone_id, &candidates, &mut attempts)
                     .await
-                    {
-                        Ok(served) => {
-                            // `parsePlayinfoSource` walks the last envelope's
-                            // `data` list. A bare `main_url` without
-                            // `encrypt_info` hits its plain-stream branch, and
-                            // `_mediaUrl` expands `/src/...` into the loopback
-                            // URL that `serve_src_file` decrypts per Range.
-                            return Ok(cached_audio_payload(&chapter_id, served, &attempts));
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "audio plain: chapter {} tone {} candidate {}/{} failed: {}",
-                                chapter_id,
-                                tone_id,
-                                index + 1,
-                                keyed.len(),
-                                err
-                            );
-                            attempts.push(format!("带密钥候选 {}: {}", index + 1, err));
-                            last_err = err;
-                        }
+                {
+                    Ok(served) => {
+                        // `parsePlayinfoSource` walks the last envelope's
+                        // `data` list. A bare `main_url` without
+                        // `encrypt_info` hits its plain-stream branch, and
+                        // `_mediaUrl` expands `/src/...` into the loopback
+                        // URL that `serve_src_file` decrypts per Range.
+                        return Ok(cached_audio_payload(&chapter_id, served, &attempts));
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "audio plain: chapter {} tone {} exhausted {} candidates (last: {})",
+                            chapter_id,
+                            tone_id,
+                            candidates.len(),
+                            err
+                        );
                     }
                 }
 
-                // 第二轮：明文兜底。有些音色标称 encrypt=true，实际内容并没有
-                // 加密；用空 key 下载一次，缓存里不写 key sidecar，播放器就能
-                // 直接播放原始字节。只试第一个地址，避免把时间耗在同一个
-                // 文件的副本上。
-                if let Some(candidate) = candidates.first() {
-                    let plain_id = format!("{base_id}_plain");
-                    match crate::endpoints::video::download_and_save_with_timeout(
-                        ctx,
-                        &plain_id,
-                        &candidate.url,
-                        &[],
-                        AUDIO_DOWNLOAD_TIMEOUT,
-                    )
-                    .await
-                    {
-                        Ok(served) => {
+                // 第二轮：换一台设备再问一次上游。上游是按客户端下发 CDN
+                // 域名的，第一台设备拿到的那个名字可能在公网根本解析不了；
+                // 换一台往往就是一个能用的域名。已经试过的主机不再重试，
+                // 所以上游没换域名时这一轮几乎不花时间。
+                if let Ok(mut retry_payload) = fetch_playinfo_with_retry(ctx, p.clone(), 2).await {
+                    normalize_audio_envelope(&mut retry_payload);
+                    patch_playinfo_keys(&mut retry_payload);
+                    patch_encrypted_audio_keys(&mut retry_payload);
+                    let retry_scan = encrypted_audio_candidates(&retry_payload);
+                    let tried_hosts = upstream_host_list(&candidates);
+                    let fresh: Vec<AudioCandidate> = retry_scan
+                        .candidates
+                        .into_iter()
+                        .filter(|candidate| {
+                            !tried_hosts.contains(&host_of_candidate(candidate))
+                        })
+                        .collect();
+                    if !fresh.is_empty() {
+                        let fresh_hosts = upstream_host_list(&fresh);
+                        log::warn!(
+                            "audio plain: chapter {} tone {} retrying with new hosts: {}",
+                            chapter_id,
+                            tone_id,
+                            fresh_hosts.join(", ")
+                        );
+                        if let Ok(served) = cache_audio_chapter(
+                            ctx,
+                            &chapter_id,
+                            &tone_id,
+                            &fresh,
+                            &mut attempts,
+                        )
+                        .await
+                        {
                             return Ok(cached_audio_payload(&chapter_id, served, &attempts));
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "audio plain: chapter {} tone {} plain fallback failed: {}",
-                                chapter_id,
-                                tone_id,
-                                err
-                            );
-                            attempts.push(format!("明文兜底: {}", err));
-                            last_err = err;
                         }
                     }
                 }
@@ -358,11 +345,18 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                 // 服务端确实没能拿到可解密的音频。给出带原因的业务码：iOS 端
                 // 没有端上解密能力，把加密直连地址塞回去只会得到一句没有
                 // 信息量的「播放出错」。
+                //
+                // 消息里带上上游给过的域名：上游按客户端下发 CDN 域名，
+                // 有时给的那个名字在公网根本解析不了。只看最后一个候选的
+                // 报错，分不清「上游给了死域名」还是「路径不对」。
+                let upstream_hosts = upstream_host_list(&candidates);
+                let last_err = attempts.last().cloned().unwrap_or_default();
                 log::warn!(
-                    "audio plain: chapter {} tone {} exhausted {} candidates (last: {})",
+                    "audio plain: chapter {} tone {} exhausted {} candidates (hosts: {}; last: {})",
                     chapter_id,
                     tone_id,
                     candidates.len(),
+                    upstream_hosts.join(", "),
                     last_err
                 );
                 return Ok(json!({
@@ -371,9 +365,10 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                         "item_id": chapter_id.clone(),
                         "code": 4903,
                         "message": format!(
-                            "IOS_AUDIO_CACHE_FAILED: {}（已尝试 {} 个候选）",
+                            "IOS_AUDIO_CACHE_FAILED: {}（已尝试 {} 次；上游域名：{}）",
                             sanitize_cache_error(&last_err),
-                            attempts.len()
+                            attempts.len(),
+                            upstream_hosts.join(", ")
                         ),
                     }],
                 }));
@@ -383,16 +378,124 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
     })
 }
 
-/// Collects every encrypted stream of a patched playinfo answer, paired with
-/// a usable 16-byte key, in the order the player should try them.
+/// Downloads one chapter into the cache and returns the path it is served
+/// from.
 ///
-/// The upstream switches envelope shape by book genre / tone: the chapter
-/// endpoint normally answers `data[].video_model`, while some 智能朗读 voices
-/// arrive in the mget-style `data.video_model_datas[].video_model`. Accepting
-/// both, tolerating an absent `media_type`, deriving the key from `spade_a`
-/// when `key_hex` is missing, and retrying `backup_url` is what keeps an
-/// unfamiliar voice from silently falling back to the encrypted direct URL
-/// that iOS cannot play.
+/// Two rounds per candidate list: the encrypted streams first (they are the
+/// ones the upstream marks as encrypted, and they carry the key that makes
+/// the cache entry decryptable), then a clear-stream fallback — some voices
+/// claim `encrypt=true` while the bytes are not encrypted at all, and
+/// caching them without a key lets the player use the original bytes
+/// directly.
+///
+/// Every failure is appended to `attempts`, which ends up in the answer's
+/// `diag` and, when nothing worked, in the reason shown on screen.
+async fn cache_audio_chapter(
+    ctx: &Ctx,
+    chapter_id: &str,
+    tone_id: &str,
+    candidates: &[AudioCandidate],
+    attempts: &mut Vec<String>,
+) -> Result<String, String> {
+    let base_id = audio_cache_id(chapter_id, tone_id);
+    let mut last_err = String::from("no candidate attempted");
+
+    // 第一轮：带密钥的候选。第一个候选沿用旧 id —— 设备上还可能
+    // 留着上一版缓存的同名文件，命中它就不用重新下载整章。
+    let keyed: Vec<&AudioCandidate> = candidates.iter().filter(|c| !c.key.is_empty()).collect();
+    for (index, candidate) in keyed.iter().enumerate() {
+        let cache_id = if index == 0 {
+            base_id.clone()
+        } else {
+            format!("{base_id}_{index}")
+        };
+        match crate::endpoints::video::download_and_save_with_timeout(
+            ctx,
+            &cache_id,
+            &candidate.url,
+            &candidate.key,
+            AUDIO_DOWNLOAD_TIMEOUT,
+        )
+        .await
+        {
+            Ok(served) => return Ok(served),
+            Err(err) => {
+                log::warn!(
+                    "audio plain: chapter {} tone {} candidate {}/{} failed: {}",
+                    chapter_id,
+                    tone_id,
+                    index + 1,
+                    keyed.len(),
+                    err
+                );
+                attempts.push(format!("带密钥候选 {}: {}", index + 1, err));
+                last_err = err;
+            }
+        }
+    }
+
+    // 第二轮：明文兜底。只试第一个地址，避免把时间耗在同一个文件的副本上。
+    if let Some(candidate) = candidates.first() {
+        let plain_id = format!("{base_id}_plain");
+        match crate::endpoints::video::download_and_save_with_timeout(
+            ctx,
+            &plain_id,
+            &candidate.url,
+            &[],
+            AUDIO_DOWNLOAD_TIMEOUT,
+        )
+        .await
+        {
+            Ok(served) => return Ok(served),
+            Err(err) => {
+                log::warn!(
+                    "audio plain: chapter {} tone {} plain fallback failed: {}",
+                    chapter_id,
+                    tone_id,
+                    err
+                );
+                attempts.push(format!("明文兜底: {}", err));
+                last_err = err;
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+/// The host of one candidate address.
+fn host_of_candidate(candidate: &AudioCandidate) -> String {
+    candidate
+        .url
+        .split("://")
+        .nth(1)
+        .unwrap_or(candidate.url.as_str())
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The hosts the upstream offered for one chapter, in order and without
+/// duplicates.
+///
+/// Only the host is kept: the path and the query of a media address are the
+/// credential that proves the request is authorised, so they must not reach
+/// a message that ends up on the screen.
+fn upstream_host_list(candidates: &[AudioCandidate]) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let host = host_of_candidate(candidate);
+        if host.is_empty() {
+            continue;
+        }
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
 /// 整章有声书的缓存下载预算。短剧一集只有几 MB，120 秒绰绰有余；一章
 /// 真人讲书动辄十几分钟音频、几十 MB，手机网络下 120 秒经常下不完，缓存
 /// 于是被判失败。回环服务对音频章节路由也放宽了同样的预算。

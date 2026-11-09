@@ -111,9 +111,12 @@ pub async fn init(
 ) -> Result<String, String> {
     // The shipping core has no console, and an Android app cannot read its own
     // logcat (READ_LOGS is a system permission), so logs go to a rotating file
-    // beside the runtime files *and* to logcat. Desktop/test builds never
+    // beside the runtime files *and* to logcat. iOS has no console and no
+    // logcat at all, but the Dart log page reads the same rotating file, so
+    // the file is the only observation surface there — which is exactly what
+    // a phone that cannot reach the CDN needs. Desktop/test builds never
     // install a logger, where the `log` macros compile to no-ops.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         crate::core_log::install(&resolve_runtime_dir(&config_path, &runtime_dir));
         log::info!("core init: port={port} lan_share={lan_share} config={config_path}");

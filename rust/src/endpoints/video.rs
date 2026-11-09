@@ -1383,6 +1383,118 @@ fn describe_transport_error(err: &reqwest::Error) -> String {
     parts.join(" | ")
 }
 
+/// How long a fallback CDN host may spend proving it serves the path.
+const CDN_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The host of an address, without its path or query.
+///
+/// Only the host is ever logged or shown on screen: the path and the query
+/// of a media address are the credential that proves the request is
+/// authorised, so they must not leak into a message.
+fn host_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// The addresses one media path may be fetched from, in the order they should
+/// be tried.
+///
+/// The upstream picks a CDN host per client. The same chapter answered for a
+/// phone on a Chinese network came back as `v11-novelapp.fqnovel.com` — a
+/// name that resolves nowhere, so the phone could not fetch a byte — while a
+/// cloud probe was answered with `v5-novelapp.fqnovelvod.com`. The *path*
+/// identifies the object, not the host: the `v3` generation of
+/// `fqnovelvod.com` serves the very same path, unsigned, and so does
+/// `v3-dy-o.zjcdn.com`. A dead host can therefore be swapped for a live one
+/// that carries the identical path.
+///
+/// The first entry is always the address the upstream gave. The rest keep
+/// the path and only move the host; the signature in the query was seen
+/// accepted by more than one host, so it is kept, with a copy without it as
+/// a second try for the generations that reject a foreign signature.
+pub fn cdn_host_candidates(url: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![url.to_string()];
+    let Ok(parsed) = url::Url::parse(url) else {
+        return out;
+    };
+    let host = parsed.host_str().unwrap_or("").to_string();
+    // 只有真实 CDN 域名才做降级：测试用的本地 mock 服务器换了域名也没有
+    // 意义，反而会让同一个请求被重复发出去。
+    let is_cdn = [".fqnovelvod.com", ".fqnovel.com", ".zjcdn.com"]
+        .iter()
+        .any(|suffix| host.ends_with(suffix));
+    if !is_cdn {
+        return out;
+    }
+    let path = parsed.path().to_string();
+    let query = parsed
+        .query()
+        .map(|value| format!("?{value}"))
+        .unwrap_or_default();
+    // `v11-novelapp.fqnovel.com` -> version `v11`, family `novelapp`.
+    let prefix = match host.split_once('.') {
+        Some((prefix, _domain)) => prefix.to_string(),
+        None => host.clone(),
+    };
+    let (version, family) = match prefix.split_once('-') {
+        Some((version, family)) => (version.to_string(), family.to_string()),
+        None => (String::new(), prefix.clone()),
+    };
+
+    let mut hosts: Vec<String> = Vec::new();
+    if !version.is_empty() && !family.is_empty() {
+        // 先保留上游给的版本号，只把域名换成能解析的那个。
+        hosts.push(format!("{version}-{family}.fqnovelvod.com"));
+    }
+    for candidate_version in ["v3", "v5"] {
+        if !family.is_empty() {
+            hosts.push(format!("{candidate_version}-{family}.fqnovelvod.com"));
+        }
+    }
+    hosts.push("v3-dy-o.zjcdn.com".to_string());
+    // 已确认能匿名服务同一路径的两个 host，作为跨族的通用兜底。
+    hosts.push("v3-fq-tts.fqnovelvod.com".to_string());
+    hosts.push("v3-novelapp.fqnovelvod.com".to_string());
+
+    for host in hosts {
+        for candidate in [
+            format!("https://{host}{path}{query}"),
+            format!("https://{host}{path}"),
+        ] {
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+/// Asks a candidate host for the first kilobyte of the media.
+///
+/// The fallback hosts are educated guesses; one kilobyte is enough to tell a
+/// host that serves the path from one that does not, and it keeps a dead
+/// host from eating the chapter's whole download budget.
+async fn probe_media_host(url: &str, timeout: Duration) -> Result<(), String> {
+    let Some(client) = streaming_client() else {
+        return Err("streaming client unavailable".to_string());
+    };
+    let resp = client
+        .get(url)
+        .timeout(timeout)
+        .header(reqwest::header::USER_AGENT, UA_WINDOWS_BROWSER)
+        .header(reqwest::header::RANGE, "bytes=0-1023")
+        .send()
+        .await
+        .map_err(|e| format!("download video: {}", describe_transport_error(&e)))?;
+    let status = resp.status();
+    if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(format!("download video: HTTP {status}"));
+    }
+    Ok(())
+}
+
 /// Streams a video body to `part_path` chunk by chunk, never holding the
 /// whole file in memory. Enforces the per-file cap from `Content-Length`
 /// when present and from the running byte count while streaming. Leaves a
@@ -1625,11 +1737,65 @@ pub(crate) async fn download_and_save_with_timeout(
         // would go to the real upstream instead of the mock server and
         // the codec-gate download tests would never see the request.
         let download_url = ctx.up.effective_url(video_url);
-        if let Err(err) =
-            stream_download_to_file(&download_url, UA_WINDOWS_BROWSER, &part_path, timeout).await
-        {
+        // 上游按客户端下发 CDN 域名，同一段媒体在不同网络下会得到不同的
+        // 主机名；有的域名在公网根本解析不了。路径才是对象的身份，所以
+        // 主地址不通时按 host 阶梯换一个能服务同一路径的主机。
+        let candidates: Vec<String> = cdn_host_candidates(&download_url)
+            .into_iter()
+            .map(|candidate| ctx.up.effective_url(&candidate))
+            .collect();
+        let mut last_err = String::from("no CDN host attempted");
+        let mut tried: Vec<String> = Vec::new();
+        let mut downloaded = false;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if index > 0 {
+                // 备用主机只是推断出来的：先花一小段预算确认它真的服务这个
+                // 路径，别让一个死域名把整章的下载时间吃掉。
+                if let Err(err) = probe_media_host(candidate, CDN_PROBE_TIMEOUT).await {
+                    log::warn!(
+                        "download: fallback host {} does not serve the path: {}",
+                        host_of(candidate),
+                        err
+                    );
+                    tried.push(host_of(candidate));
+                    continue;
+                }
+            }
             let _ = tokio::fs::remove_file(&part_path).await;
-            return Err(err);
+            match stream_download_to_file(candidate, UA_WINDOWS_BROWSER, &part_path, timeout).await {
+                Ok(_) => {
+                    downloaded = true;
+                    break;
+                }
+                Err(err) => {
+                    log::warn!(
+                        "download: candidate {}/{} ({}) failed: {}",
+                        index + 1,
+                        candidates.len(),
+                        host_of(candidate),
+                        err
+                    );
+                    last_err = err;
+                    tried.push(host_of(candidate));
+                }
+            }
+        }
+        if !downloaded {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            // 只留主机名，且只留前几个：完整名单太长，屏幕上的提示会被
+            // 截断，反而看不到最关键的那个。
+            let mut listed: Vec<&String> = Vec::new();
+            for host in &tried {
+                if !listed.contains(&host) {
+                    listed.push(host);
+                }
+            }
+            let shown: Vec<&str> = listed.iter().take(6).map(|host| host.as_str()).collect();
+            let mut message = last_err.clone();
+            if !shown.is_empty() {
+                message.push_str(&format!(" (tried hosts: {})", shown.join(", ")));
+            }
+            return Err(message);
         }
     } else {
         // No TLS provider installed in this process (unit-test embedding
@@ -2440,47 +2606,92 @@ fn build_cenc_index(
     Ok(Some(index))
 }
 
+/// The clear sample-entry type recorded in the `frma` box of a `sinf`.
+///
+/// CENC replaces the real codec box (`Opus`, `avc1`, `hvc1`, ...) with an
+/// encrypted one (`enca`, `encv`) and keeps the original four-character code
+/// in `frma`. Renaming the entry back to that code is what makes the
+/// decrypted stream decodable; guessing the code does not.
+///
+/// Guessing is not a small mistake here: a listening chapter is an Opus
+/// track in MP4, and renaming it to `mp4a` tells the decoder to expect AAC
+/// and then hands it Opus packets. The decoder rejects the file outright
+/// ("invalid sampling rate index"), which is why 智能朗读 could never make a
+/// sound on iOS while the container itself decrypted correctly.
+fn original_sample_entry_type(data: &[u8], sinf: &Mp4Box) -> Option<[u8; 4]> {
+    for child in iter_boxes(data, sinf.off + sinf.header, sinf.off + sinf.size) {
+        if child.typ != *b"frma" || child.off + 12 > data.len() {
+            continue;
+        }
+        let mut code = [0u8; 4];
+        code.copy_from_slice(&data[child.off + 8..child.off + 12]);
+        if code.iter().all(|byte| *byte == 0) {
+            return None;
+        }
+        return Some(code);
+    }
+    None
+}
+
 /// Records the rewrites `rewrite_encrypted_sample_entries` used to apply in
 /// place (encv -> hvc1, enca -> mp4a, `sinf` blanked into a `free` box) as
 /// offset patches instead, so the file on disk keeps its original bytes.
+///
+/// The sample entry is renamed to the code `frma` records, not to a hardcoded
+/// one — see [`original_sample_entry_type`] for why that difference decides
+/// whether the chapter is audible at all.
 fn collect_sample_entry_patches(
     data: &[u8],
     boxes: &HashMap<[u8; 4], Vec<Mp4Box>>,
     base_off: u64,
     out: &mut Vec<CencPatch>,
 ) {
-    for (typ, replacement) in [(b"encv", b"hvc1"), (b"enca", b"mp4a")] {
+    for (typ, fallback) in [(b"encv", b"hvc1"), (b"enca", b"mp4a")] {
         let Some(list) = boxes.get(typ) else {
             continue;
         };
         for b in list {
+            let children = match box_children_start(typ, b.off, b.header) {
+                Some(start) => iter_boxes(data, start, b.off + b.size),
+                None => Vec::new(),
+            };
+            let sinf = children.iter().find(|child| child.typ == *b"sinf");
+            let replacement = sinf
+                .and_then(|box_| original_sample_entry_type(data, box_))
+                .unwrap_or(fallback);
             if b.off + 8 <= data.len() {
                 out.push(CencPatch {
                     off: base_off + (b.off + 4) as u64,
                     bytes: replacement.to_vec(),
                 });
             }
-            let Some(child_start) = box_children_start(typ, b.off, b.header) else {
+            let Some(sinf) = sinf else {
                 continue;
             };
-            for child in iter_boxes(data, child_start, b.off + b.size) {
-                if child.typ == *b"sinf" {
-                    let mut header = Vec::with_capacity(8);
+            {
+                // 保留 box 的原大小，只把类型改成 `free`：播放器会跳过
+                // `free` 的内容，但仍然按声明的长度前进。若把大小改成 8
+                // 再把剩下的字节清零，父容器里就会多出一个「长度为 0」的
+                // 盒子——按 ISO BMFF 它的含义是「一直到文件末尾」，解析器
+                // 会因此把后面的兄弟盒子一起吞掉。
+                let mut header = Vec::with_capacity(8);
+                if sinf.header == 8 {
+                    header.extend_from_slice(&(sinf.size as u32).to_be_bytes());
+                } else {
                     header.extend_from_slice(&8u32.to_be_bytes());
-                    header.extend_from_slice(b"free");
+                }
+                header.extend_from_slice(b"free");
+                out.push(CencPatch {
+                    off: base_off + sinf.off as u64,
+                    bytes: header,
+                });
+                let start = sinf.off + 8;
+                let end = (sinf.off + sinf.size).min(data.len());
+                if start < end {
                     out.push(CencPatch {
-                        off: base_off + child.off as u64,
-                        bytes: header,
+                        off: base_off + start as u64,
+                        bytes: vec![0u8; end - start],
                     });
-                    let start = child.off + 8;
-                    let end = (child.off + child.size).min(data.len());
-                    if start < end {
-                        out.push(CencPatch {
-                            off: base_off + start as u64,
-                            bytes: vec![0u8; end - start],
-                        });
-                    }
-                    break;
                 }
             }
         }
@@ -2787,6 +2998,8 @@ pub fn register(s: &mut Server) {
 
 #[cfg(test)]
 mod cenc_sample_fixture;
+#[cfg(test)]
+mod cdn_hosts;
 #[cfg(test)]
 mod spade_vectors;
 #[cfg(test)]
