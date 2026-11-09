@@ -1521,9 +1521,7 @@ pub fn cdn_host_candidates(url: &str) -> Vec<String> {
 fn short_reason(err: &str) -> String {
     if let Some(pos) = err.find("HTTP ") {
         let tail = &err[pos..];
-        let end = tail
-            .find(|c: char| c == ' ' || c == ')' || c == '|')
-            .unwrap_or(tail.len());
+        let end = tail.find([' ', ')', '|']).unwrap_or(tail.len());
         return tail[..end].to_string();
     }
     if err.contains("timeout") {
