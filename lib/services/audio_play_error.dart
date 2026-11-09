@@ -64,6 +64,11 @@ String? _errorDetail(Object error) {
   final text = raw.trim();
   if (text.isEmpty) return null;
   if (text.startsWith('HTTP ')) return '音频服务返回异常（$text）';
+  // 上游偶尔回一个零字节的 200，核心只能报「解析失败」。说清楚是上游
+  // 没给内容，用户重试一次通常就好了。
+  if (text.startsWith('parse upstream json: EOF')) {
+    return '上游这次没有返回音频内容，请重试';
+  }
   if (text.contains('未获取到音频地址')) {
     return '没有取到这一章的音频地址，可换一章或改用系统朗读';
   }

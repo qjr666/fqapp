@@ -94,15 +94,48 @@ fn tone_ids(value: &Value, key: &str) -> Vec<String> {
             continue;
         };
         for id_key in ["id", "tone_id"] {
-            if let Some(Value::String(text)) = obj.get(id_key) {
-                if !text.is_empty() {
+            match obj.get(id_key) {
+                Some(Value::String(text)) if !text.is_empty() => {
                     out.push(text.clone());
                     break;
                 }
+                Some(Value::Number(num)) => {
+                    out.push(num.to_string());
+                    break;
+                }
+                _ => {}
             }
         }
     }
     out
+}
+
+/// 智能朗读用的**原著**书号：TTS 走的是原著的章节 id。
+fn related_novel_id(value: &Value) -> Option<String> {
+    let data = data_of(value);
+    for key in ["relate_novel_bookid_str", "relate_novel_bookid"] {
+        match data.get(key) {
+            Some(Value::String(text)) if !text.is_empty() && text != "0" => {
+                return Some(text.clone());
+            }
+            Some(Value::Number(num)) => {
+                let text = num.to_string();
+                if text != "0" {
+                    return Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 把一小段 JSON 打成一行，便于在探针日志里看清形状。
+fn json_line(value: Option<&Value>) -> String {
+    match value {
+        Some(v) => serde_json::to_string(v).unwrap_or_default(),
+        None => "none".to_string(),
+    }
 }
 
 /// 从 `audio_tones` 里取出真人讲书主播的 abook_id。
@@ -422,7 +455,9 @@ async fn probe_flakiness(srv: &Arc<Server>, book_id: &str, chapter_id: &str, ton
 }
 
 /// 找出真机上那本书的「智能朗读」音色与「真人讲书」主播。
-async fn resolve_target(srv: &Arc<Server>) -> Option<(String, Vec<String>, Vec<String>)> {
+async fn resolve_target(
+    srv: &Arc<Server>,
+) -> Option<(String, Vec<String>, Vec<String>, Option<String>)> {
     let search = srv.handler("search")?;
     let tones = srv.handler("tones")?;
     let directory = srv.handler("directory")?;
@@ -449,13 +484,21 @@ async fn resolve_target(srv: &Arc<Server>) -> Option<(String, Vec<String>, Vec<S
                 continue;
             }
         };
+        let data = data_of(&detail);
         let tts = tone_ids(&detail, "tts_tones");
         let narrators = narrator_ids(&detail);
+        let novel = related_novel_id(&detail);
         println!(
-            "=== book {id}: envelope={} tts_tones={:?} narrators={:?}",
-            envelope_shape(&detail),
-            tts,
-            narrators
+            "=== book {id}: tts_tones={:?} narrators={:?} related_novel={:?}",
+            tts, narrators, novel
+        );
+        println!(
+            "[tones] tts_tones[0] = {}",
+            json_line(data.get("tts_tones").and_then(|v| v.as_array()).and_then(|l| l.first()))
+        );
+        println!(
+            "[tones] audio_tones[0] = {}",
+            json_line(data.get("audio_tones").and_then(|v| v.as_array()).and_then(|l| l.first()))
         );
         if tts.is_empty() && narrators.is_empty() {
             continue;
@@ -468,9 +511,26 @@ async fn resolve_target(srv: &Arc<Server>) -> Option<(String, Vec<String>, Vec<S
             println!("book {id} has no chapter id");
             continue;
         }
-        return Some((id.clone(), tts, narrators));
+        return Some((id.clone(), tts, narrators, novel));
     }
     None
+}
+
+/// 取一本书的第一章 id。
+async fn first_chapter(srv: &Arc<Server>, book_id: &str) -> Option<String> {
+    let detail = srv.handler("audio_book_detail")?;
+    let directory = srv.handler("directory")?;
+    let params = Params::from_pairs(vec![("book_id".to_string(), book_id.to_string())]);
+    let mut items: Vec<String> = Vec::new();
+    if let Ok(value) = detail(&srv.ctx, &params).await {
+        collect_strings(&value, ITEM_KEYS, &mut items);
+    }
+    if items.is_empty() {
+        if let Ok(value) = directory(&srv.ctx, &params).await {
+            collect_strings(&value, ITEM_KEYS, &mut items);
+        }
+    }
+    items.first().cloned()
 }
 
 /// 找一本真正的有声书和它的第一章，当对照组。
@@ -543,52 +603,42 @@ async fn live_audio_cache_probe() {
     }
 
     // ---- 目标书：真机上正在听的那本 ----
-    if let Some((book_id, tts_tones, narrators)) = resolve_target(&srv).await {
-        let directory = srv.handler("directory").expect("route");
-        let params = Params::from_pairs(vec![("book_id".to_string(), book_id.clone())]);
-        let mut chapters: Vec<String> = Vec::new();
-        if let Ok(value) = directory(&srv.ctx, &params).await {
-            collect_strings(&value, ITEM_KEYS, &mut chapters);
-        }
-        let Some(chapter_id) = chapters.first().cloned() else {
-            println!("=== target book has no chapter id");
-            return;
-        };
-
-        for tone in tts_tones.iter().take(3) {
-            probe_case(
-                &srv,
-                &lb,
-                &Case {
-                    label: format!("智能朗读 {book_id} tone {tone}"),
-                    book_id: book_id.clone(),
-                    chapter_id: chapter_id.clone(),
-                    tone_id: tone.clone(),
-                },
-            )
-            .await;
-        }
-
-        // 真人讲书：主播的 abook_id 是另一本书，章节也换成它自己的。
-        for narrator in narrators.iter().take(2) {
-            let detail = srv.handler("audio_book_detail").expect("route");
-            let params = Params::from_pairs(vec![("book_id".to_string(), narrator.clone())]);
-            let mut items: Vec<String> = Vec::new();
-            if let Ok(value) = detail(&srv.ctx, &params).await {
-                collect_strings(&value, ITEM_KEYS, &mut items);
+    if let Some((book_id, tts_tones, narrators, related_novel)) = resolve_target(&srv).await {
+        // 智能朗读：TTS 走的是**原著**的章节 id，音色取 tts_tones。
+        let tts_book = related_novel.clone().unwrap_or_else(|| book_id.clone());
+        let tts_chapter = first_chapter(&srv, &tts_book).await;
+        println!("=== 智能朗读 book={tts_book} chapter={tts_chapter:?}");
+        if let Some(chapter_id) = tts_chapter {
+            for tone in tts_tones.iter().take(3) {
+                probe_case(
+                    &srv,
+                    &lb,
+                    &Case {
+                        label: format!("智能朗读 {tts_book} tone {tone}"),
+                        book_id: tts_book.clone(),
+                        chapter_id: chapter_id.clone(),
+                        tone_id: tone.clone(),
+                    },
+                )
+                .await;
             }
-            let Some(abook_chapter) = items.first().cloned() else {
-                println!("=== narrator {narrator} has no chapter id");
+        }
+
+        // 真人讲书：主播那一本的章节 id，音色是 0（App 就是这么问的）。
+        for narrator in narrators.iter().take(2) {
+            let abook_chapter = first_chapter(&srv, narrator).await;
+            println!("=== 真人讲书 book={narrator} chapter={abook_chapter:?}");
+            let Some(chapter_id) = abook_chapter else {
                 continue;
             };
-            for tone in ["0", "1"] {
+            for tone in ["0"] {
                 probe_case(
                     &srv,
                     &lb,
                     &Case {
                         label: format!("真人讲书 {narrator} tone {tone}"),
                         book_id: narrator.clone(),
-                        chapter_id: abook_chapter.clone(),
+                        chapter_id: chapter_id.clone(),
                         tone_id: tone.to_string(),
                     },
                 )

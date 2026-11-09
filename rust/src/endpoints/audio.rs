@@ -143,6 +143,26 @@ fn has_playable_stream(payload: &Value) -> bool {
     })
 }
 
+/// Was this failure the upstream answering with a zero-byte body?
+fn is_empty_body_error(err: &ApiError) -> bool {
+    match err {
+        ApiError::Internal(message) => message.starts_with("parse upstream json: EOF"),
+        _ => false,
+    }
+}
+
+/// The upstream says "this voice has no recording" in two ways: a business
+/// code and an empty body. Answering with the upstream's own shape lets the
+/// app fall back to another voice instead of showing a bare
+/// 「播放出错，请稍后重试」.
+fn no_this_tone_payload() -> Value {
+    json!({
+        "code": 101019,
+        "data": [],
+        "message": "NO_THIS_TONE",
+    })
+}
+
 /// Looks for a recording under a neighbouring voice id.
 ///
 /// `tone_id=0` is not a real voice — the app shows it as a 「默认音色」
@@ -200,8 +220,15 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                 if tone_id == "0" {
                     match fetch_neighbour_tone(ctx, &p).await {
                         Some(alt) => alt,
-                        None => return Err(err),
+                        None => {
+                            if is_empty_body_error(&err) {
+                                return Ok(no_this_tone_payload());
+                            }
+                            return Err(err);
+                        }
                     }
+                } else if is_empty_body_error(&err) {
+                    return Ok(no_this_tone_payload());
                 } else {
                     return Err(err);
                 }
