@@ -88,12 +88,13 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                 ..Default::default()
             })
             .await?;
+        // 不同音色上游会回不同形状的信封，先统一成一种，下游只处理一种。
+        normalize_audio_envelope(&mut payload);
         patch_playinfo_keys(&mut payload);
         if plain_mode {
-            // 章节答案有两种信封：`data[].video_model` 与
-            // `data.video_model_datas[].video_model`。key 派生之前只覆盖了
-            // 前者，智能朗读因此拿不到 key_hex —— 核心与 Dart 两侧都会把它
-            // 当成「没有可播的流」。两种信封都要补 key。
+            // 信封已经在上面统一成 `data[]`，所以这里只需要 `data[]` 形状的
+            // key 派生；`patch_encrypted_audio_keys` 是给 mget 形状用的兜底，
+            // 归一化之后它不会命中。
             patch_encrypted_audio_keys(&mut payload);
             let scan = encrypted_audio_candidates(&payload);
             let saw_encrypted = scan.saw_encrypted;
@@ -459,6 +460,33 @@ fn patch_model_stream_keys(model: &mut Map<String, Value>) -> bool {
     changed
 }
 
+/// Upstream answers the audio playinfo endpoint with one of two envelopes
+/// depending on the voice: `data[]` (one row per item) or
+/// `data.video_model_datas[]` (the mget shape). The Dart side only knows the
+/// first one, so the second one failed to parse at all and the user saw a
+/// bare "播放出错" instead of a playable stream.
+///
+/// Normalise both into the `data[]` shape here so downstream code has one
+/// shape to handle. The original object is kept under `video_info` as well:
+/// the Dart legacy bridge understands that key, so both parsers can find the
+/// rows.
+fn normalize_audio_envelope(payload: &mut Value) -> bool {
+    let Some(root) = payload.as_object_mut() else {
+        return false;
+    };
+    let Some(data) = root.get("data").and_then(|d| d.as_object()) else {
+        return false;
+    };
+    let Some(rows) = data.get("video_model_datas").and_then(|r| r.as_array()) else {
+        return false;
+    };
+    let rows = rows.clone();
+    let original = Value::Object(data.clone());
+    root.insert("video_info".to_string(), original);
+    root.insert("data".to_string(), Value::Array(rows));
+    true
+}
+
 /// patchPlayinfoKeys: the playinfo answer nests the streams in
 /// data[].video_model (a JSON string).
 fn patch_playinfo_keys(v: &mut Value) {
@@ -762,5 +790,46 @@ mod key_vectors {
             candidates[0].key,
             hex::decode("0f7a32fda0f04388ba27cf1d0a95b024").expect("key")
         );
+    }
+
+    #[test]
+    fn normalises_the_mget_envelope_into_the_playinfo_shape() {
+        let model = audio_model(
+            "l7wZ+1azG8pUsS7NVIcYzWKCGvlWhCrVV5sa1lWsK+NnqC+2tg==",
+            "692e7c06f8818bb4b2223c0e00f7a81a",
+        );
+        let mut value = json!({
+            "code": 0,
+            "data": { "video_model_datas": [ { "item_id": "7579131531361258521", "video_model": model } ] }
+        });
+        assert!(normalize_audio_envelope(&mut value));
+        // `data` becomes the row list the Dart parser walks …
+        assert!(value["data"].is_array());
+        assert_eq!(value["data"][0]["item_id"], "7579131531361258521");
+        // … and the original object stays reachable under `video_info`.
+        assert!(value["video_info"]["video_model_datas"].is_array());
+
+        // The key patch now runs through the `data[]` path.
+        patch_playinfo_keys(&mut value);
+        let raw = value["data"][0]["video_model"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            parsed["video_list"][0]["encrypt_info"]["key_hex"],
+            "61826b7eceb342a9ad4fd9d7556be625"
+        );
+    }
+
+    #[test]
+    fn leaves_the_playinfo_envelope_alone() {
+        let model = audio_model(
+            "nbwTwF23F/5phBHDb4Qjz3KBC/lBtzrJcLI4y2qGEc9dhRWhoQ==",
+            "677752d8f8818bb4b2223c0e00f7a81a",
+        );
+        let mut value = json!({
+            "code": 0,
+            "data": [ { "item_id": "1", "video_model": model } ]
+        });
+        assert!(!normalize_audio_envelope(&mut value));
+        assert!(value["data"].is_array());
     }
 }
