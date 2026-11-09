@@ -146,8 +146,6 @@ func topViewController() -> UIViewController? {
 final class LibraryBackupChannel: NSObject, UIDocumentPickerDelegate {
   /// 与 Android 端一致的备份体积上限：16 MB。
   private static let maxBytes = 16 * 1024 * 1024
-  /// 分卷数量的上限，与 Android 端一致。
-  private static let maxParts = 2000
   /// 分卷文件名必须是这个形状，读回来时才知道没有越出采集目录。
   private static let partPattern = "^part-[0-9]+-[a-fA-F0-9-]+\\.json$"
   /// 导出文件名由调用方给出，必须是普通文件名，不能带路径分隔符。
@@ -159,8 +157,9 @@ final class LibraryBackupChannel: NSObject, UIDocumentPickerDelegate {
     case open
     /// 把一段内容交给用户保存。
     case save(Data, String)
-    /// 把采集清单与分卷打成一个 zip 交给用户保存。
-    case exportZip(Data, [String], String)
+    /// 采集分卷导出：iOS 没有系统 zip API，交回 Dart 用纯 Dart 压缩后
+    /// 再走 `saveBackup`，这里只负责给出明确的 unsupported 答复。
+    case exportZip
   }
 
   private let channel: FlutterMethodChannel
@@ -199,13 +198,10 @@ final class LibraryBackupChannel: NSObject, UIDocumentPickerDelegate {
       }
       begin(.save(data, exportName(args, fallback: "fqapp-backup.json")), result)
     case "exportFanqieCapture":
-      guard let data = byteArgument(args, "bytes"),
-        let parts = args?["parts"] as? [String] else {
-        result(FlutterError(code: "bad_args", message: "缺少采集分卷参数", details: nil))
-        return
-      }
-      begin(
-        .exportZip(data, parts, exportName(args, fallback: "fqapp-fanqie-capture.zip")), result)
+      // 打包交给 Dart 的 `archive`：iOS 没有公开的 FileManager.zipItem，
+      // 直接回一个契约里约定好的错误，Dart 会把 zip 字节通过 saveBackup
+      // 再送回来，用系统选择器导出。
+      begin(.exportZip, result)
     case "storeFanqieCapture":
       guard let data = byteArgument(args, "bytes") else {
         result(FlutterError(code: "bad_args", message: "缺少采集内容", details: nil))
@@ -267,15 +263,12 @@ final class LibraryBackupChannel: NSObject, UIDocumentPickerDelegate {
       } catch {
         finish(FlutterError(code: "write_failed", message: error.localizedDescription, details: nil))
       }
-    case .exportZip(let data, let parts, let name):
-      do {
-        let url = try makeArchive(manifest: data, parts: parts, name: name)
-        present(UIDocumentPickerViewController(forExporting: [url], asCopy: true))
-      } catch let error as NSError where error.domain == "fqapp" {
-        finish(FlutterError(code: "BACKUP_ZIP_UNSUPPORTED", message: error.localizedDescription, details: nil))
-      } catch {
-        finish(FlutterError(code: "write_failed", message: error.localizedDescription, details: nil))
-      }
+    case .exportZip:
+      finish(
+        FlutterError(
+          code: "BACKUP_ZIP_UNSUPPORTED",
+          message: "本机不直接打包采集分卷，请使用 Dart 压缩兜底",
+          details: nil))
     }
   }
 
@@ -352,52 +345,6 @@ final class LibraryBackupChannel: NSObject, UIDocumentPickerDelegate {
     let target = directory.appendingPathComponent(name)
     try data.write(to: target, options: .atomic)
     return target
-  }
-
-  /// 把采集清单与各分卷打成一个 zip。
-  ///
-  /// 系统自带的 zip 打包是 iOS 16 才有的；更老的系统交回一个明确的错误，
-  /// Dart 侧会用纯 Dart 的压缩再走一遍保存流程。
-  private func makeArchive(manifest: Data, parts: [String], name: String) throws -> URL {
-    guard parts.count <= LibraryBackupChannel.maxParts else {
-      throw NSError(
-        domain: "fqapp", code: 1,
-        userInfo: [NSLocalizedDescriptionKey: "采集分卷过多，无法导出"])
-    }
-    let source = try captureDirectory()
-    let staging = FileManager.default.temporaryDirectory
-      .appendingPathComponent("fqapp-archive-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-    try manifest.write(to: staging.appendingPathComponent("manifest.json"), options: .atomic)
-    for name in parts {
-      guard LibraryBackupChannel.matchesPart(name) else {
-        throw NSError(
-          domain: "fqapp", code: 2, userInfo: [NSLocalizedDescriptionKey: "采集分卷参数无效"])
-      }
-      let origin = source.appendingPathComponent(name)
-      guard FileManager.default.fileExists(atPath: origin.path) else {
-        throw NSError(
-          domain: "fqapp", code: 3,
-          userInfo: [NSLocalizedDescriptionKey: "采集分卷缺失，无法导出"])
-      }
-      try FileManager.default.copyItem(at: origin, to: staging.appendingPathComponent(name))
-    }
-    let archive = FileManager.default.temporaryDirectory
-      .appendingPathComponent(name)
-    if FileManager.default.fileExists(atPath: archive.path) {
-      try FileManager.default.removeItem(at: archive)
-    }
-    guard #available(iOS 16.0, *) else {
-      try? FileManager.default.removeItem(at: staging)
-      throw NSError(
-        domain: "fqapp", code: 4,
-        userInfo: [
-          NSLocalizedDescriptionKey: "系统版本低于 iOS 16，无法直接导出分卷备份"
-        ])
-    }
-    try FileManager.default.zipItem(at: staging, to: archive, keepParent: false)
-    try? FileManager.default.removeItem(at: staging)
-    return archive
   }
 
   // MARK: - 采集文件
