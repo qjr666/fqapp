@@ -11,6 +11,9 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
     <!-- 局域网共享：读取当前网络状态，并在 Wi-Fi 变化时重新发现同网段设备 -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- 设计 §7.3：P5 设备发现预留的多播权限。当前版本走 UDP 广播（只需
+         INTERNET），此声明仅为后续叠加标准 mDNS 时无需再改清单。 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- 短剧 / 漫剧悬浮窗播放（#24）：切后台时把画面搬进系统悬浮窗，需要用户在系统设置里允许 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>

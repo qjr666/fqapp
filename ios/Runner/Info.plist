@@ -37,6 +37,12 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>用于在同一 Wi-Fi 下访问本机的阅读服务，以及把阅读进度同步到你的另一台设备。</string>
+	<!-- 设计 §7.3：P5 设备发现预留的 Bonjour 服务类型。当前版本走 UDP 广播，
+	     不注册 Bonjour 服务；声明在此以便后续叠加标准 mDNS 时无需再改清单。 -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_fqapp._tcp</string>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../services/backend_service.dart';
+import '../services/lan_discovery_service.dart';
 import '../services/lan_sync_pairing.dart';
 import '../services/lan_sync_preferences.dart';
 import '../services/sync_agent.dart';
@@ -31,6 +32,10 @@ class _LanSyncPageState extends State<LanSyncPage> {
   final _pairCode = TextEditingController();
 
   SyncAgent? _agent;
+  final _discovery = LanDiscoveryService();
+  StreamSubscription<List<DiscoveredDevice>>? _discoverySub;
+  List<DiscoveredDevice> _discovered = const [];
+  bool _discovering = false;
   List<String> _addresses = const [];
   int _port = 0;
   int _lastSyncAt = 0;
@@ -56,6 +61,8 @@ class _LanSyncPageState extends State<LanSyncPage> {
   @override
   void dispose() {
     _codeTimer?.cancel();
+    _discoverySub?.cancel();
+    _discovery.dispose();
     _agent?.close();
     _address.dispose();
     _capability.dispose();
@@ -72,6 +79,13 @@ class _LanSyncPageState extends State<LanSyncPage> {
     final paired = await _pairing.loadPaired();
     // The local service may not be up yet; an empty device list is fine.
     final hosts = await _safeHosts();
+    // Listen before starting: the first probe can be answered immediately.
+    _discoverySub ??= _discovery.devices.listen((devices) {
+      if (mounted) setState(() => _discovered = devices);
+    });
+    if (mounted) setState(() => _discovering = true);
+    await _discovery.start();
+    if (mounted) setState(() => _discovering = false);
     if (!mounted) return;
     setState(() {
       _addresses = addresses;
@@ -92,6 +106,24 @@ class _LanSyncPageState extends State<LanSyncPage> {
     } catch (_) {
       return const <PairedDevice>[];
     }
+  }
+
+  Future<void> _search() async {
+    if (!mounted) return;
+    setState(() => _discovering = true);
+    _discovery.reset();
+    await _discovery.probe();
+    if (mounted) setState(() => _discovering = false);
+  }
+
+  void _useDevice(DiscoveredDevice device) {
+    setState(() {
+      _pairAddress.text = device.baseUrl;
+      _address.text = device.baseUrl;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已填入 ${device.name} 的地址，可继续配对或手动同步')),
+    );
   }
 
   static Future<List<String>> _detectLanAddresses() async {
@@ -323,6 +355,58 @@ class _LanSyncPageState extends State<LanSyncPage> {
                 ),
                 const SizedBox(height: 6),
                 AppText('上次同步：$lastSync', style: muted),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+          const ArchiveSection(title: '附近设备', code: 'LAN / DISCOVER'),
+          const SizedBox(height: 14),
+          ContentPanel(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                AppText(
+                  '同一 Wi-Fi 下自动搜索，点设备即可把地址填入下面的配对或手动输入。'
+                  '部分路由器会隔离设备间的广播，此时仍可手动填写。',
+                  style: muted,
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: AppText(
+                        _discovering
+                            ? '正在搜索…'
+                            : '已发现 ${_discovered.length} 台设备',
+                        style: muted,
+                      ),
+                    ),
+                    TextButton(
+                      key: const ValueKey('lan-sync-discover'),
+                      onPressed: _discovering ? null : _search,
+                      child: const Text('重新搜索'),
+                    ),
+                  ],
+                ),
+                if (_discovering) const LinearProgressIndicator(minHeight: 2),
+                if (_discovered.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: AppText('尚未发现设备', style: muted),
+                  )
+                else
+                  for (final device in _discovered)
+                    InkWell(
+                      key: ValueKey('lan-sync-device-${device.id}'),
+                      onTap: () => _useDevice(device),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: AppText(
+                          '${device.name} · ${device.platform} · ${device.baseUrl}',
+                          style: muted,
+                        ),
+                      ),
+                    ),
               ],
             ),
           ),
