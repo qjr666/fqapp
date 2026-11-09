@@ -24,14 +24,22 @@ fn box_of(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
 /// `format` is the four-character code `frma` records; `None` builds the
 /// same file without a `frma` box.
 fn encrypted_audio_fixture(format: Option<&[u8; 4]>) -> Vec<u8> {
+    encrypted_audio_fixture_with_body(format, 28)
+}
+
+/// The same file, with a different number of bytes between the sample entry's
+/// header and its child boxes.
+///
+/// Encoders disagree about that gap; the rewrite must not depend on it.
+fn encrypted_audio_fixture_with_body(format: Option<&[u8; 4]>, body: usize) -> Vec<u8> {
     let mut sinf_payload = Vec::new();
     if let Some(code) = format {
         sinf_payload.extend_from_slice(&box_of(b"frma", code));
     }
     let sinf = box_of(b"sinf", &sinf_payload);
-    // An encrypted audio sample entry keeps 28 bytes of audio fields before
-    // its child boxes; the index builder looks for `sinf` right after them.
-    let mut enca_payload = vec![0u8; 28];
+    // An encrypted audio sample entry keeps its audio fields before the
+    // child boxes; the index builder looks for `sinf` right after them.
+    let mut enca_payload = vec![0u8; body];
     enca_payload.extend_from_slice(&sinf);
     let enca = box_of(b"enca", &enca_payload);
 
@@ -98,6 +106,25 @@ fn encrypted_track_without_frma_falls_back_to_mp4a() {
         &data[enca_at + 4..enca_at + 8],
         b"mp4a",
         "without `frma` the historical guess is the only option left"
+    );
+}
+
+#[test]
+fn the_codec_is_found_even_when_the_entry_layout_differs() {
+    // The gap between the sample entry's header and its child boxes is not
+    // the same in every file; the rewrite must not depend on it.
+    let mut data = encrypted_audio_fixture_with_body(Some(b"Opus"), 32);
+    let enca_at = enca_offset(&data);
+    let index = build_cenc_index(&data, 0, data.len() as u64)
+        .expect("index")
+        .expect("the fixture carries an encrypted track");
+    let key = [7u8; 16];
+    apply_cenc_index(&mut data, 0, &index, &key).expect("decrypt");
+
+    assert_eq!(
+        &data[enca_at + 4..enca_at + 8],
+        b"Opus",
+        "the protection box must still be found and its codec honoured"
     );
 }
 

@@ -2606,6 +2606,47 @@ fn build_cenc_index(
     Ok(Some(index))
 }
 
+/// Finds the protection scheme box (`sinf`) inside an encrypted sample entry.
+///
+/// The entry's children start at a fixed offset, but that offset depends on
+/// the entry's layout — an audio entry and a video entry differ, and
+/// encoders are not always consistent about it. When the fixed offset finds
+/// nothing, the entry's bytes are scanned instead: a wrong offset would
+/// otherwise leave the entry renamed to a guessed codec with its protection
+/// box still in place, and the decoder refuses such a file outright.
+fn find_sinf(data: &[u8], entry: &Mp4Box) -> Option<Mp4Box> {
+    if let Some(start) = box_children_start(&entry.typ, entry.off, entry.header) {
+        if let Some(found) = iter_boxes(data, start, entry.off + entry.size)
+            .into_iter()
+            .find(|child| child.typ == *b"sinf")
+        {
+            return Some(found);
+        }
+    }
+    // 兜底：按字节找 `sinf` 标记，用它前面的长度字段还原这个盒子。
+    let begin = entry.off + entry.header;
+    let end = (entry.off + entry.size).min(data.len());
+    if begin + 4 > end {
+        return None;
+    }
+    let mut at = begin;
+    while at + 4 <= end {
+        if &data[at..at + 4] == b"sinf" && at >= 4 {
+            let size = u32_be(data, at - 4) as usize;
+            if size >= 12 && at - 4 + size <= end {
+                return Some(Mp4Box {
+                    off: at - 4,
+                    size,
+                    header: 8,
+                    typ: *b"sinf",
+                });
+            }
+        }
+        at += 1;
+    }
+    None
+}
+
 /// The clear sample-entry type recorded in the `frma` box of a `sinf`.
 ///
 /// CENC replaces the real codec box (`Opus`, `avc1`, `hvc1`, ...) with an
@@ -2651,13 +2692,9 @@ fn collect_sample_entry_patches(
             continue;
         };
         for b in list {
-            let children = match box_children_start(typ, b.off, b.header) {
-                Some(start) => iter_boxes(data, start, b.off + b.size),
-                None => Vec::new(),
-            };
-            let sinf = children.iter().find(|child| child.typ == *b"sinf");
+            let sinf = find_sinf(data, b);
             let replacement = sinf
-                .and_then(|box_| original_sample_entry_type(data, box_))
+                .and_then(|box_| original_sample_entry_type(data, &box_))
                 .unwrap_or(*fallback);
             if b.off + 8 <= data.len() {
                 out.push(CencPatch {
