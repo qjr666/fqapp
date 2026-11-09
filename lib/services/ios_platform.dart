@@ -296,9 +296,7 @@ class _IosPlayer {
       player.stream.completed.listen((v) => event('completed', v)),
       player.stream.width.listen((_) => _size()),
       player.stream.height.listen((_) => _size()),
-      player.stream.error.listen(
-        (_) => event('error', {'message': '媒体播放失败，请重试或切换清晰度'}),
-      ),
+      player.stream.error.listen((_) => event('error', _errorPayload())),
     ]);
     unawaited(
       video.waitUntilFirstFrameRendered.then((_) => event('firstFrame', true)),
@@ -312,6 +310,31 @@ class _IosPlayer {
   final subscriptions = <StreamSubscription<dynamic>>[];
   final ready = Completer<void>();
   bool disposed = false;
+
+  /// 上一次 open 用的密钥与来源形态。播放失败时要靠它们区分「媒体坏了」
+  /// 和「这是加密直连片源，iPhone 解不开」——两者的处置完全不同。
+  String _sourceKey = '';
+  bool _serverDecrypted = false;
+
+  /// 播放器报错的载荷。
+  ///
+  /// 以前是「有密钥且不是服务端解密流就直接拒绝播放」，那等于提前判死：
+  /// 上游给音频打的「加密」标记很多时候是失效的，文件其实是明文的，
+  /// iPhone 完全能直接播。改成先播、播不了再报错，并且把原因说清楚。
+  Map<String, dynamic> _errorPayload() {
+    if (_sourceKey.isNotEmpty && !_serverDecrypted) {
+      return {
+        'message': '该加密片源需要端上解密，iPhone 上无法播放',
+        'errorCode': 4901,
+        'httpStatusCode': null,
+      };
+    }
+    return {
+      'message': '媒体播放失败，请重试或切换清晰度',
+      'errorCode': 4902,
+      'httpStatusCode': null,
+    };
+  }
 
   void _fail(int code, String message) {
     if (!ready.isCompleted) ready.completeError(StateError(message));
@@ -343,15 +366,16 @@ class _IosPlayer {
         return;
       }
       // 主路径：Rust 回环服务已按 Range 解密成明文（URL 同时带
-      // /_session/ 与 /src/）。其它形态 —— 上游直连加密 URL、file://
-      // 离线缓存 —— 都需要端上 CENC 解密，而 Rust 的 desktop_media /
-      // desktop_fetch 只在 Windows 编译，iOS 静态库里没有对应符号。
-      final serverDecrypted =
+      // /_session/ 与 /src/）。其它形态 —— 上游直连地址、file://
+      // 离线缓存 —— media_kit 只能按原样交给系统解码器。
+      //
+      // 这里**不再**因为「带了密钥」就提前拒绝：上游给音频打的「加密」
+      // 标记很多时候是失效的，文件其实是明文的，iPhone 直接播就能出声。
+      // 提前拒绝等于把一条能播的路堵死；真解不开时，播放器会报错，
+      // 那时再按「加密直连片源」报 4901。
+      _sourceKey = key;
+      _serverDecrypted =
           url.contains('/_session/') && url.contains('/src/');
-      if (key.isNotEmpty && !serverDecrypted) {
-        _fail(4901, '该加密片源需要端上解密');
-        return;
-      }
       if (disposed) return;
       await player.open(Media(url), play: false);
       if (startMs > 0) {

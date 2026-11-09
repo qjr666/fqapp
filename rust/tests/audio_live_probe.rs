@@ -88,7 +88,7 @@ fn write_outline(value: &Value, depth: usize, out: &mut String) {
 /// 收集 payload 里所有指定键下的字符串值。
 fn find_all_str(value: &Value, keys: &[&str], out: &mut Vec<String>) {
     let mut pairs: Vec<(String, String)> = Vec::new();
-    collect_pairs(value, &mut pairs, |key, _| keys.contains(&key));
+    collect_pairs(value, &mut pairs, &|key, _| keys.contains(&key));
     for (_, value) in pairs {
         out.push(value);
     }
@@ -98,13 +98,15 @@ fn find_all_str(value: &Value, keys: &[&str], out: &mut Vec<String>) {
 /// `audio_book_id`（有声书）与 `book_id`（小说）——两者混在一起会让上游
 /// 返回空 body，探针却只能看到一句「解析失败」。
 fn find_all_str_tagged(value: &Value, keys: &[&str], out: &mut Vec<(String, String)>) {
-    collect_pairs(value, out, |key, _| keys.contains(&key));
+    collect_pairs(value, out, &|key, _| keys.contains(&key));
 }
 
+/// `keep` 是 trait object 而不是泛型参数：递归调用里每次 `&keep` 都会产生
+/// 一个新的单态化类型，泛型版本会直接撞上「reached the recursion limit」。
 fn collect_pairs(
     value: &Value,
     out: &mut Vec<(String, String)>,
-    keep: impl Fn(&str, &str) -> bool,
+    keep: &dyn Fn(&str, &str) -> bool,
 ) {
     match value {
         Value::Object(map) => {
@@ -129,12 +131,12 @@ fn collect_pairs(
                         _ => {}
                     }
                 }
-                collect_pairs(item, out, &keep);
+                collect_pairs(item, out, keep);
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_pairs(item, out, &keep);
+                collect_pairs(item, out, keep);
             }
         }
         _ => {}
