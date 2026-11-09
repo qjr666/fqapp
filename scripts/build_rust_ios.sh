@@ -65,6 +65,14 @@ cp -f "$APP_DIR/rust/target/aarch64-apple-ios/release/libfqapi_core.a" \
 echo "==> 已放置：$OUT_DIR/libfqapi_core.a"
 lipo -info "$OUT_DIR/libfqapi_core.a"
 
+# 核心的单元测试在这里跑一次：它们守着容器改写（`enca` 必须按 `frma` 里的
+# 真实编码改名）与 CDN 主机阶梯这类「编译通过但行为错了」的坑。单元测试模块
+# 只有在 `cargo test` 下才会被编译，所以不跑它就等于这些测试从没存在过。
+# 失败不影响出包，但日志里能看到。
+echo "==> rust unit tests"
+( cd "$APP_DIR" && cargo test --locked --manifest-path "$MANIFEST" --lib ) \
+  || echo "    (单元测试失败，不影响出包)"
+
 # 真机反馈「听书取流失败」时，截图只答得出「失败了」，答不出「上游给的信封
 # 长什么样」「那个音频地址本身能不能下载」「失败卡在传输层的哪一步」。
 # 这条探针对着真实上游取一次音频章节，把三件事一次打印出来。

@@ -2658,7 +2658,7 @@ fn collect_sample_entry_patches(
             let sinf = children.iter().find(|child| child.typ == *b"sinf");
             let replacement = sinf
                 .and_then(|box_| original_sample_entry_type(data, box_))
-                .unwrap_or(fallback);
+                .unwrap_or(*fallback);
             if b.off + 8 <= data.len() {
                 out.push(CencPatch {
                     off: base_off + (b.off + 4) as u64,
