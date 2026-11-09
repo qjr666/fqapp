@@ -25,6 +25,7 @@ pub mod search;
 pub mod session;
 pub mod shuqi;
 pub mod sync;
+pub mod sync_pair;
 pub mod toutiao;
 pub mod util;
 pub mod video;

@@ -1,13 +1,15 @@
-// LAN sync console (design §M5). Follows the archive vocabulary used by
-// `library_backup_page.dart`: ArchiveFeaturePage shell, ArchiveSection headers,
-// ContentPanel rows and GlassTextButton actions.
+// LAN sync console (design §M5, pairing in §M2). Follows the archive
+// vocabulary used by `library_backup_page.dart`: ArchiveFeaturePage shell,
+// ArchiveSection headers, ContentPanel rows and GlassTextButton actions.
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../services/backend_service.dart';
+import '../services/lan_sync_pairing.dart';
 import '../services/lan_sync_preferences.dart';
 import '../services/sync_agent.dart';
 import '../widgets/wenku/wenku_ui.dart';
@@ -21,9 +23,12 @@ class LanSyncPage extends StatefulWidget {
 
 class _LanSyncPageState extends State<LanSyncPage> {
   final _prefs = LanSyncPreferences.instance;
+  final _pairing = LanSyncPairing.instance;
   final _address = TextEditingController();
   final _capability = TextEditingController();
   final _name = TextEditingController();
+  final _pairAddress = TextEditingController();
+  final _pairCode = TextEditingController();
 
   SyncAgent? _agent;
   List<String> _addresses = const [];
@@ -33,6 +38,15 @@ class _LanSyncPageState extends State<LanSyncPage> {
   bool _error = false;
   String? _message;
 
+  PairCode? _issuedCode;
+  List<PairedDevice> _hosts = const [];
+  PairedPeer? _paired;
+  int _codeRemaining = 0;
+  Timer? _codeTimer;
+  bool _pairBusy = false;
+  bool _pairError = false;
+  String? _pairMessage;
+
   @override
   void initState() {
     super.initState();
@@ -41,10 +55,13 @@ class _LanSyncPageState extends State<LanSyncPage> {
 
   @override
   void dispose() {
+    _codeTimer?.cancel();
     _agent?.close();
     _address.dispose();
     _capability.dispose();
     _name.dispose();
+    _pairAddress.dispose();
+    _pairCode.dispose();
     super.dispose();
   }
 
@@ -52,6 +69,9 @@ class _LanSyncPageState extends State<LanSyncPage> {
     await _prefs.load();
     final addresses = await _detectLanAddresses();
     final port = Uri.tryParse(BackendService.instance.baseUrl)?.port ?? 0;
+    final paired = await _pairing.loadPaired();
+    // The local service may not be up yet; an empty device list is fine.
+    final hosts = await _safeHosts();
     if (!mounted) return;
     setState(() {
       _addresses = addresses;
@@ -60,7 +80,18 @@ class _LanSyncPageState extends State<LanSyncPage> {
       _address.text = _prefs.peerAddress;
       _capability.text = _prefs.peerCapability;
       _name.text = _prefs.deviceName;
+      _paired = paired;
+      _hosts = hosts;
+      _pairAddress.text = paired?.address ?? _prefs.peerAddress;
     });
+  }
+
+  Future<List<PairedDevice>> _safeHosts() async {
+    try {
+      return await _pairing.hosts();
+    } catch (_) {
+      return const <PairedDevice>[];
+    }
   }
 
   static Future<List<String>> _detectLanAddresses() async {
@@ -92,6 +123,87 @@ class _LanSyncPageState extends State<LanSyncPage> {
     ).showSnackBar(SnackBar(content: Text('已复制$label')));
   }
 
+  void _startCountdown(int seconds) {
+    _codeTimer?.cancel();
+    _codeRemaining = seconds;
+    _codeTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      setState(() {
+        _codeRemaining--;
+        if (_codeRemaining <= 0) {
+          _issuedCode = null;
+          timer.cancel();
+        }
+      });
+    });
+  }
+
+  void _setPairMessage(String? message, {bool error = false}) {
+    if (!mounted) return;
+    setState(() {
+      _pairMessage = message;
+      _pairError = error;
+    });
+  }
+
+  Future<void> _runPairAction(Future<void> Function() action) async {
+    if (_pairBusy) return;
+    setState(() {
+      _pairBusy = true;
+      _pairMessage = null;
+      _pairError = false;
+    });
+    try {
+      await action();
+    } on SyncException catch (error) {
+      _setPairMessage(error.message, error: true);
+    } catch (error) {
+      _setPairMessage('操作失败：$error', error: true);
+    } finally {
+      if (mounted) setState(() => _pairBusy = false);
+    }
+  }
+
+  Future<void> _issueCode() => _runPairAction(() async {
+    final code = await _pairing.issueCode();
+    if (!mounted) return;
+    _startCountdown(code.ttlSeconds);
+    setState(() => _issuedCode = code);
+    _setPairMessage('配对码已生成，请在另一台设备输入这 6 位数字。');
+  });
+
+  Future<void> _pair() => _runPairAction(() async {
+    final peer = await _pairing.pairWithPeer(
+      peerBaseUrl: _pairAddress.text,
+      code: _pairCode.text,
+    );
+    if (!mounted) return;
+    setState(() {
+      _paired = peer;
+      _address.text = peer.address;
+      _pairCode.clear();
+    });
+    _setPairMessage('配对成功。之后点「立即同步」会自动使用这把密钥。');
+  });
+
+  Future<void> _unpair() => _runPairAction(() async {
+    await _pairing.clearPaired();
+    if (!mounted) return;
+    setState(() => _paired = null);
+    _setPairMessage('已取消配对，可改用下面的手动输入。');
+  });
+
+  Future<void> _revoke(String deviceId) => _runPairAction(() async {
+    await _pairing.revoke(deviceId);
+    final hosts = await _safeHosts();
+    if (!mounted) return;
+    setState(() => _hosts = hosts);
+    _setPairMessage('已移除该设备，它以前的密钥立即失效。');
+  });
+
   Future<void> _sync() async {
     if (_busy) return;
     setState(() {
@@ -100,9 +212,17 @@ class _LanSyncPageState extends State<LanSyncPage> {
       _error = false;
     });
     try {
+      // A pairing secret wins over manual entry, but manual entry stays as the
+      // fallback when pairing is unavailable (design §10).
+      final paired = _paired ?? await _pairing.loadPaired();
+      final peerAddress = paired?.address ?? _address.text;
+      final peerSecret = paired?.secret ?? _capability.text;
       await _prefs.setPeer(_address.text, _capability.text);
       await _prefs.setDeviceName(_name.text);
-      final result = await (_agent ??= SyncAgent()).syncOnce();
+      final result = await (_agent ??= SyncAgent()).syncOnce(
+        peerBaseUrl: peerAddress,
+        peerCapability: peerSecret,
+      );
       if (!mounted) return;
       setState(() {
         _lastSyncAt = result.at.millisecondsSinceEpoch;
@@ -158,7 +278,8 @@ class _LanSyncPageState extends State<LanSyncPage> {
           ),
           const SizedBox(height: 12),
           AppText(
-            '把下面显示的地址与会话密钥填到另一台设备，两台都点一次「立即同步」。'
+            '推荐先在两台设备间配对一次：其中一台生成 6 位配对码，另一台输入即可。'
+            '之后不用再复制会话密钥。也可以继续使用下面的手动输入。'
             '进度按时间取新，书架与已看记录取并集。',
             style: muted,
           ),
@@ -206,12 +327,128 @@ class _LanSyncPageState extends State<LanSyncPage> {
             ),
           ),
           const SizedBox(height: 24),
-          const ArchiveSection(title: '对端设备', code: 'LAN / PEER'),
+          const ArchiveSection(title: '配对', code: 'LAN / PAIR'),
           const SizedBox(height: 14),
           ContentPanel(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                AppText(
+                  '① 让另一台设备连我：生成配对码，把 6 位数字填到对方设备。',
+                  style: muted,
+                ),
+                const SizedBox(height: 10),
+                if (_issuedCode != null) ...[
+                  AppText(
+                    _issuedCode!.code,
+                    style: const TextStyle(
+                      fontSize: 32,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 6,
+                    ),
+                  ),
+                  AppText('剩余 $_codeRemaining 秒', style: muted),
+                  const SizedBox(height: 8),
+                ],
+                GlassTextButton(
+                  key: const ValueKey('lan-sync-issue-code'),
+                  onPressed: _pairBusy ? null : _issueCode,
+                  child: AppText(_issuedCode == null ? '生成配对码' : '重新生成'),
+                ),
+                const SizedBox(height: 16),
+                AppText('已允许读取本机的设备（${_hosts.length}）', style: muted),
+                if (_hosts.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: AppText('暂无', style: muted),
+                  )
+                else
+                  for (final host in _hosts)
+                    Row(
+                      children: [
+                        Expanded(
+                          child: AppText(
+                            '${host.name} · ${host.platform}',
+                            style: muted,
+                          ),
+                        ),
+                        TextButton(
+                          key: ValueKey('lan-sync-revoke-${host.id}'),
+                          onPressed: _pairBusy ? null : () => _revoke(host.id),
+                          child: const Text('移除'),
+                        ),
+                      ],
+                    ),
+                const Divider(height: 28),
+                AppText(
+                  '② 我要连另一台设备：填对方地址，输入它显示的配对码。',
+                  style: muted,
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  key: const ValueKey('lan-sync-pair-address'),
+                  controller: _pairAddress,
+                  enabled: !_pairBusy,
+                  decoration: const InputDecoration(
+                    labelText: '对端地址（http://手机IP:端口）',
+                    border: OutlineInputBorder(),
+                  ),
+                  keyboardType: TextInputType.url,
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  key: const ValueKey('lan-sync-pair-code'),
+                  controller: _pairCode,
+                  enabled: !_pairBusy,
+                  decoration: const InputDecoration(
+                    labelText: '对方显示的 6 位配对码',
+                    border: OutlineInputBorder(),
+                  ),
+                  keyboardType: TextInputType.number,
+                  maxLength: 6,
+                ),
+                GlassTextButton(
+                  key: const ValueKey('lan-sync-pair'),
+                  onPressed: _pairBusy ? null : _pair,
+                  child: const AppText('配对'),
+                ),
+                if (_paired != null) ...[
+                  const SizedBox(height: 12),
+                  AppText(
+                    '已配对：${_paired!.address}\n同步时自动使用配对密钥，无需再填会话密钥。',
+                    style: muted,
+                  ),
+                  TextButton(
+                    key: const ValueKey('lan-sync-unpair'),
+                    onPressed: _pairBusy ? null : _unpair,
+                    child: const Text('取消配对，改用手动输入'),
+                  ),
+                ],
+                if (_pairBusy) ...[
+                  const SizedBox(height: 12),
+                  const LinearProgressIndicator(minHeight: 2),
+                ],
+                if (_pairMessage case final message?) ...[
+                  const SizedBox(height: 12),
+                  _pairError
+                      ? FeatureError(message)
+                      : ContentPanel(child: AppText(message, style: muted)),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+          const ArchiveSection(title: '对端设备（手动）', code: 'LAN / PEER'),
+          const SizedBox(height: 14),
+          ContentPanel(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                AppText(
+                  '配对不可用时可手动填写。会话密钥每次重启服务都会变化，配对密钥不会。',
+                  style: muted,
+                ),
+                const SizedBox(height: 12),
                 TextField(
                   key: const ValueKey('lan-sync-peer-address'),
                   controller: _address,

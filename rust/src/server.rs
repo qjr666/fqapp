@@ -88,6 +88,13 @@ pub async fn serve(
         .try_fill_bytes(&mut entropy)
         .map_err(|_| "session entropy unavailable")?;
     let token = hex::encode(entropy);
+    // Pairing secrets outlive a process, so load them before the listener
+    // accepts its first request: the capability gate answers before any sync
+    // handler has run in this process.
+    let runtime_dir = std::path::Path::new(&server.ctx.src_dir)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(&server.ctx.src_dir));
+    crate::endpoints::sync_pair::hydrate(runtime_dir).await;
     let state = AppState {
         server,
         port: local.port(),
@@ -243,8 +250,17 @@ async fn handle_request(state: AppState, req: axum::extract::Request) -> Respons
     // Reads answer any local client: external readers (Legado book sources,
     // local tooling) cannot know the per-launch capability. Device-bound
     // writes still need it.
-    let capability_ok =
-        scoped.is_some() || bearer == Some(format!("Bearer {}", state.token).as_str()) || cookie_ok;
+    // A paired device carries its own long-lived secret instead of the
+    // per-launch capability. Accept it for sync routes only, so it can never
+    // widen access to the content API or device-bound writes.
+    let paired = request_path.starts_with(crate::endpoints::sync::SYNC_PATH_PREFIX)
+        && bearer
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(crate::endpoints::sync_pair::is_authorized);
+    let capability_ok = scoped.is_some()
+        || bearer == Some(format!("Bearer {}", state.token).as_str())
+        || cookie_ok
+        || paired;
     if !capability_ok && crate::dispatch::requires_capability(&request_path) {
         return refuse(StatusCode::UNAUTHORIZED, "session required");
     }

@@ -129,3 +129,128 @@ async fn a_lan_peer_needs_the_capability_and_can_round_trip_a_snapshot() {
 
     lb.task.abort();
 }
+
+/// P4 acceptance over the real listener: a device that has not paired cannot
+/// read the snapshot, exchanging the host's one-time code grants a secret that
+/// unlocks only sync routes, and revoking that device closes the door again
+/// without restarting the server.
+#[tokio::test]
+async fn pairing_grants_a_secret_that_can_be_revoked() {
+    let dir = TempDir::new("sync-lan-pairing");
+    let server = build_server(&dir, None, &[], &[], &pool_json(2)).await;
+    let lb = start_listener(server, ListenMode::Lan).await;
+    let client = reqwest::Client::new();
+
+    // 1. Both the reading history and the device list stay private.
+    let unpaired = client
+        .get(lb.bare_url("/api/v1/sync/snapshot"))
+        .send()
+        .await
+        .expect("unpaired read");
+    assert_eq!(unpaired.status().as_u16(), 401);
+    let unpaired_hosts = client
+        .get(lb.bare_url("/api/v1/sync/hosts"))
+        .send()
+        .await
+        .expect("unpaired device list");
+    assert_eq!(unpaired_hosts.status().as_u16(), 401);
+
+    // 2. The host owns the capability, so only it can issue a code.
+    let denied_code = client
+        .post(lb.bare_url("/api/v1/sync/pair/code"))
+        .send()
+        .await
+        .expect("foreign code request");
+    assert_eq!(denied_code.status().as_u16(), 401);
+    let issued: Value = client
+        .post(lb.url("/api/v1/sync/pair/code"))
+        .send()
+        .await
+        .expect("issue code")
+        .json()
+        .await
+        .expect("json");
+    let code = issued["code"].as_str().expect("code").to_string();
+    assert_eq!(code.len(), 6);
+
+    // 3. A wrong code is refused. It reaches the handler without a capability
+    //    (the code is the credential), but grants nothing.
+    let wrong_code = if code == "000000" { "111111" } else { "000000" };
+    let wrong = client
+        .post(lb.bare_url("/api/v1/sync/pair"))
+        .json(&json!({
+            "code": wrong_code,
+            "device": { "id": "device-b", "name": "peer", "platform": "android" },
+        }))
+        .send()
+        .await
+        .expect("wrong code");
+    assert_eq!(wrong.status().as_u16(), 400);
+
+    // 4. The right code yields a long-lived secret.
+    let paired: Value = client
+        .post(lb.bare_url("/api/v1/sync/pair"))
+        .json(&json!({
+            "code": code,
+            "device": { "id": "device-b", "name": "peer", "platform": "android" },
+        }))
+        .send()
+        .await
+        .expect("pair")
+        .json()
+        .await
+        .expect("json");
+    let secret = paired["secret"].as_str().expect("secret").to_string();
+    let bearer = format!("Bearer {secret}");
+
+    let snapshot = client
+        .get(lb.bare_url("/api/v1/sync/snapshot"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .expect("paired read");
+    assert_eq!(snapshot.status().as_u16(), 200);
+
+    let hosts: Value = client
+        .get(lb.bare_url("/api/v1/sync/hosts"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .expect("host list")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(hosts["devices"].as_array().unwrap().len(), 1);
+    assert_eq!(hosts["devices"][0]["id"], "device-b");
+    assert!(hosts["devices"][0].get("secret").is_none());
+
+    // The code is single-use.
+    let reused = client
+        .post(lb.bare_url("/api/v1/sync/pair"))
+        .json(&json!({
+            "code": code,
+            "device": { "id": "device-c", "name": "other", "platform": "ios" },
+        }))
+        .send()
+        .await
+        .expect("reused code");
+    assert_eq!(reused.status().as_u16(), 400);
+
+    // 5. Revoking the device invalidates its secret immediately.
+    let revoked = client
+        .post(lb.url("/api/v1/sync/hosts/revoke"))
+        .json(&json!({ "deviceId": "device-b" }))
+        .send()
+        .await
+        .expect("revoke");
+    assert_eq!(revoked.status().as_u16(), 200);
+    let after = client
+        .get(lb.bare_url("/api/v1/sync/snapshot"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .expect("revoked read");
+    assert_eq!(after.status().as_u16(), 401);
+
+    lb.task.abort();
+}

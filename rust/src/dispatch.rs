@@ -164,6 +164,12 @@ pub fn request_body_limit(path: &str) -> Option<usize> {
         "/api/v1/sync/local" | "/api/v1/sync/snapshot" => {
             Some(crate::endpoints::sync::SYNC_REQUEST_BODY_LIMIT)
         }
+        path if path == crate::endpoints::sync_pair::PAIR_PATH
+            || path == crate::endpoints::sync_pair::PAIR_CODE_PATH
+            || path == crate::endpoints::sync_pair::REVOKE_PATH =>
+        {
+            Some(crate::endpoints::sync_pair::PAIR_REQUEST_BODY_LIMIT)
+        }
         _ => None,
     }
 }
@@ -193,6 +199,12 @@ const DEVICE_BOUND_WRITE_APIS: &[&str] = &[
 /// device identity, and a sibling app on the same phone must not be able to
 /// post comments or danmaku on the user's behalf.
 pub fn requires_capability(path: &str) -> bool {
+    // The one exception: a not-yet-paired device exchanges a short-lived code
+    // for its secret here. The code in the body is the credential, so this
+    // single route cannot demand a capability it does not have yet.
+    if path.trim_end_matches('/') == crate::endpoints::sync_pair::PAIR_PATH {
+        return false;
+    }
     // Sync carries reading history in both directions, and its GET is not a
     // public content read: in Lan mode every route under the prefix needs the
     // capability, not just the writes.

@@ -202,6 +202,12 @@ fn etag_for(envelope: &SyncEnvelope) -> String {
 /// Serves the four staging routes. `runtime_dir` is the core's runtime
 /// directory (the parent of `src/`), supplied by `dispatch`.
 pub async fn handle(req: &Request, runtime_dir: &Path) -> Response {
+    // Pairing owns four routes under the same prefix. Answer those first so
+    // the one-time code exchange stays in one module; the staging area below
+    // keeps knowing nothing about pairing.
+    if let Some(response) = crate::endpoints::sync_pair::handle(req, runtime_dir).await {
+        return response;
+    }
     hydrate(runtime_dir).await;
     let path = req.path.trim_end_matches('/');
     let Some(tail) = path.strip_prefix(SYNC_PATH_PREFIX) else {
@@ -481,6 +487,18 @@ mod tests {
                 "{path} must be behind the capability"
             );
         }
+        // P4: the code exchange is the single unauthenticated sync route;
+        // everything it grants access to stays private.
+        assert!(!crate::dispatch::requires_capability(
+            crate::endpoints::sync_pair::PAIR_PATH
+        ));
+        assert!(crate::dispatch::requires_capability(
+            crate::endpoints::sync_pair::HOSTS_PATH
+        ));
+        assert_eq!(
+            crate::dispatch::request_body_limit(crate::endpoints::sync_pair::PAIR_PATH),
+            Some(crate::endpoints::sync_pair::PAIR_REQUEST_BODY_LIMIT)
+        );
         assert_eq!(
             crate::dispatch::request_body_limit("/api/v1/sync/local"),
             Some(SYNC_REQUEST_BODY_LIMIT)
