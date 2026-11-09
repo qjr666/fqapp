@@ -424,7 +424,7 @@ async fn probe_flakiness(srv: &Arc<Server>, book_id: &str, chapter_id: &str, ton
 /// 找出真机上那本书的「智能朗读」音色与「真人讲书」主播。
 async fn resolve_target(srv: &Arc<Server>) -> Option<(String, Vec<String>, Vec<String>)> {
     let search = srv.handler("search")?;
-    let book = srv.handler("book")?;
+    let tones = srv.handler("tones")?;
     let directory = srv.handler("directory")?;
 
     let params = Params::from_pairs(vec![("query".to_string(), TARGET_TITLE.to_string())]);
@@ -440,18 +440,23 @@ async fn resolve_target(srv: &Arc<Server>) -> Option<(String, Vec<String>, Vec<S
         return None;
     }
 
-    for id in ids.iter().take(6) {
+    for id in ids.iter().take(8) {
         let params = Params::from_pairs(vec![("book_id".to_string(), id.clone())]);
-        let detail = match book(&srv.ctx, &params).await {
+        let detail = match tones(&srv.ctx, &params).await {
             Ok(value) => value,
             Err(err) => {
-                println!("book {id} failed: {err:?}");
+                println!("tones {id} failed: {err:?}");
                 continue;
             }
         };
         let tts = tone_ids(&detail, "tts_tones");
         let narrators = narrator_ids(&detail);
-        println!("=== book {id}: tts_tones={:?} narrators={:?}", tts, narrators);
+        println!(
+            "=== book {id}: envelope={} tts_tones={:?} narrators={:?}",
+            envelope_shape(&detail),
+            tts,
+            narrators
+        );
         if tts.is_empty() && narrators.is_empty() {
             continue;
         }
@@ -459,10 +464,10 @@ async fn resolve_target(srv: &Arc<Server>) -> Option<(String, Vec<String>, Vec<S
         if let Ok(value) = directory(&srv.ctx, &params).await {
             collect_strings(&value, ITEM_KEYS, &mut chapters);
         }
-        let Some(first) = chapters.first().cloned() else {
+        if chapters.is_empty() {
             println!("book {id} has no chapter id");
             continue;
-        };
+        }
         return Some((id.clone(), tts, narrators));
     }
     None

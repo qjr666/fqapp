@@ -105,6 +105,71 @@ async fn fetch_playinfo_with_retry(
     Err(last_error.unwrap_or_else(|| ApiError::Internal("playinfo failed".to_string())))
 }
 
+/// Does this answer carry a playable stream at all?
+///
+/// The upstream says "this voice has no recording" in two different ways:
+/// a business error (`NO_THIS_TONE`) and an answer whose `data` list is
+/// empty. Both mean the same thing here — there is no stream to play.
+fn has_playable_stream(payload: &Value) -> bool {
+    let mut models: Vec<Map<String, Value>> = Vec::new();
+    match payload.get("data") {
+        Some(Value::Array(rows)) => {
+            for row in rows {
+                if let Some(raw) = row.get("video_model").and_then(|v| v.as_str()) {
+                    if let Some(model) = crate::endpoints::video::decode_video_model_str(raw) {
+                        models.push(model);
+                    }
+                }
+            }
+        }
+        Some(Value::Object(data)) => {
+            if let Some(rows) = data.get("video_model_datas").and_then(|v| v.as_array()) {
+                for row in rows {
+                    if let Some(raw) = row.get("video_model").and_then(|v| v.as_str()) {
+                        if let Some(model) = crate::endpoints::video::decode_video_model_str(raw) {
+                            models.push(model);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    models.iter().any(|model| {
+        model
+            .get("video_list")
+            .and_then(|v| v.as_array())
+            .is_some_and(|list| !list.is_empty())
+    })
+}
+
+/// Looks for a recording under a neighbouring voice id.
+///
+/// `tone_id=0` is not a real voice — the app shows it as a 「默认音色」
+/// placeholder — but it is what 真人讲书 asks for: switching to a narrator
+/// opens that book's recording with tone 0. The upstream does not always
+/// publish a recording under 0 though; it answers `NO_THIS_TONE` (or an
+/// empty body) while the very same chapter plays fine under tone 1 or 2.
+/// Asking the neighbouring ids turns that dead end into a working stream.
+///
+/// Only tone 0 is retried this way. A real voice id that has no recording
+/// must stay an error: silently playing a *different* voice would be worse
+/// than a clear message.
+async fn fetch_neighbour_tone(ctx: &Ctx, params: &[(String, String)]) -> Option<Value> {
+    for candidate in ["1", "2", "3"] {
+        let mut alt = params.to_vec();
+        set_param(&mut alt, "tone_id", candidate);
+        let Ok(payload) = fetch_playinfo_with_retry(ctx, alt, 2).await else {
+            continue;
+        };
+        if has_playable_stream(&payload) {
+            log::info!("audio playinfo: tone 0 has no recording; using tone {candidate}");
+            return Some(payload);
+        }
+    }
+    None
+}
+
 fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult<Value>> {
     Box::pin(async move {
         let book_id = params.get_str("book_id");
@@ -127,7 +192,26 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
         set_param(&mut p, "req_type", "0");
         set_param(&mut p, "is_local_book", "false");
 
-        let mut payload = fetch_playinfo_with_retry(ctx, p, 3).await?;
+        let mut payload = match fetch_playinfo_with_retry(ctx, p.clone(), 3).await {
+            Ok(value) => value,
+            Err(err) => {
+                // An empty body for tone 0 usually means the same thing as
+                // `NO_THIS_TONE`: the recording lives under another voice id.
+                if tone_id == "0" {
+                    match fetch_neighbour_tone(ctx, &p).await {
+                        Some(alt) => alt,
+                        None => return Err(err),
+                    }
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+        if tone_id == "0" && !has_playable_stream(&payload) {
+            if let Some(alt) = fetch_neighbour_tone(ctx, &p).await {
+                payload = alt;
+            }
+        }
         // 不同音色上游会回不同形状的信封，先统一成一种，下游只处理一种。
         normalize_audio_envelope(&mut payload);
         patch_playinfo_keys(&mut payload);
