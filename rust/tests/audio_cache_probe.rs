@@ -471,6 +471,14 @@ async fn probe_case(srv: &Arc<Server>, lb: &Loopback, case: &Case) {
 async fn probe_cdn_ladder(raw_url: &str) {
     let candidates = fqapi_core::endpoints::video::cdn_host_candidates(raw_url);
     println!("[cdn] {} candidates", candidates.len());
+    // 公共解析器把这台主机指向哪里：真机上系统解析器给的节点全部拒连，
+    // 换一批节点重试是唯一的绕路，所以这条地址必须看得见。
+    if let Some((_, rest)) = raw_url.split_once("://") {
+        if let Some((host, _)) = rest.split_once('/') {
+            let addresses = fqapi_core::endpoints::cdn_dns::resolve_host(host).await;
+            println!("[dns] {host} -> {} address(es)", addresses.len());
+        }
+    }
     for candidate in candidates {
         let host = candidate
             .split("://")

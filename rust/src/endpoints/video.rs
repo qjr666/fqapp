@@ -2,6 +2,7 @@
 //! series detail and episode-list endpoints.
 
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -1384,14 +1385,23 @@ fn describe_transport_error(err: &reqwest::Error) -> String {
 }
 
 /// How long a fallback CDN host may spend proving it serves the path.
-const CDN_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+const CDN_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How many addresses one download may try.
 ///
 /// The ladder is ordered by how likely a host is to serve the path, so the
 /// first few entries are the ones worth the budget. The tail is a long shot:
 /// stopping there keeps a chapter's download inside its deadline.
-const CDN_LADDER_LIMIT: usize = 20;
+const CDN_LADDER_LIMIT: usize = 32;
+
+/// How many hosts one download may retry on the nodes a public resolver
+/// names.
+///
+/// The retry is the way around a resolver whose nodes refuse the
+/// connection, but each attempt costs a round trip to the resolver. Three
+/// is enough to walk past a dead node set; more would spend the chapter's
+/// budget on lookups.
+const CDN_RESOLVER_RETRIES: usize = 3;
 
 /// The host of an address, without its path or query.
 ///
@@ -1485,7 +1495,7 @@ pub fn cdn_host_candidates(url: &str) -> Vec<String> {
     }
     // 同一业务族的其它代。`v5-novelapp` 是唯一被线上探针确认能服务同一条
     // 路径的主机，所以它排在最前。
-    for candidate_version in ["v5", "v3", "v11", "v26"] {
+    for candidate_version in ["v5", "v3", "v11", "v26", "v9"] {
         push_cdn_host(
             &mut hosts,
             format!("{candidate_version}-{family}.fqnovelvod.com"),
@@ -1525,9 +1535,17 @@ pub fn cdn_host_candidates(url: &str) -> Vec<String> {
 /// a media address are the credential that proves the request is authorised.
 fn short_reason(err: &str) -> String {
     if let Some(pos) = err.find("HTTP ") {
-        let tail = &err[pos..];
-        let end = tail.find([' ', ')', '|']).unwrap_or(tail.len());
-        return tail[..end].to_string();
+        // Keep the status code. Cutting at the first blank turned
+        // 「HTTP 403 Forbidden」 into 「HTTP」, which reads like a transport
+        // failure and hides the one thing that says the host answered and
+        // refused to serve this path.
+        let tail = &err[pos + 5..];
+        let end = tail
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        if end > 0 {
+            return format!("HTTP {}", &tail[..end]);
+        }
     }
     if err.contains("timeout") {
         return "timeout".to_string();
@@ -1567,10 +1585,43 @@ fn is_status_failure(reason: &str) -> bool {
 /// The fallback hosts are educated guesses; one kilobyte is enough to tell a
 /// host that serves the path from one that does not, and it keeps a dead
 /// host from eating the chapter's whole download budget.
+///
+/// A host is not written off after one failed way of connecting: some CDNs
+/// answer only over HTTP/1.1, and a phone whose IPv6 route is broken only
+/// reaches a node over IPv4. Each attempt fails fast, so trying the ways
+/// we know is cheap.
 async fn probe_media_host(url: &str, timeout: Duration) -> Result<(), String> {
-    let Some(client) = streaming_client() else {
-        return Err("streaming client unavailable".to_string());
-    };
+    let mut first_err: Option<String> = None;
+    for client in [
+        streaming_client(),
+        streaming_client_http1(),
+        streaming_client_ipv4(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match probe_media_host_with(client, url, timeout).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                // The host answered. Another way of connecting buys nothing.
+                if is_status_failure(&short_reason(&err)) {
+                    return Err(err);
+                }
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| "download video: streaming client unavailable".to_string()))
+}
+
+/// The probe itself, over one client.
+async fn probe_media_host_with(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let resp = client
         .get(url)
         .timeout(timeout)
@@ -1707,11 +1758,36 @@ async fn download_once(
     let Some(client) = picked else {
         return Err("streaming client unavailable".to_string());
     };
+    download_once_with(
+        client,
+        url,
+        user_agent,
+        part_path,
+        cap_bytes,
+        timeout,
+        flavour != DownloadFlavour::Default,
+    )
+    .await
+}
+
+/// One download attempt over a client the caller picked.
+///
+/// The browser headers are what a CDN in front of the media expects from a
+/// browser request; the plain client leaves them out.
+async fn download_once_with(
+    client: &reqwest::Client,
+    url: &str,
+    user_agent: &str,
+    part_path: &Path,
+    cap_bytes: u64,
+    timeout: Duration,
+    browser_headers: bool,
+) -> Result<u64, String> {
     let mut req = client
         .get(url)
         .timeout(crate::upstream::budget::cap_timeout(timeout))
         .header(reqwest::header::USER_AGENT, user_agent);
-    if flavour != DownloadFlavour::Default {
+    if browser_headers {
         req = req
             .header(reqwest::header::REFERER, "https://www.fqnovel.com/")
             .header(reqwest::header::ACCEPT_ENCODING, "identity");
@@ -1754,6 +1830,93 @@ async fn download_once(
     }
     file.flush().await.map_err(|e| e.to_string())?;
     Ok(total)
+}
+
+/// A client that reaches one host through addresses we chose ourselves.
+///
+/// The system resolver decides which node answers for a CDN name, and the
+/// nodes it names are not always the ones that answer. When they refuse the
+/// connection, the way to the same name is to ask somebody else where it
+/// lives and to pin the request to the address they name.
+fn pinned_client(host: &str, addrs: &[IpAddr]) -> Option<reqwest::Client> {
+    if addrs.is_empty() {
+        return None;
+    }
+    let sockets: Vec<SocketAddr> = addrs
+        .iter()
+        .map(|address| SocketAddr::new(*address, 443))
+        .collect();
+    reqwest::Client::builder()
+        .timeout(CLIENT_DOWNLOAD_TIMEOUT)
+        .http1_only()
+        .resolve_to_addrs(host, &sockets)
+        .build()
+        .ok()
+}
+
+/// Downloads one address through the nodes a public resolver names.
+///
+/// This is the way around a resolver whose nodes refuse the connection: the
+/// name is right, the node was wrong. A phone that got
+/// `v95-<cluster>-novelapp.fqnovelvod.com` from the upstream saw every
+/// address the system resolver knew for that name refuse the connection
+/// (`Connection refused (os error 61)`), while the same name answers from
+/// a node a public resolver names.
+async fn download_via_public_resolver(
+    url: &str,
+    host: &str,
+    part_path: &Path,
+    timeout: Duration,
+) -> Result<u64, String> {
+    let addrs = crate::endpoints::cdn_dns::resolve_host(host).await;
+    if addrs.is_empty() {
+        return Err("download video: no public resolver answered".to_string());
+    }
+    let Some(client) = pinned_client(host, &addrs) else {
+        return Err("download video: pinned client unavailable".to_string());
+    };
+    log::warn!(
+        "download: {} refused every address the system resolver gave; retrying on the {} address(es) a public resolver named",
+        host,
+        addrs.len()
+    );
+    let _ = tokio::fs::remove_file(part_path).await;
+    download_once_with(
+        &client,
+        url,
+        UA_WINDOWS_BROWSER,
+        part_path,
+        MAX_VIDEO_DOWNLOAD_BYTES,
+        timeout,
+        true,
+    )
+    .await
+}
+
+/// Downloads one candidate address.
+///
+/// The system resolver's nodes may refuse the connection; when they do, the
+/// same name is tried again on the nodes a public resolver names.
+async fn download_candidate(
+    url: &str,
+    host: &str,
+    part_path: &Path,
+    timeout: Duration,
+    resolver_budget: &mut usize,
+) -> Result<u64, String> {
+    let first = stream_download_to_file(url, UA_WINDOWS_BROWSER, part_path, timeout).await;
+    let err = match first {
+        Ok(total) => return Ok(total),
+        Err(err) => err,
+    };
+    if !is_transport_failure(&short_reason(&err)) || *resolver_budget == 0 {
+        return Err(err);
+    }
+    *resolver_budget -= 1;
+    if let Ok(total) = download_via_public_resolver(url, host, part_path, timeout).await {
+        return Ok(total);
+    }
+    Err(err)
 }
 
 /// Downloads the MP4, saves it to src/, and returns the served path.
@@ -1870,6 +2033,8 @@ pub(crate) async fn download_and_save_with_timeout(
         let mut downloaded = false;
         // 连都连不上的主机：它的另一个变体（去掉签名）也一样连不上。
         let mut dead_host: Option<String> = None;
+        // 还有几个主机可以换一批节点（公共解析器）再试。
+        let mut resolver_budget: usize = CDN_RESOLVER_RETRIES;
         for (index, candidate) in candidates.iter().take(CDN_LADDER_LIMIT).enumerate() {
             let host = host_of(candidate);
             if dead_host.as_deref() == Some(host.as_str()) {
@@ -1889,6 +2054,29 @@ pub(crate) async fn download_and_save_with_timeout(
                         );
                         if is_transport_failure(&reason) {
                             dead_host = Some(host.clone());
+                            // 系统解析器给的节点全部拒连：换一个公共解析器
+                            // 问同一批域名，再在它给的节点上试一次。域名本身
+                            // 是对的，只是节点不对。
+                            if resolver_budget > 0 {
+                                resolver_budget -= 1;
+                                match download_via_public_resolver(
+                                    candidate, &host, &part_path, timeout,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        downloaded = true;
+                                        break;
+                                    }
+                                    Err(pinned_err) => {
+                                        log::warn!(
+                                            "download: host {} refused the nodes a public resolver named too: {}",
+                                            host,
+                                            short_reason(&pinned_err)
+                                        );
+                                    }
+                                }
+                            }
                         }
                         tried.push((host.clone(), reason));
                         continue;
@@ -1896,7 +2084,8 @@ pub(crate) async fn download_and_save_with_timeout(
                 }
             }
             let _ = tokio::fs::remove_file(&part_path).await;
-            match stream_download_to_file(candidate, UA_WINDOWS_BROWSER, &part_path, timeout).await
+            match download_candidate(candidate, &host, &part_path, timeout, &mut resolver_budget)
+                .await
             {
                 Ok(_) => {
                     downloaded = true;

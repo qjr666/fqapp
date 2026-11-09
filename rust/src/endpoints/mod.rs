@@ -11,6 +11,7 @@ pub mod audio_text;
 pub mod author;
 pub mod base;
 pub mod book;
+pub mod cdn_dns;
 pub mod comments;
 pub mod content;
 pub mod content_util;
