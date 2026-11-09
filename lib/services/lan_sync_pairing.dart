@@ -180,7 +180,9 @@ class LanSyncPairing {
     required String peerBaseUrl,
     required String code,
   }) async {
-    final address = peerBaseUrl.trim();
+    // Keep the stored address in the same shape the URL builder expects, so
+    // the pairing card and later syncs never show a stray trailing slash.
+    final address = peerBaseUrl.trim().replaceAll(RegExp(r'/+$'), '');
     final digits = code.trim();
     if (address.isEmpty || digits.isEmpty) {
       throw const SyncException('请填写对端地址与 6 位配对码');
