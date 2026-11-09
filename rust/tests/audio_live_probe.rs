@@ -14,8 +14,6 @@
 
 mod common;
 
-use std::error::Error as _;
-
 use common::{build_server, pool_json, TempDir};
 use fqapi_core::endpoints::Params;
 use serde_json::Value;
