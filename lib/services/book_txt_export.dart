@@ -9,7 +9,11 @@ import '../models/media_item.dart';
 /// Where a finished export landed, as the platform reported it.
 @immutable
 class ExportTarget {
-  const ExportTarget({required this.path, required this.isPublic});
+  const ExportTarget({
+    required this.path,
+    required this.isPublic,
+    this.hint,
+  });
 
   /// Path shown to the user. Either the shared Downloads entry or, on Android
   /// 9 and older, the app's own external directory.
@@ -19,6 +23,11 @@ class ExportTarget {
   /// storage. The completion message has to tell the two apart: a private file
   /// is not where the file manager looks.
   final bool isPublic;
+
+  /// Where the user picks the file up, in the platform's own words. iOS has
+  /// no shared Downloads collection, so it reports the share sheet instead of
+  /// a path nobody can open.
+  final String? hint;
 }
 
 /// Thrown when the platform could not store the exported text.
@@ -73,7 +82,12 @@ class PlatformTxtSink implements TxtSink {
     if (path is! String || path.isEmpty) {
       throw const ExportWriteException('系统未返回导出路径');
     }
-    return ExportTarget(path: path, isPublic: result?['public'] == true);
+    final hint = result?['hint'];
+    return ExportTarget(
+      path: path,
+      isPublic: result?['public'] == true,
+      hint: hint is String && hint.isNotEmpty ? hint : null,
+    );
   }
 }
 
@@ -233,7 +247,8 @@ class BookTxtExport extends ValueNotifier<BookTxtExportState> {
 }
 
 String _report(String title, ExportTarget target, int completed, int failed) {
-  final where = target.isPublic ? target.path : '${target.path}（应用私有目录）';
+  final where = target.hint ??
+      (target.isPublic ? target.path : '${target.path}（应用私有目录）');
   final missing = failed == 0 ? '' : '，$failed 章取文失败，已保留标题';
   return '已导出《$title》$completed 章$missing\n$where';
 }

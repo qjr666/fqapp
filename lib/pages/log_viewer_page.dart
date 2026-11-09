@@ -310,7 +310,7 @@ class _LogViewerPageState extends State<LogViewerPage>
             '共 ${entries.length} 条\n\n${formatLogLines(entries)}',
       );
       _message(
-        '已导出 ${entries.length} 条${target.isPublic ? '' : '到应用目录'}：${target.path}',
+        '已导出 ${entries.length} 条${_where(target)}',
       );
     } on ExportWriteException catch (error) {
       _message('导出失败：${error.message}');
@@ -365,7 +365,7 @@ class _LogViewerPageState extends State<LogViewerPage>
       );
       _message(
         '已导出应用 ${appEntries.length} 条 + 核心 $coreSummary'
-        '${target.isPublic ? '' : '到应用目录'}：${target.path}',
+        '${_where(target)}',
       );
     } on ExportWriteException catch (error) {
       _message('导出失败：${error.message}');
@@ -640,4 +640,17 @@ class _LogViewerPageState extends State<LogViewerPage>
       message: filtered ? '试试其他关键词，或调整筛选条件' : '运行应用后，日志会显示在这里',
     );
   }
+}
+
+/// Where an exported file can be picked up.
+///
+/// iOS has no shared Downloads collection: the platform reports the share
+/// sheet it opened instead of a path nobody can open, and the file also sits
+/// in the app's own Documents folder.
+String _where(ExportTarget target) {
+  final hint = target.hint;
+  if (hint != null && hint.isNotEmpty) {
+    return hint;
+  }
+  return target.isPublic ? '：${target.path}' : '到应用目录：${target.path}';
 }
