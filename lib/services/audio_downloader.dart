@@ -9,6 +9,7 @@ import 'api_client.dart';
 import 'audio_download_store.dart';
 import 'audio_download_transfer.dart';
 import 'download_resume_store.dart';
+import 'episode_source_cache.dart';
 
 enum AudioDownloadStatus { waiting, downloading, paused, completed, failed }
 
@@ -827,11 +828,21 @@ class AudioDownloader extends ValueNotifier<List<AudioDownloadTask>> {
     run.ownsFinal = false;
   }
 
+  /// 取这一章的可下载音频。
+  ///
+  /// iOS 必须和播放走同一条路：上游给的是 CENC 加密直连流，存下来 iPhone
+  /// 解不开，离线播放只会失败。带上 `mode=plain` 让核心把整章缓存并按
+  /// Range 解密，存下来的是明文。Android / Windows 不带该参数，行为不变。
   static Future<AudioSource> _defaultResolve(
     String bookId,
     String itemId,
     String toneId,
-  ) => ApiClient.instance.audioSource(itemId, bookId: bookId, toneId: toneId);
+  ) => ApiClient.instance.audioSource(
+    itemId,
+    bookId: bookId,
+    toneId: toneId,
+    mode: audioContentMode,
+  );
 }
 
 class _MutableTask {
