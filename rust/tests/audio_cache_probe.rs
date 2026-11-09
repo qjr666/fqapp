@@ -472,9 +472,15 @@ struct Candidate {
 /// `tts_tones`、只有一部分带 `audio_tones`。早先的版本命中第一本就返回，
 /// 于是「智能朗读」那一支经常一次都没跑过——书找到了，音色却是空的。
 async fn resolve_candidates(srv: &Arc<Server>) -> Vec<Candidate> {
-    let search = srv.handler("search")?;
-    let tones = srv.handler("tones")?;
-    let directory = srv.handler("directory")?;
+    let Some(search) = srv.handler("search") else {
+        return Vec::new();
+    };
+    let Some(tones) = srv.handler("tones") else {
+        return Vec::new();
+    };
+    let Some(directory) = srv.handler("directory") else {
+        return Vec::new();
+    };
 
     let params = Params::from_pairs(vec![("query".to_string(), TARGET_TITLE.to_string())]);
     let mut ids: Vec<String> = Vec::new();
