@@ -887,6 +887,12 @@ async fn live_audio_cache_probe() {
     // ---- 目标书：真机上正在听的那本 ----
     let candidates = resolve_candidates(&srv).await;
     println!("=== candidates: {}", candidates.len());
+    for candidate in candidates.iter() {
+        println!(
+            "[candidate] id={} tts_tones={:?} narrators={:?} related_novel={:?}",
+            candidate.id, candidate.tts_tones, candidate.narrators, candidate.related_novel
+        );
+    }
 
     // ---- 智能朗读：TTS 走的是**原著**的章节 id，音色取 tts_tones ----
     // App 选中智能朗读后会切到关联原著，用原著的章节 id 请求，tone_id 是
