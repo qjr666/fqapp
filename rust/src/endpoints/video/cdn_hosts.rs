@@ -194,7 +194,7 @@ fn the_cdn_ladder_swaps_a_dead_host_for_one_that_serves_the_path() {
         "a copy without the signature must exist as well"
     );
     assert!(
-        !candidates
+        !candidates[1..]
             .iter()
             .any(|candidate| candidate.contains("fqnovel.com/a/b")),
         "the dead domain must not be tried again"
@@ -204,7 +204,7 @@ fn the_cdn_ladder_swaps_a_dead_host_for_one_that_serves_the_path() {
 #[test]
 fn the_cdn_ladder_keeps_the_version_the_upstream_asked_for_first() {
     let candidates = cdn_host_candidates("https://v11-novelapp.fqnovel.com/a/b.mp4");
-    let version_kept = candidates
+    let version_kept = candidates[1..]
         .iter()
         .find(|candidate| candidate.contains("v11-novelapp"))
         .expect("the upstream's own generation must be retried on a resolvable domain");

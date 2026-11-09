@@ -341,6 +341,15 @@ async fn probe_case(srv: &Arc<Server>, lb: &Loopback, case: &Case) {
             sanitize(url)
         );
     }
+    // 路径是对象的身份，域名只是它当前被下发到哪个 CDN。打印路径（去掉
+    // 签名）才能把「哪个代能服务这条路径」和「哪个域名解析不了」分开。
+    if let Some((url, _)) = urls.first() {
+        let path = url.split("://").nth(1).unwrap_or("").split_once('/').map(|(_, rest)| rest);
+        if let Some(path) = path {
+            let path = path.split('?').next().unwrap_or(path);
+            println!("[direct]   path={path}");
+        }
+    }
 
     // 上游是按客户端下发 CDN 域名的：换一台设备再问一次，看域名会不会变。
     // 会变的话，「第一台给的域名解析不了」就有第二条路可走。

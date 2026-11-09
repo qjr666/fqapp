@@ -1539,6 +1539,13 @@ async fn stream_download_to_file_with_cap(
             if err.contains("timeout") {
                 return Err(err);
             }
+            // The server's own answer — a length above the cap — is final:
+            // asking again only replaces the real reason with whatever the
+            // second attempt happened to say, which by then is usually
+            // "connection refused" because the server closed its socket.
+            if is_definitive_failure(&err) {
+                return Err(err);
+            }
             // The connection died before any byte arrived. Some CDNs only
             // behave over HTTP/1.1, only for a request that carries the
             // headers a browser sends, or only over IPv4; the same URL then
@@ -1555,7 +1562,7 @@ async fn stream_download_to_file_with_cap(
             match second {
                 Ok(total) => Ok(total),
                 Err(_) => {
-                    download_once(
+                    match download_once(
                         url,
                         user_agent,
                         part_path,
@@ -1564,10 +1571,25 @@ async fn stream_download_to_file_with_cap(
                         DownloadFlavour::Ipv4,
                     )
                     .await
+                    {
+                        Ok(total) => Ok(total),
+                        // 报第一次的错误：后面两次只是换了连法，它们的错误
+                        // 一般更没有信息量。
+                        Err(_) => Err(err),
+                    }
                 }
             }
         }
     }
+}
+
+/// Is this failure the server's own final answer?
+///
+/// A length above the cap does not change by asking again, and neither does
+/// a body that already grew past it. Only a transport problem might be
+/// fixed by connecting differently.
+fn is_definitive_failure(err: &str) -> bool {
+    err.contains("exceeds cap")
 }
 
 /// One download attempt: connect, check the status, stream the body to disk.
