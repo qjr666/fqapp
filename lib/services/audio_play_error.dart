@@ -53,7 +53,7 @@ String? _cacheFailureReason(String message) {
   if (raw.isEmpty) return null;
   final cleaned = raw.replaceAll(RegExp(r'https?://\S+'), '地址').trim();
   if (cleaned.isEmpty) return null;
-  return cleaned.length > 60 ? '${cleaned.substring(0, 60)}…' : cleaned;
+  return cleaned.length > 120 ? '${cleaned.substring(0, 120)}…' : cleaned;
 }
 
 /// 上游业务错误 / 解析失败的具体原因。没有原因的失败才回落通用文案。

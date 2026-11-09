@@ -95,7 +95,28 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
             // 前者，智能朗读因此拿不到 key_hex —— 核心与 Dart 两侧都会把它
             // 当成「没有可播的流」。两种信封都要补 key。
             patch_encrypted_audio_keys(&mut payload);
-            let candidates = encrypted_audio_candidates(&payload);
+            let scan = encrypted_audio_candidates(&payload);
+            let saw_encrypted = scan.saw_encrypted;
+            let candidates = scan.candidates;
+            if candidates.is_empty() && saw_encrypted {
+                // The answer does carry an encrypted stream, we only failed to
+                // recognise its shape. Handing the encrypted URL back would
+                // leave iOS with a source it cannot play and a generic
+                // failure message, so report the mismatch itself.
+                log::warn!(
+                    "audio plain: chapter {} tone {} has an encrypted stream in an unrecognised shape",
+                    chapter_id,
+                    tone_id
+                );
+                return Ok(json!({
+                    "code": 0,
+                    "data": [{
+                        "item_id": chapter_id.clone(),
+                        "code": 4903,
+                        "message": "IOS_AUDIO_CACHE_FAILED: 上游返回了加密音频，但当前解析规则未能识别其结构",
+                    }],
+                }));
+            }
             if candidates.is_empty() {
                 // A genuinely clear stream needs no cache at all. Keeping the
                 // upstream answer lets iOS open the signed URL directly.
@@ -232,6 +253,18 @@ struct AudioCandidate {
     key: Vec<u8>,
 }
 
+/// What a scan of a playinfo answer found.
+struct AudioScan {
+    /// The playable streams, in the order the player should try them.
+    candidates: Vec<AudioCandidate>,
+    /// Whether the answer carried an encrypted stream at all. A scan that saw
+    /// one but produced no candidate means the envelope shape was not
+    /// understood — that must not be mistaken for "this stream is clear", or
+    /// the caller hands iOS an encrypted URL it cannot play and reports a
+    /// generic failure instead of the real mismatch.
+    saw_encrypted: bool,
+}
+
 /// The answer the Dart side expects for a server-decrypted stream: a bare
 /// `main_url` that the backend expands into the loopback URL.
 fn cached_audio_payload(chapter_id: &str, served: String, attempts: &[String]) -> Value {
@@ -247,11 +280,16 @@ fn cached_audio_payload(chapter_id: &str, served: String, attempts: &[String]) -
 
 /// Strips signed URLs out of an error before it can reach the screen: the
 /// download errors carry the full request URL, and that URL is a credential.
+/// The host is kept — it is the part that says *which* CDN answered, and
+/// without it two different failures look identical — while the path and the
+/// query, which carry the signature, are dropped.
 fn sanitize_cache_error(err: &str) -> String {
     static URL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = URL_RE.get_or_init(|| regex::Regex::new(r"https?://\S+").expect("url regex"));
-    let cleaned = re.replace_all(err, "<url>").to_string();
-    cleaned.chars().take(120).collect()
+    let re = URL_RE.get_or_init(|| {
+        regex::Regex::new(r"https?://([^\s/?#]+)[^)\s]*").expect("url regex")
+    });
+    let cleaned = re.replace_all(err, "host=$1").to_string();
+    cleaned.chars().take(160).collect()
 }
 
 /// Collects every encrypted stream of a patched playinfo answer, paired with
@@ -264,7 +302,7 @@ fn sanitize_cache_error(err: &str) -> String {
 /// when `key_hex` is missing, and retrying `backup_url` is what keeps an
 /// unfamiliar voice from silently falling back to the encrypted direct URL
 /// that iOS cannot play.
-fn encrypted_audio_candidates(payload: &Value) -> Vec<AudioCandidate> {
+fn encrypted_audio_candidates(payload: &Value) -> AudioScan {
     let mut models: Vec<Map<String, Value>> = Vec::new();
     match payload.get("data") {
         Some(Value::Array(rows)) => {
@@ -277,10 +315,7 @@ fn encrypted_audio_candidates(payload: &Value) -> Vec<AudioCandidate> {
             }
         }
         Some(Value::Object(data)) => {
-            if let Some(rows) = data
-                .get("video_model_datas")
-                .and_then(|v| v.as_array())
-            {
+            if let Some(rows) = data.get("video_model_datas").and_then(|v| v.as_array()) {
                 for row in rows {
                     if let Some(raw) = row.get("video_model").and_then(|v| v.as_str()) {
                         if let Some(model) =
@@ -296,8 +331,8 @@ fn encrypted_audio_candidates(payload: &Value) -> Vec<AudioCandidate> {
     }
 
     let mut out: Vec<AudioCandidate> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, Vec<u8>)> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(String, Vec<u8>)> = std::collections::HashSet::new();
+    let mut saw_encrypted = false;
     for model in models {
         // Only an explicitly video-flavoured answer is out of scope. TTS
         // voices have been seen without `media_type`, and skipping those was
@@ -313,7 +348,9 @@ fn encrypted_audio_candidates(payload: &Value) -> Vec<AudioCandidate> {
             continue;
         };
         for stream in list {
-            let Some(item) = stream.as_object() else { continue; };
+            let Some(item) = stream.as_object() else {
+                continue;
+            };
             let Some(info) = item.get("encrypt_info").and_then(|v| v.as_object()) else {
                 continue;
             };
@@ -324,6 +361,9 @@ fn encrypted_audio_candidates(payload: &Value) -> Vec<AudioCandidate> {
             {
                 continue;
             }
+            // The answer does carry an encrypted stream, even if the details
+            // below turn out to be unusable. Remember that.
+            saw_encrypted = true;
             // `patch_playinfo_keys` / `patch_encrypted_audio_keys` derive a
             // 16-byte key from `spade_a`. Derive it here too when neither
             // envelope shape carried a `key_hex`, so a voice with an
@@ -336,10 +376,7 @@ fn encrypted_audio_candidates(payload: &Value) -> Vec<AudioCandidate> {
                     _ => Vec::new(),
                 },
                 _ => {
-                    let spade = info
-                        .get("spade_a")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let spade = info.get("spade_a").and_then(|v| v.as_str()).unwrap_or("");
                     let derived = crate::endpoints::video::derive_spade_content_key(spade);
                     if derived.len() == 16 {
                         derived
@@ -365,7 +402,10 @@ fn encrypted_audio_candidates(payload: &Value) -> Vec<AudioCandidate> {
             }
         }
     }
-    out
+    AudioScan {
+        candidates: out,
+        saw_encrypted,
+    }
 }
 
 /// Cache entries live in `src_dir`; ids must stay inside one path segment.
@@ -696,7 +736,9 @@ mod key_vectors {
             "data": { "video_model_datas": [ { "item_id": "1", "video_model": model } ] }
         });
         patch_encrypted_audio_keys(&mut value);
-        let candidates = encrypted_audio_candidates(&value);
+        let scan = encrypted_audio_candidates(&value);
+        assert!(scan.saw_encrypted, "the answer carries an encrypted stream");
+        let candidates = scan.candidates;
         assert_eq!(candidates.len(), 2, "main_url and backup_url");
         assert_eq!(
             candidates[0].key,
@@ -715,7 +757,9 @@ mod key_vectors {
             "data": [ { "item_id": "1", "video_model": model } ]
         });
         patch_playinfo_keys(&mut value);
-        let candidates = encrypted_audio_candidates(&value);
+        let scan = encrypted_audio_candidates(&value);
+        assert!(scan.saw_encrypted, "the answer carries an encrypted stream");
+        let candidates = scan.candidates;
         assert_eq!(candidates.len(), 2, "main_url and backup_url");
         assert_eq!(
             candidates[0].key,

@@ -65,6 +65,19 @@ cp -f "$APP_DIR/rust/target/aarch64-apple-ios/release/libfqapi_core.a" \
 echo "==> 已放置：$OUT_DIR/libfqapi_core.a"
 lipo -info "$OUT_DIR/libfqapi_core.a"
 
+# 真机反馈「听书取流失败」时，截图只答得出「失败了」，答不出「上游给的信封
+# 长什么样」「那个音频地址本身能不能下载」「失败卡在传输层的哪一步」。
+# 这条探针对着真实上游取一次音频章节，把三件事一次打印出来。
+#
+# 它只读网络、不改任何东西，失败也不影响出包——所以放在这里而不是某个
+# workflow 里：iOS 这条作业没有 fmt 门禁，探针一定能跑到。
+if [ "${FQAPP_LIVE_PROBE:-1}" = "1" ]; then
+  echo "==> live upstream audio probe"
+  ( cd "$APP_DIR" && cargo test --locked --manifest-path "$MANIFEST" \
+      --test audio_live_probe -- --ignored --nocapture ) \
+    || echo "    (探针失败，不影响出包)"
+fi
+
 if [ "$SIMULATOR" -eq 1 ]; then
   build_target aarch64-apple-ios-sim
   build_target x86_64-apple-ios

@@ -55,7 +55,7 @@ class IosPlatform {
     _emit('fqapp/system_tts_events', <String, dynamic>{
       'type': type,
       'id': id,
-      if (rangeStart != null) 'start': rangeStart,
+      'start': ?rangeStart,
     });
   }
 
@@ -85,7 +85,7 @@ class IosPlatform {
     _tts.setCompletionHandler(() => _ttsEvent('done'));
     // willSpeakRangeOfSpeechString：恢复精确到字的高亮（可选增强，缺了
     // SystemTtsPlayback 会退化为整句高亮）。
-    _tts.setProgressHandler((String _text, int start, int _end, String _word) {
+    _tts.setProgressHandler((String _, int start, int _, String _) {
       _ttsEvent('range', rangeStart: start);
     });
     _tts.setErrorHandler((dynamic _) {

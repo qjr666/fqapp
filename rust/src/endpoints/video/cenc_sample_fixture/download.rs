@@ -193,9 +193,15 @@ async fn stream_download_enforces_cap_from_running_total() {
     let part = dir.join("ep.mp4.part");
     let url = format!("http://127.0.0.1:{port}/ep.mp4");
     // Exercise the same loop with a small cap via the test-only seam.
-    let err = stream_download_to_file_with_cap(&url, UA_WINDOWS_BROWSER, &part, 10, VIDEO_DOWNLOAD_TIMEOUT)
-        .await
-        .expect_err("stream past the cap must be rejected");
+    let err = stream_download_to_file_with_cap(
+        &url,
+        UA_WINDOWS_BROWSER,
+        &part,
+        10,
+        VIDEO_DOWNLOAD_TIMEOUT,
+    )
+    .await
+    .expect_err("stream past the cap must be rejected");
     assert!(err.contains("exceeds cap"), "unexpected error: {err}");
     let _ = server.await;
     let _ = std::fs::remove_dir_all(&dir);

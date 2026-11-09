@@ -1304,6 +1304,88 @@ fn streaming_client() -> Option<&'static reqwest::Client> {
         .as_ref()
 }
 
+/// A second streaming client that refuses HTTP/2.
+///
+/// Some CDNs answer the HTTP/2 upgrade badly enough that the connection is
+/// dropped before a single byte arrives, while the very same URL over
+/// HTTP/1.1 works. Keeping this as a separate client lets a failed download
+/// retry without paying for a client build per attempt.
+static STREAMING_CLIENT_HTTP1: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+
+fn streaming_client_http1() -> Option<&'static reqwest::Client> {
+    STREAMING_CLIENT_HTTP1
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(CLIENT_DOWNLOAD_TIMEOUT)
+                .http1_only()
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+/// A third streaming client: HTTP/1.1, bound to IPv4 only.
+///
+/// Apple's networking stack tries IPv4 and IPv6 in parallel (Happy
+/// Eyeballs), so a phone reaches a CDN whose IPv6 edge is broken. Rust's
+/// resolver hands hyper the addresses in system order and hyper has no such
+/// fallback, so a broken IPv6 address makes the whole request fail. Binding
+/// the socket to `0.0.0.0` keeps the connection on IPv4 and sidesteps it.
+static STREAMING_CLIENT_IPV4: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+
+fn streaming_client_ipv4() -> Option<&'static reqwest::Client> {
+    STREAMING_CLIENT_IPV4
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(CLIENT_DOWNLOAD_TIMEOUT)
+                .http1_only()
+                .local_address(Some(std::net::SocketAddr::from((
+                    [0, 0, 0, 0],
+                    0,
+                ))))
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Which client and header set one download attempt uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DownloadFlavour {
+    /// The default client: HTTP/2 negotiated, browser User-Agent only.
+    Default,
+    /// HTTP/1.1 only, plus the headers a CDN in front of the media usually
+    /// expects from a browser request.
+    BrowserLike,
+    /// HTTP/1.1, browser headers, and IPv4 only.
+    Ipv4,
+}
+
+/// Expands a reqwest failure into something a screenshot can explain.
+///
+/// `reqwest::Error` renders every transport-level problem as one sentence —
+/// "error sending request for url (...)" — for TLS, DNS, a reset connection
+/// and a timeout alike. The source chain carries the actual reason, so walk
+/// it and lead with the host, which is the part that tells the two apart.
+fn describe_transport_error(err: &reqwest::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(url) = err.url() {
+        parts.push(format!("host={}", url.host_str().unwrap_or("?")));
+    }
+    if err.is_timeout() {
+        parts.push("timeout".to_string());
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    if parts.is_empty() {
+        parts.push(err.to_string());
+    }
+    parts.join(" | ")
+}
+
 /// Streams a video body to `part_path` chunk by chunk, never holding the
 /// whole file in memory. Enforces the per-file cap from `Content-Length`
 /// when present and from the running byte count while streaming. Leaves a
@@ -1331,14 +1413,84 @@ async fn stream_download_to_file_with_cap(
     cap_bytes: u64,
     timeout: Duration,
 ) -> Result<u64, String> {
-    let client = streaming_client().ok_or_else(|| "streaming client unavailable".to_string())?;
-    let mut resp = client
+    let first = download_once(
+        url,
+        user_agent,
+        part_path,
+        cap_bytes,
+        timeout,
+        DownloadFlavour::Default,
+    )
+    .await;
+    match first {
+        Ok(total) => Ok(total),
+        Err(err) => {
+            // A timeout is a timeout on every protocol: retrying would only
+            // double the wait the user already spent.
+            if err.contains("timeout") {
+                return Err(err);
+            }
+            // The connection died before any byte arrived. Some CDNs only
+            // behave over HTTP/1.1, only for a request that carries the
+            // headers a browser sends, or only over IPv4; the same URL then
+            // works. Each attempt fails fast, so walking the ladder is cheap.
+            let second = download_once(
+                url,
+                user_agent,
+                part_path,
+                cap_bytes,
+                timeout,
+                DownloadFlavour::BrowserLike,
+            )
+            .await;
+            match second {
+                Ok(total) => Ok(total),
+                Err(err) => {
+                    download_once(
+                        url,
+                        user_agent,
+                        part_path,
+                        cap_bytes,
+                        timeout,
+                        DownloadFlavour::Ipv4,
+                    )
+                    .await
+                }
+            }
+        }
+    }
+}
+
+/// One download attempt: connect, check the status, stream the body to disk.
+async fn download_once(
+    url: &str,
+    user_agent: &str,
+    part_path: &Path,
+    cap_bytes: u64,
+    timeout: Duration,
+    flavour: DownloadFlavour,
+) -> Result<u64, String> {
+    let picked = match flavour {
+        DownloadFlavour::Default => streaming_client(),
+        DownloadFlavour::BrowserLike => streaming_client_http1(),
+        DownloadFlavour::Ipv4 => streaming_client_ipv4(),
+    };
+    let Some(client) = picked else {
+        return Err("streaming client unavailable".to_string());
+    };
+    let mut req = client
         .get(url)
         .timeout(crate::upstream::budget::cap_timeout(timeout))
-        .header(reqwest::header::USER_AGENT, user_agent)
+        .header(reqwest::header::USER_AGENT, user_agent);
+    if flavour != DownloadFlavour::Default {
+        req = req
+            .header(reqwest::header::REFERER, "https://www.fqnovel.com/")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+    }
+    let mut resp = req
         .send()
         .await
-        .map_err(|e| format!("download video: {e}"))?;
+        .map_err(|e| format!("download video: {}", describe_transport_error(&e)))?;
     // The whole-body path rejects anything but 200; keep that contract.
     if resp.status() != reqwest::StatusCode::OK {
         return Err(format!("download video: HTTP {}", resp.status()));
@@ -1386,8 +1538,14 @@ pub(crate) async fn download_and_save(
     video_url: &str,
     content_key: &[u8],
 ) -> Result<String, String> {
-    download_and_save_with_timeout(ctx, video_id, video_url, content_key, VIDEO_DOWNLOAD_TIMEOUT)
-        .await
+    download_and_save_with_timeout(
+        ctx,
+        video_id,
+        video_url,
+        content_key,
+        VIDEO_DOWNLOAD_TIMEOUT,
+    )
+    .await
 }
 
 /// Same as [`download_and_save`] with a caller-chosen deadline.

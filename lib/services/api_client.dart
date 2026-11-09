@@ -549,12 +549,49 @@ class ApiClient {
     // tone 0, so the caller falls back to the first selectable voice.
     // `mode=plain` 只在 iOS 上出现：核心把加密音频缓存进 src/，返回可按
     // Range 解密的回环流。此时请求要等整章下载完，不能套用 20 秒超时。
+    final path = '/api/v1/audio/books/${Uri.encodeComponent(trimmedBookId)}'
+        '/chapters/${Uri.encodeComponent(itemId)}';
+    try {
+      return await _audioSourceFrom(
+        path,
+        itemId: itemId,
+        selectedTone: selectedTone,
+        mode: mode,
+      );
+    } on ApiException catch (error) {
+      // iOS 上服务端缓存解密失败时核心会回 4903。但上游给的那个加密直连
+      // 地址在 iPhone 上其实是能播的 —— 真人讲书的「加密」标记早已失效，
+      // 走苹果网络栈的播放器能直接拉下来。早期版本就是靠这条兜底工作的，
+      // 把它换成硬报错等于把能播的路堵死（真机反馈「真人讲书从能播变成
+      // 不能播」正是这个回归）。所以这里退回不带 mode 的原始答案再试一次。
+      if (mode != 'plain' ||
+          !error.message.contains('IOS_AUDIO_CACHE_FAILED')) {
+        rethrow;
+      }
+      try {
+        return await _audioSourceFrom(
+          path,
+          itemId: itemId,
+          selectedTone: selectedTone,
+          mode: null,
+        );
+      } catch (_) {
+        // 兜底也失败：把服务端给出的真实原因（已脱敏）抛回去，它比笼统的
+        // 「播放出错，请稍后重试」有用得多。
+        throw error;
+      }
+    }
+  }
+
+  /// Requests one chapter's playable audio model.
+  Future<AudioSource> _audioSourceFrom(
+    String path, {
+    required String itemId,
+    required String selectedTone,
+    String? mode,
+  }) async {
     final response = await _get(
-      _url(
-        '/api/v1/audio/books/${Uri.encodeComponent(trimmedBookId)}'
-        '/chapters/${Uri.encodeComponent(itemId)}',
-        {'tone_id': selectedTone, 'mode': ?mode},
-      ),
+      _url(path, {'tone_id': selectedTone, 'mode': ?mode}),
       timeout: mode == 'plain' ? iosCacheFetchTimeout : null,
     );
     final statusCode = response.statusCode;

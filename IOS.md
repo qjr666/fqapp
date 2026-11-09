@@ -147,6 +147,33 @@ BUNDLE_ID=com.fqapp.fqapp IPA=/tmp/pack/fqapp_ios_unsigned.ipa ./your-sign-scrip
   此外第四轮还：复用旧缓存 id（设备上可能还留着能播的那份）、加空密钥的明文
   兜底、失败时把脱敏后的真实原因带给界面。首次起播需等整章缓存完。系统朗读
   （本地 `flutter_tts`）是独立链路。
+- **智能朗读 / 真人讲书**：第四轮包（run 42547362598）真机反馈：
+  - 真人讲书：`这个声音暂时无法在 iPhone 上播放（download video: error sending
+    request for url (<url>)）` —— 诊断信息生效了，但原因是 reqwest 在**传输层**
+    就断了，不是 HTTP 403、也不是超时。
+  - 智能朗读：仍是笼统的「播放出错」—— 走的是另一条路：信封没被识别成候选，
+    于是核心**静默落回**加密直连地址，Dart 侧解析不了那个信封。
+
+  查下来的三个结论（第五轮改动）：
+  1. **`error sending request` 是 reqwest 对所有传输层故障的统一文案**
+     （TLS / DNS / 连接被重置 / 超时都长这样）。第五轮把错误链展开成
+     `host=… | timeout | <cause>`，并把脱敏从「抹掉整个 URL」改成「保留域名、
+     丢掉带签名的路径与查询串」——域名正是区分两种故障的关键。
+  2. **同一个地址，苹果网络栈能下、Rust 的 reqwest 不能**。苹果栈有 Happy
+     Eyeballs（IPv6 失败立刻回退 IPv4），hyper 没有；reqwest 的 TLS 走
+     `rustls-platform-verifier`（系统信任库）。第五轮给下载加了三段递进
+     兜底：默认（h2）→ HTTP/1.1 + 浏览器请求头 → 再强制 IPv4（本地地址绑到
+     `0.0.0.0`）。每段失败都很快，走完不增加等待。
+  3. **服务端缓存失败时必须落回加密直连地址**。真人讲书的「加密」标记早已
+     失效，直连地址在 iPhone 上本来就能播——第三轮把这条静默兜底换成硬报错
+     4903，正是「真人讲书从能播变成不能播」的回归。第五轮在 Dart 侧恢复：
+     `mode=plain` 收到 4903 时，退回不带 `mode` 的原始答案再试一次；兜底也
+     失败才把 4903 的真实原因抛给界面。
+  另外核心现在能区分「真的没有加密流」与「有加密流但没认出来」：后者不再
+  静默落回，而是显式报 4903 + 「未能识别其结构」。
+  为拿到真机截图答不出的信息，第五轮加了 `rust/tests/audio_live_probe.rs`：
+  它对着真实上游取一次音频章节，打印信封结构、音频地址（去查询串）与传输层
+  的真实失败原因，并在 Android 工作流里以 `continue-on-error` 方式跑。
 - **离线加密缓存仍不可用**：`file://` + keyHex 需要端上 CENC 解密，而
   `desktop_media` / `desktop_fetch` 被 `#[cfg(target_os = "windows")]` 门住，
   iOS 静态库里没有 `fq_desktop_media_open`。同样走 4901 明确提示。要补齐需

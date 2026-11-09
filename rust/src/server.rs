@@ -184,8 +184,7 @@ const CACHE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Picks the deadline for one request from its local route path.
 fn request_budget(path: &str) -> std::time::Duration {
     let is_video = path.contains("/api/v1/videos/");
-    let is_audio_chapter =
-        path.contains("/api/v1/audio/books/") && path.contains("/chapters/");
+    let is_audio_chapter = path.contains("/api/v1/audio/books/") && path.contains("/chapters/");
     if is_video || is_audio_chapter {
         CACHE_FETCH_TIMEOUT
     } else {
