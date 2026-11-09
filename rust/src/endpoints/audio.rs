@@ -279,67 +279,87 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                 );
             } else {
                 let mut attempts: Vec<String> = Vec::new();
+                // 上游给过的所有主机名：换设备重问时用它判断「这个域名是不是
+                // 已经试过了」。
+                let mut seen_hosts: Vec<String> = upstream_host_list(&candidates);
+                let candidate_count = candidates.len();
+                let mut current = candidates;
+                let mut served: Option<String> = None;
 
-                // 第一轮：按上游给的地址下载。
-                match cache_audio_chapter(ctx, &chapter_id, &tone_id, &candidates, &mut attempts)
+                // 上游按客户端下发 CDN 域名：同一个章节在不同的设备上会拿到
+                // 不同的主机名，有的能连通、有的在公网连不上。所以不止试一
+                // 轮：这一轮失败就换一台设备再问一次上游，直到拿到一个没
+                // 试过的主机名为止。
+                for round in 0..AUDIO_HOST_ROUNDS {
+                    match cache_audio_chapter(
+                        ctx,
+                        &chapter_id,
+                        &tone_id,
+                        &current,
+                        &mut attempts,
+                    )
                     .await
-                {
-                    Ok(served) => {
-                        // `parsePlayinfoSource` walks the last envelope's
-                        // `data` list. A bare `main_url` without
-                        // `encrypt_info` hits its plain-stream branch, and
-                        // `_mediaUrl` expands `/src/...` into the loopback
-                        // URL that `serve_src_file` decrypts per Range.
-                        return Ok(cached_audio_payload(&chapter_id, served, &attempts));
+                    {
+                        Ok(path) => {
+                            served = Some(path);
+                            break;
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "audio plain: chapter {} tone {} round {} exhausted {} candidates (last: {})",
+                                chapter_id,
+                                tone_id,
+                                round + 1,
+                                current.len(),
+                                err
+                            );
+                        }
                     }
-                    Err(err) => {
-                        log::warn!(
-                            "audio plain: chapter {} tone {} exhausted {} candidates (last: {})",
-                            chapter_id,
-                            tone_id,
-                            candidates.len(),
-                            err
-                        );
+                    if round + 1 >= AUDIO_HOST_ROUNDS {
+                        break;
                     }
-                }
-
-                // 第二轮：换一台设备再问一次上游。上游是按客户端下发 CDN
-                // 域名的，第一台设备拿到的那个名字可能在公网根本解析不了；
-                // 换一台往往就是一个能用的域名。已经试过的主机不再重试，
-                // 所以上游没换域名时这一轮几乎不花时间。
-                if let Ok(mut retry_payload) = fetch_playinfo_with_retry(ctx, p.clone(), 2).await {
+                    // 换一台设备再问一次上游。上游是按客户端下发 CDN 域名的，
+                    // 第一台设备拿到的那个名字可能在公网根本解析不了；换一台
+                    // 往往就是一个能用的域名。已经试过的主机不再重试。
+                    let Ok(mut retry_payload) = fetch_playinfo_with_retry(ctx, p.clone(), 2).await
+                    else {
+                        continue;
+                    };
                     normalize_audio_envelope(&mut retry_payload);
                     patch_playinfo_keys(&mut retry_payload);
                     patch_encrypted_audio_keys(&mut retry_payload);
                     let retry_scan = encrypted_audio_candidates(&retry_payload);
-                    let tried_hosts = upstream_host_list(&candidates);
-                    let fresh: Vec<AudioCandidate> = retry_scan
-                        .candidates
-                        .into_iter()
-                        .filter(|candidate| {
-                            !tried_hosts.contains(&host_of_candidate(candidate))
-                        })
-                        .collect();
-                    if !fresh.is_empty() {
-                        let fresh_hosts = upstream_host_list(&fresh);
-                        log::warn!(
-                            "audio plain: chapter {} tone {} retrying with new hosts: {}",
-                            chapter_id,
-                            tone_id,
-                            fresh_hosts.join(", ")
-                        );
-                        if let Ok(served) = cache_audio_chapter(
-                            ctx,
-                            &chapter_id,
-                            &tone_id,
-                            &fresh,
-                            &mut attempts,
-                        )
-                        .await
-                        {
-                            return Ok(cached_audio_payload(&chapter_id, served, &attempts));
+                    let mut fresh: Vec<AudioCandidate> = Vec::new();
+                    for candidate in retry_scan.candidates {
+                        let host = host_of_candidate(&candidate);
+                        if seen_hosts.contains(&host) {
+                            continue;
                         }
+                        seen_hosts.push(host);
+                        fresh.push(candidate);
                     }
+                    if fresh.is_empty() {
+                        // 上游这一轮没换域名：没有新东西可试，但下一轮换一台
+                        // 设备仍可能换，所以继续。
+                        continue;
+                    }
+                    log::warn!(
+                        "audio plain: chapter {} tone {} round {} retrying with new hosts: {}",
+                        chapter_id,
+                        tone_id,
+                        round + 2,
+                        upstream_host_list(&fresh).join(", ")
+                    );
+                    current = fresh;
+                }
+
+                if let Some(path) = served {
+                    // `parsePlayinfoSource` walks the last envelope's
+                    // `data` list. A bare `main_url` without
+                    // `encrypt_info` hits its plain-stream branch, and
+                    // `_mediaUrl` expands `/src/...` into the loopback
+                    // URL that `serve_src_file` decrypts per Range.
+                    return Ok(cached_audio_payload(&chapter_id, path, &attempts));
                 }
 
                 // 服务端确实没能拿到可解密的音频。给出带原因的业务码：iOS 端
@@ -349,14 +369,13 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                 // 消息里带上上游给过的域名：上游按客户端下发 CDN 域名，
                 // 有时给的那个名字在公网根本解析不了。只看最后一个候选的
                 // 报错，分不清「上游给了死域名」还是「路径不对」。
-                let upstream_hosts = upstream_host_list(&candidates);
                 let last_err = attempts.last().cloned().unwrap_or_default();
                 log::warn!(
                     "audio plain: chapter {} tone {} exhausted {} candidates (hosts: {}; last: {})",
                     chapter_id,
                     tone_id,
-                    candidates.len(),
-                    upstream_hosts.join(", "),
+                    candidate_count,
+                    seen_hosts.join(", "),
                     last_err
                 );
                 return Ok(json!({
@@ -368,7 +387,7 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                             "IOS_AUDIO_CACHE_FAILED: {}（已尝试 {} 次；上游域名：{}）",
                             sanitize_cache_error(&last_err),
                             attempts.len(),
-                            upstream_hosts.join(", ")
+                            seen_hosts.join(", ")
                         ),
                     }],
                 }));
@@ -501,6 +520,12 @@ fn upstream_host_list(candidates: &[AudioCandidate]) -> Vec<String> {
 /// 于是被判失败。回环服务对音频章节路由也放宽了同样的预算。
 const AUDIO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How many times one chapter may ask the upstream for a fresh CDN host.
+///
+/// 上游按客户端下发 CDN 域名，同一条路径在不同设备上会得到不同的主机名，
+/// 有的在公网连不上。多换几台设备就多几次机会拿到一个连得上的域名。
+const AUDIO_HOST_ROUNDS: usize = 3;
+
 /// One playable stream discovered in a patched playinfo answer.
 struct AudioCandidate {
     url: String,
@@ -544,7 +569,7 @@ fn sanitize_cache_error(err: &str) -> String {
     let re = URL_RE
         .get_or_init(|| regex::Regex::new(r"https?://([^\s/?#]+)[^)\s]*").expect("url regex"));
     let cleaned = re.replace_all(err, "host=$1").to_string();
-    cleaned.chars().take(160).collect()
+    cleaned.chars().take(400).collect()
 }
 
 /// Collects every encrypted stream of a patched playinfo answer, paired with

@@ -490,6 +490,48 @@ async fn probe_cdn_ladder(raw_url: &str) {
             }
         }
     }
+    probe_cdn_ladder_three_part(raw_url).await;
+}
+
+/// 真机拿到的主机名是三段的：版本号 + 集群标记 + 业务族
+/// （`v95-ynkmtc-novelapp.fqnovelvod.com`）。这里用同一条路径造一个这样
+/// 的地址，再走一遍阶梯：只要阶梯里有一个主机能服务这条路径，真机就能
+/// 出声 —— 这正是上一版栽跟头的地方（族被解析错了，一个能用的主机都没
+/// 生成出来）。
+async fn probe_cdn_ladder_three_part(raw_url: &str) {
+    let Some((_, rest)) = raw_url.split_once("://") else {
+        return;
+    };
+    let Some((host, path)) = rest.split_once('/') else {
+        return;
+    };
+    let family = host
+        .split('.')
+        .next()
+        .unwrap_or(host)
+        .rsplit('-')
+        .next()
+        .unwrap_or("novelapp");
+    let synthetic = format!("https://v95-ynkmtc-{family}.fqnovelvod.com/{path}");
+    println!("\n[cdn3] ladder of a three-part host");
+    for candidate in fqapi_core::endpoints::video::cdn_host_candidates(&synthetic) {
+        let host = candidate
+            .split("://")
+            .nth(1)
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("?")
+            .to_string();
+        match fetch_range(&candidate, 1023).await {
+            Ok((status, bytes)) => {
+                println!("[cdn3] {host} -> status={status} bytes={}", bytes.len());
+            }
+            Err(err) => {
+                println!("[cdn3] {host} -> failed: {err}");
+            }
+        }
+    }
 }
 
 /// 同一个音色连续取若干次，统计上游回空 body 的比例。

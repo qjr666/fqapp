@@ -1384,7 +1384,14 @@ fn describe_transport_error(err: &reqwest::Error) -> String {
 }
 
 /// How long a fallback CDN host may spend proving it serves the path.
-const CDN_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const CDN_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How many addresses one download may try.
+///
+/// The ladder is ordered by how likely a host is to serve the path, so the
+/// first few entries are the ones worth the budget. The tail is a long shot:
+/// stopping there keeps a chapter's download inside its deadline.
+const CDN_LADDER_LIMIT: usize = 20;
 
 /// The host of an address, without its path or query.
 ///
@@ -1396,6 +1403,16 @@ fn host_of(url: &str) -> String {
         .ok()
         .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
         .unwrap_or_else(|| "?".to_string())
+}
+
+/// Adds one host to the ladder, keeping the order and dropping repeats.
+fn push_cdn_host(hosts: &mut Vec<String>, candidate: String) {
+    if candidate.is_empty() || candidate.contains("--") {
+        return;
+    }
+    if !hosts.contains(&candidate) {
+        hosts.push(candidate);
+    }
 }
 
 /// The addresses one media path may be fetched from, in the order they should
@@ -1433,30 +1450,53 @@ pub fn cdn_host_candidates(url: &str) -> Vec<String> {
         .query()
         .map(|value| format!("?{value}"))
         .unwrap_or_default();
-    // `v11-novelapp.fqnovel.com` -> version `v11`, family `novelapp`.
+    // 上游给的域名有三段：`v95-ynkmtc-novelapp.fqnovelvod.com` —— 版本号、
+    // 一段集群标记、业务族。只按第一个连字符切会把集群标记粘进业务族，
+    // 于是「同一族的其它代」一个都生成不出来：真机拿到的那条真人讲书
+    // 音频就是这种三段域名，结果连早已验证可用的 `v5-novelapp` 都没试到。
     let prefix = match host.split_once('.') {
         Some((prefix, _domain)) => prefix.to_string(),
         None => host.clone(),
     };
-    let (version, family) = match prefix.split_once('-') {
-        Some((version, family)) => (version.to_string(), family.to_string()),
-        None => (String::new(), prefix.clone()),
+    let segments: Vec<&str> = prefix.split('-').filter(|part| !part.is_empty()).collect();
+    let version = segments.first().copied().unwrap_or("");
+    let family = if segments.len() >= 2 {
+        segments[segments.len() - 1]
+    } else {
+        prefix.as_str()
+    };
+    let cluster = if segments.len() >= 3 {
+        segments[1..segments.len() - 1].join("-")
+    } else {
+        String::new()
     };
 
     let mut hosts: Vec<String> = Vec::new();
-    if !version.is_empty() && !family.is_empty() {
-        // 先保留上游给的版本号，只把域名换成能解析的那个。
-        hosts.push(format!("{version}-{family}.fqnovelvod.com"));
+    // 上游给的那个主机名本身排在最前：它知道这条路径。
+    push_cdn_host(&mut hosts, host.clone());
+    if !version.is_empty() {
+        // 同代同族、只把域名换成能解析的那个。
+        push_cdn_host(&mut hosts, format!("{version}-{family}.fqnovelvod.com"));
     }
-    for candidate_version in ["v3", "v5"] {
-        if !family.is_empty() {
-            hosts.push(format!("{candidate_version}-{family}.fqnovelvod.com"));
+    // 同一业务族的其它代。`v5-novelapp` 是唯一被线上探针确认能服务同一条
+    // 路径的主机，所以它排在最前。
+    for candidate_version in ["v5", "v3", "v11", "v26"] {
+        push_cdn_host(&mut hosts, format!("{candidate_version}-{family}.fqnovelvod.com"));
+    }
+    if !cluster.is_empty() {
+        // 同一族、同一集群的其它代。
+        for candidate_version in ["v5", "v3"] {
+            push_cdn_host(
+                &mut hosts,
+                format!("{candidate_version}-{cluster}-{family}.fqnovelvod.com"),
+            );
         }
     }
-    hosts.push("v3-dy-o.zjcdn.com".to_string());
-    // 已确认能匿名服务同一路径的两个 host，作为跨族的通用兜底。
-    hosts.push("v3-fq-tts.fqnovelvod.com".to_string());
-    hosts.push("v3-novelapp.fqnovelvod.com".to_string());
+    // 跨族的通用兜底。
+    push_cdn_host(&mut hosts, "v3-novelapp.fqnovelvod.com".to_string());
+    push_cdn_host(&mut hosts, "v3-fq-tts.fqnovelvod.com".to_string());
+    push_cdn_host(&mut hosts, "v3-dy-o.zjcdn.com".to_string());
+    push_cdn_host(&mut hosts, "v26-reading-video.fqnovelvod.com".to_string());
 
     for host in hosts {
         for candidate in [
@@ -1469,6 +1509,51 @@ pub fn cdn_host_candidates(url: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// A short reason for a failed attempt, safe to show on a phone screen.
+///
+/// Only the host and the kind of failure survive: the path and the query of
+/// a media address are the credential that proves the request is authorised.
+fn short_reason(err: &str) -> String {
+    if let Some(pos) = err.find("HTTP ") {
+        let tail = &err[pos..];
+        let end = tail
+            .find(|c: char| c == ' ' || c == ')' || c == '|')
+            .unwrap_or(tail.len());
+        return tail[..end].to_string();
+    }
+    if err.contains("timeout") {
+        return "timeout".to_string();
+    }
+    if err.contains("refused") || err.contains("Refused") {
+        return "refused".to_string();
+    }
+    if err.contains("dns") || err.contains("resolve") {
+        return "no-dns".to_string();
+    }
+    if err.contains("tcp connect error") {
+        return "connect-error".to_string();
+    }
+    "error".to_string()
+}
+
+/// Is this failure about the network rather than about the address?
+///
+/// A refused connection, a name that does not resolve and a timeout describe
+/// the route to the host, not the host itself. The same host with another
+/// request flavour will fail the same way, so the ladder moves on.
+fn is_transport_failure(reason: &str) -> bool {
+    matches!(reason, "timeout" | "refused" | "no-dns" | "connect-error")
+}
+
+/// Is this failure the host's own final answer?
+///
+/// An HTTP status means the host answered: it either does not serve this
+/// path or rejects this request. Retrying the same address with another
+/// flavour buys nothing, so the ladder moves on to the next host.
+fn is_status_failure(reason: &str) -> bool {
+    reason.starts_with("HTTP 4") || reason.starts_with("HTTP 5")
 }
 
 /// Asks a candidate host for the first kilobyte of the media.
@@ -1544,6 +1629,13 @@ async fn stream_download_to_file_with_cap(
             // second attempt happened to say, which by then is usually
             // "connection refused" because the server closed its socket.
             if is_definitive_failure(&err) {
+                return Err(err);
+            }
+            // 主机自己给的答复（403/404 之类）换了连法也一样：直接换主机，
+            // 别把整章的时间花在同一个地址上。连接层面的问题不在这里
+            // 判：有的 CDN 只有在 HTTP/1.1 或 IPv4 下才认，下面两次重连
+            // 正是为它准备的。
+            if is_status_failure(&short_reason(&err)) {
                 return Err(err);
             }
             // The connection died before any byte arrived. Some CDNs only
@@ -1767,20 +1859,34 @@ pub(crate) async fn download_and_save_with_timeout(
             .map(|candidate| ctx.up.effective_url(&candidate))
             .collect();
         let mut last_err = String::from("no CDN host attempted");
-        let mut tried: Vec<String> = Vec::new();
+        // (主机, 失败原因)：主机名可以上屏，路径与签名不行。
+        let mut tried: Vec<(String, String)> = Vec::new();
         let mut downloaded = false;
-        for (index, candidate) in candidates.iter().enumerate() {
+        // 连都连不上的主机：它的另一个变体（去掉签名）也一样连不上。
+        let mut dead_host: Option<String> = None;
+        for (index, candidate) in candidates.iter().take(CDN_LADDER_LIMIT).enumerate() {
+            let host = host_of(candidate);
+            if dead_host.as_deref() == Some(host.as_str()) {
+                continue;
+            }
             if index > 0 {
                 // 备用主机只是推断出来的：先花一小段预算确认它真的服务这个
                 // 路径，别让一个死域名把整章的下载时间吃掉。
-                if let Err(err) = probe_media_host(candidate, CDN_PROBE_TIMEOUT).await {
-                    log::warn!(
-                        "download: fallback host {} does not serve the path: {}",
-                        host_of(candidate),
-                        err
-                    );
-                    tried.push(host_of(candidate));
-                    continue;
+                match probe_media_host(candidate, CDN_PROBE_TIMEOUT).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let reason = short_reason(&err);
+                        log::warn!(
+                            "download: host {} does not serve the path: {}",
+                            host,
+                            reason
+                        );
+                        if is_transport_failure(&reason) {
+                            dead_host = Some(host.clone());
+                        }
+                        tried.push((host.clone(), reason));
+                        continue;
+                    }
                 }
             }
             let _ = tokio::fs::remove_file(&part_path).await;
@@ -1790,32 +1896,38 @@ pub(crate) async fn download_and_save_with_timeout(
                     break;
                 }
                 Err(err) => {
+                    let reason = short_reason(&err);
                     log::warn!(
                         "download: candidate {}/{} ({}) failed: {}",
                         index + 1,
                         candidates.len(),
-                        host_of(candidate),
-                        err
+                        host,
+                        reason
                     );
                     last_err = err;
-                    tried.push(host_of(candidate));
+                    if is_transport_failure(&reason) {
+                        dead_host = Some(host.clone());
+                    }
+                    tried.push((host.clone(), reason));
                 }
             }
         }
         if !downloaded {
             let _ = tokio::fs::remove_file(&part_path).await;
             // 只留主机名，且只留前几个：完整名单太长，屏幕上的提示会被
-            // 截断，反而看不到最关键的那个。
-            let mut listed: Vec<&String> = Vec::new();
-            for host in &tried {
-                if !listed.contains(&host) {
-                    listed.push(host);
+            // 截断，反而看不到最关键的那个。每个主机带上失败原因，一眼
+            // 就能分出「域名连不上」还是「这个主机不服务这条路径」。
+            let mut listed: Vec<String> = Vec::new();
+            for (host, reason) in &tried {
+                let entry = format!("{host}={reason}");
+                if !listed.contains(&entry) {
+                    listed.push(entry);
                 }
             }
-            let shown: Vec<&str> = listed.iter().take(6).map(|host| host.as_str()).collect();
+            let shown: Vec<&str> = listed.iter().take(8).map(|entry| entry.as_str()).collect();
             let mut message = last_err.clone();
             if !shown.is_empty() {
-                message.push_str(&format!(" (tried hosts: {})", shown.join(", ")));
+                message.push_str(&format!(" (tried: {})", shown.join(", ")));
             }
             return Err(message);
         }

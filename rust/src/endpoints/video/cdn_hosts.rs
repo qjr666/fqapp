@@ -231,3 +231,56 @@ fn the_host_of_an_address_keeps_the_credential_out() {
         "v3-fq-tts.fqnovelvod.com"
     );
 }
+
+#[test]
+fn the_cdn_ladder_drops_the_cluster_segment_of_a_three_part_host() {
+    // 真机上拿到的那条真人讲书音频的主机名有三段：版本号、集群标记、
+    // 业务族。只按第一个连字符切会把集群标记粘进业务族，于是「同一族的
+    // 其它代」一个都生成不出来 —— 早已验证可用的 `v5-novelapp` 根本没被
+    // 试过，整条音频就卡在这里。
+    let url = "https://v95-ynkmtc-novelapp.fqnovelvod.com/a/b.mp4?sign=1";
+    let candidates = cdn_host_candidates(url);
+
+    assert_eq!(
+        candidates.first().map(String::as_str),
+        Some(url),
+        "the address the upstream gave must stay first"
+    );
+    for expected in [
+        // 同代同族、只去掉集群标记
+        "https://v95-novelapp.fqnovelvod.com/a/b.mp4",
+        // 线上探针确认能服务同一条路径的那一代
+        "https://v5-novelapp.fqnovelvod.com/a/b.mp4",
+        "https://v3-novelapp.fqnovelvod.com/a/b.mp4",
+        // 同族同集群的其它代
+        "https://v5-ynkmtc-novelapp.fqnovelvod.com/a/b.mp4",
+        // 跨族的兜底
+        "https://v3-dy-o.zjcdn.com/a/b.mp4",
+    ] {
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.starts_with(expected)),
+            "{expected} must be in the ladder: {candidates:?}"
+        );
+    }
+}
+
+#[test]
+fn the_cdn_ladder_tries_the_known_good_generation_before_the_others() {
+    // 主地址连不上时，第一个该试的就是那条已知可用的代：它排在所有推断
+    // 出来的主机之前，免得整章的下载预算耗在猜测上。
+    let candidates = cdn_host_candidates("https://v95-ynkmtc-novelapp.fqnovelvod.com/a/b.mp4");
+    let known_good = candidates
+        .iter()
+        .position(|candidate| candidate.contains("v5-novelapp.fqnovelvod.com"))
+        .expect("the generation that serves these paths must be in the ladder");
+    let cluster_only = candidates
+        .iter()
+        .position(|candidate| candidate.contains("v5-ynkmtc-novelapp.fqnovelvod.com"))
+        .expect("the cluster variant must be in the ladder");
+    assert!(
+        known_good < cluster_only,
+        "the known-good generation must come first: {candidates:?}"
+    );
+}
