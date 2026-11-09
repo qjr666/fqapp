@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+    <!-- 局域网共享：读取当前网络状态，并在 Wi-Fi 变化时重新发现同网段设备 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- 短剧 / 漫剧悬浮窗播放（#24）：切后台时把画面搬进系统悬浮窗，需要用户在系统设置里允许 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>

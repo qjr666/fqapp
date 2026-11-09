@@ -1,6 +1,7 @@
 import 'platform_channel.dart';
 import 'dart:convert';
 
+import 'package:archive/archive.dart';
 import 'package:flutter/services.dart';
 
 import '../models/fanqie_library_capture.dart';
@@ -37,16 +38,57 @@ class FanqieLibraryCaptureService {
     return bytes == null ? null : FanqieLibraryCapture.decode(bytes);
   }
 
-  Future<bool> export(FanqieLibraryCapture capture) async =>
-      await _files.invokeMethod<
-        bool
-      >(capture.parts.isEmpty ? 'saveBackup' : 'exportFanqieCapture', {
-        'name':
-            'fanqie-library-${DateTime.now().millisecondsSinceEpoch}.${capture.parts.isEmpty ? 'json' : 'zip'}',
-        'bytes': capture.encode(),
-        'parts': capture.parts,
+  Future<bool> export(FanqieLibraryCapture capture) async {
+    final name =
+        'fanqie-library-${DateTime.now().millisecondsSinceEpoch}.'
+        '${capture.parts.isEmpty ? 'json' : 'zip'}';
+    try {
+      return await _files.invokeMethod<bool>(
+        capture.parts.isEmpty ? 'saveBackup' : 'exportFanqieCapture',
+        {
+          'name': name,
+          'bytes': capture.encode(),
+          'parts': capture.parts,
+        },
+      ) ??
+          false;
+    } on PlatformException catch (error) {
+      if (error.code != 'BACKUP_ZIP_UNSUPPORTED') rethrow;
+      // 老系统没有系统级 zip 打包（iOS 16 以前）：在这里压好，走同一条保存
+      // 流程，用户看到的还是「选一个保存位置」。
+      final bytes = await _zipInDart(capture);
+      return await _files.invokeMethod<bool>('saveBackup', {
+        'name': name,
+        'bytes': bytes,
       }) ??
-      false;
+          false;
+    }
+  }
+
+  /// Packs the capture and its parts into a zip without asking the platform.
+  ///
+  /// The manifest is stored as `capture.json`; the parts keep their own
+  /// names, which is what the importer reads back.
+  Future<Uint8List> _zipInDart(FanqieLibraryCapture capture) async {
+    final archive = Archive();
+    final manifest = capture.encode();
+    archive.addFile(ArchiveFile('capture.json', manifest.length, manifest));
+    for (final name in capture.parts.toSet()) {
+      final bytes = await _files.invokeMethod<Uint8List>(
+        'readFanqieCapturePart',
+        {'name': name},
+      );
+      if (bytes == null) {
+        throw PlatformException(
+          code: 'CAPTURE_MISSING',
+          message: '原始分卷缺失，未导出',
+        );
+      }
+      archive.addFile(ArchiveFile(name, bytes.length, bytes));
+    }
+    final zipped = ZipEncoder().encode(archive);
+    return Uint8List.fromList(zipped);
+  }
 
   Future<FanqieLibraryCapture> completeMetadata(
     FanqieLibraryCapture capture,

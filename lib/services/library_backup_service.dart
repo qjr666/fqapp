@@ -1,6 +1,7 @@
 import 'platform_channel.dart';
 import 'dart:isolate';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../models/library_backup.dart';
@@ -15,6 +16,47 @@ class LibraryBackupService {
 
   AiBackupRestoreResult? lastAiRestore;
   String? lastAiExportNote;
+
+  /// Whether this build can show a system file picker.
+  ///
+  /// The channel is implemented per platform: Android has a Kotlin plugin,
+  /// desktop has a Dart adapter, iOS has a `UIDocumentPickerViewController`
+  /// bridge. A host without one answers with [MissingPluginException].
+  ///
+  /// The page asks once and disables the entries that cannot work, instead of
+  /// letting the user press a button that can only fail.
+  static bool? _pickerSupported;
+
+  /// The message shown when the host has no file picker at all.
+  static const unsupportedMessage =
+      '当前运行环境没有系统文件选择器，无法导入或导出备份。';
+
+  /// Probes the host once and caches the answer.
+  ///
+  /// Only a positive answer is cached. A host that has no picker keeps being
+  /// asked, so a build that gains the channel later is picked up without a
+  /// restart, and a probe that failed for an unrelated reason is not frozen
+  /// into the session.
+  static Future<bool> pickerSupported() async {
+    if (_pickerSupported == true) return true;
+    var supported = false;
+    try {
+      supported = await _channel.invokeMethod<bool>('hasPicker') ?? false;
+    } on MissingPluginException {
+      supported = false;
+    } on PlatformException {
+      // A handler that exists but failed to answer is not a usable picker.
+      supported = false;
+    }
+    _pickerSupported = supported ? true : null;
+    return supported;
+  }
+
+  /// Forgets the probe result. Only for tests.
+  @visibleForTesting
+  static void resetPickerSupportForTest() {
+    _pickerSupported = null;
+  }
 
   Future<LibraryBackup> capture({
     bool includeAi = true,
@@ -100,6 +142,12 @@ class LibraryBackupService {
   }
 
   Future<bool> export(LibraryBackup backup) async {
+    if (!await pickerSupported()) {
+      throw PlatformException(
+        code: 'BACKUP_UNSUPPORTED',
+        message: unsupportedMessage,
+      );
+    }
     final bytes = await Isolate.run(backup.encode);
     final stamp = backup.createdAt
         .toLocal()
@@ -115,6 +163,12 @@ class LibraryBackupService {
   }
 
   Future<LibraryBackup?> pick() async {
+    if (!await pickerSupported()) {
+      throw PlatformException(
+        code: 'BACKUP_UNSUPPORTED',
+        message: unsupportedMessage,
+      );
+    }
     final bytes = await _channel.invokeMethod<Uint8List>('openBackup');
     return bytes == null
         ? null

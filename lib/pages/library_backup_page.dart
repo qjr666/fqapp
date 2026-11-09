@@ -40,6 +40,24 @@ class _LibraryBackupPageState extends State<LibraryBackupPage> {
   final _previewKey = GlobalKey();
   final _messageKey = GlobalKey();
 
+  /// Whether this build can show a system file picker.
+  ///
+  /// `null` while the probe is still running; the entries stay enabled until
+  /// the answer arrives, so a slow host does not block the page.
+  bool? _pickerSupported;
+
+  @override
+  void initState() {
+    super.initState();
+    _probePicker();
+  }
+
+  Future<void> _probePicker() async {
+    final supported = await LibraryBackupService.pickerSupported();
+    if (!mounted) return;
+    setState(() => _pickerSupported = supported);
+  }
+
   Future<void> _run(
     String label,
     Future<void> Function() action, {
@@ -208,6 +226,10 @@ class _LibraryBackupPageState extends State<LibraryBackupPage> {
     final scheme = Theme.of(context).colorScheme;
     final preview = _preview;
     final enabled = _busy == null;
+    // A host without a system picker cannot import or export anything; the
+    // entries say so instead of failing after the user presses them.
+    final pickerMissing = _pickerSupported == false;
+    final pickerReady = enabled && !pickerMissing;
     final exportedAt = preview?.createdAt.toLocal().toString().split('.').first;
     final muted = TextStyle(
       fontSize: 13,
@@ -243,19 +265,32 @@ class _LibraryBackupPageState extends State<LibraryBackupPage> {
                 children: [
                   GlassTextButton(
                     key: const ValueKey('backup-export'),
-                    onPressed: enabled ? _export : null,
+                    onPressed: pickerReady ? _export : null,
                     child: const AppText('导出备份'),
                   ),
                   GlassTextButton(
                     key: const ValueKey('backup-export-ai'),
-                    onPressed: enabled ? _exportBook : null,
+                    onPressed: pickerReady ? _exportBook : null,
                     child: const AppText('按书导出 AI 资产'),
                   ),
                   GlassTextButton(
                     key: const ValueKey('backup-import'),
-                    onPressed: enabled ? _pick : null,
-                    child: AppText(preview == null ? '从备份文件恢复' : '重新选择其他备份文件'),
+                    onPressed: pickerReady ? _pick : null,
+                    child: AppText(
+                      preview == null ? '从备份文件恢复' : '重新选择其他备份文件',
+                    ),
                   ),
+                  if (pickerMissing) ...[
+                    const SizedBox(height: 12),
+                    AppText(
+                      LibraryBackupService.unsupportedMessage,
+                      style: TextStyle(
+                        fontSize: 12,
+                        height: 1.6,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),

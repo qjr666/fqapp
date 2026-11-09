@@ -45,6 +45,7 @@ import 'about_page.dart';
 import 'api_service_page.dart';
 import 'cached_books_page.dart';
 import 'cached_dramas_page.dart';
+import 'lan_sync_page.dart';
 import 'library_backup_page.dart';
 import 'settings_category_page.dart';
 import 'system_tts_settings_page.dart';
@@ -153,6 +154,15 @@ class SettingsPage extends StatelessWidget {
             onTap: (context, _) => Navigator.push(
               context,
               MaterialPageRoute(builder: (_) => const LibraryBackupPage()),
+            ),
+          ),
+          SettingsItem(
+            icon: CupertinoIcons.wifi,
+            title: '局域网同步',
+            subtitle: '同一 Wi-Fi 下同步阅读进度与记录',
+            onTap: (context, _) => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const LanSyncPage()),
             ),
           ),
           SettingsItem(

@@ -386,6 +386,61 @@ class LibraryStore implements ReaderStore {
     });
   }
 
+  /// LAN sync: apply a merged snapshot with last-write-wins semantics.
+  ///
+  /// [mergeBackup] deliberately fills gaps only. A sync merge has already
+  /// compared timestamps (see `SyncMerger`), so here an existing record is
+  /// replaced when the incoming one is newer; an equal or older record is a
+  /// no-op, which keeps repeated syncs idempotent.
+  Future<({int history, int episodes})> mergeSync({
+    required List<Map<String, dynamic>> history,
+    required Map<String, Map<String, int>> watched,
+  }) {
+    final guard = ReadingDataWriteGuard(this);
+    return _serializeResult(() async {
+      if (!guard.canWriteHistory) throw StateError('历史已清理，请重新同步');
+      var updatedHistory = 0;
+      for (final entry in history) {
+        final kind = entry['kind']?.toString() ?? 'book';
+        final id = (entry['contentId'] ?? entry['id'])?.toString() ?? '';
+        if (id.isEmpty) continue;
+        final scoped = kind == 'audio' || kind == 'manga';
+        final key = scoped ? '$kind:$id' : id;
+        final previous = _historyRecord(_histBox.get(key), id: key);
+        final incomingTime = (entry['time'] as num?)?.toInt() ?? 0;
+        final previousTime =
+            previous == null ? -1 : _historyTime(previous).toInt();
+        if (previousTime >= incomingTime) continue;
+        await _histBox.put(key, {
+          ...entry,
+          'id': key,
+          if (scoped) 'contentId': id,
+        });
+        updatedHistory++;
+      }
+      var updatedEpisodes = 0;
+      for (final entry in watched.entries) {
+        final current = _watchedRecord(_watchedBox.get(entry.key));
+        final next = Map<String, int>.from(current);
+        var changed = 0;
+        for (final episode in entry.value.entries) {
+          final old = next[episode.key];
+          if (old == null || episode.value > old) {
+            next[episode.key] = episode.value;
+            changed++;
+          }
+        }
+        if (changed == 0) continue;
+        await _watchedBox.put(entry.key, next);
+        updatedEpisodes += changed;
+      }
+      await _histBox.flush();
+      await _watchedBox.flush();
+      _localHistoryCount = null;
+      return (history: updatedHistory, episodes: updatedEpisodes);
+    });
+  }
+
   static Map<String, int> _watchedRecord(dynamic raw) {
     if (raw is List) return {for (final id in raw) id.toString(): 0};
     if (raw is! Map) return {};

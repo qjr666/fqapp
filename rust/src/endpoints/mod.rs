@@ -24,6 +24,7 @@ pub mod router;
 pub mod search;
 pub mod session;
 pub mod shuqi;
+pub mod sync;
 pub mod toutiao;
 pub mod util;
 pub mod video;

@@ -463,6 +463,9 @@ class DesktopPlatform with WindowListener {
       RegExp(r'^part-[0-9]+-[a-fA-F0-9-]+\.json$').hasMatch(name);
   Future<dynamic> _backup(String method, Map args) async {
     switch (method) {
+      case 'hasPicker':
+        // 能力探测：桌面端有系统文件选择器。
+        return true;
       case 'saveBackup':
         return await _save(args['name'] as String, args['bytes'] as Uint8List, [
               'json',

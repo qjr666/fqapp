@@ -68,6 +68,11 @@ class LibraryBackupPlugin : FlutterPlugin, ActivityAware,
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        if (call.method == "hasPicker") {
+            // 能力探测：这个平台有系统文件选择器。
+            result.success(true)
+            return
+        }
         if (call.method == "storeFanqieCapture" || call.method == "storeFanqieCapturePart" ||
             call.method == "latestFanqieCapture" || call.method == "readFanqieCapturePart") {
             captureFile(call, result)

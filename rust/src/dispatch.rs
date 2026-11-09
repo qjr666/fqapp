@@ -161,6 +161,9 @@ pub const ACCOUNT_REQUEST_BODY_LIMIT: usize = 16 * 1024;
 pub fn request_body_limit(path: &str) -> Option<usize> {
     match path {
         ACCOUNT_HISTORY_PATH | ACCOUNT_LIBRARY_PATH => Some(ACCOUNT_REQUEST_BODY_LIMIT),
+        "/api/v1/sync/local" | "/api/v1/sync/snapshot" => {
+            Some(crate::endpoints::sync::SYNC_REQUEST_BODY_LIMIT)
+        }
         _ => None,
     }
 }
@@ -173,6 +176,9 @@ pub fn request_body_limit(path: &str) -> Option<usize> {
 /// contract test; the list lives apart from router.rs's route table on
 /// purpose — see
 /// .agents/notes/implemented/bug-fix/2026-09-28-loopback-write-methods.md.
+/// The LAN sync routes are not in this list: they are guarded by path prefix
+/// in `requires_capability` (their GETs are private too) and check their own
+/// methods in `endpoints::sync::handle`.
 const DEVICE_BOUND_WRITE_APIS: &[&str] = &[
     "playlet_comment_add",
     "playlet_comment_digg",
@@ -187,6 +193,12 @@ const DEVICE_BOUND_WRITE_APIS: &[&str] = &[
 /// device identity, and a sibling app on the same phone must not be able to
 /// post comments or danmaku on the user's behalf.
 pub fn requires_capability(path: &str) -> bool {
+    // Sync carries reading history in both directions, and its GET is not a
+    // public content read: in Lan mode every route under the prefix needs the
+    // capability, not just the writes.
+    if path.starts_with(crate::endpoints::sync::SYNC_PATH_PREFIX) {
+        return true;
+    }
     let params = Params::parse("");
     match router::match_rest_path(path, &params) {
         Some(m) => DEVICE_BOUND_WRITE_APIS.contains(&m.api),
@@ -205,6 +217,16 @@ pub async fn dispatch(server: &Server, req: &Request) -> Response {
     }
     if path == ACCOUNT_LIBRARY_PATH {
         return crate::endpoints::account_library::handle(ctx, req).await;
+    }
+
+    // LAN sync staging needs the method and the body, which the name-based
+    // `Handler` signature does not carry. Its file lives next to `src/`, never
+    // inside it: everything under `src/` is served by `/src/*`.
+    if path.starts_with(crate::endpoints::sync::SYNC_PATH_PREFIX) {
+        let runtime_dir = Path::new(&ctx.src_dir)
+            .parent()
+            .unwrap_or_else(|| Path::new(&ctx.src_dir));
+        return crate::endpoints::sync::handle(req, runtime_dir).await;
     }
 
     if path == "/health" {

@@ -35,6 +35,8 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>用于在同一 Wi-Fi 下访问本机的阅读服务，以及把阅读进度同步到你的另一台设备。</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

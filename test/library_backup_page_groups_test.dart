@@ -12,8 +12,10 @@ import 'package:fqapp/pages/library_backup_page.dart';
 import 'package:fqapp/services/app_theme.dart';
 import 'package:fqapp/services/encrypted_hive.dart';
 import 'package:fqapp/services/library_store.dart';
+import 'package:fqapp/services/library_backup_service.dart';
 import 'package:fqapp/services/shelf_group_store.dart';
 import 'package:fqapp/services/shelf_store.dart';
+import 'package:fqapp/widgets/wenku/wenku_ui.dart';
 
 /// 备份页的分组文案：预览计数、恢复完成文案、帮助文案与分组不可用提示。
 ///
@@ -28,6 +30,7 @@ void main() {
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
+    LibraryBackupService.resetPickerSupportForTest();
     directory = await Directory.systemTemp.createTemp('fqapp-backup-page-');
     Hive.init(directory.path);
     await library.init();
@@ -62,6 +65,8 @@ void main() {
     final messenger = tester.binding.defaultBinaryMessenger;
     messenger.setMockMethodCallHandler(channel, (call) async {
       switch (call.method) {
+        case 'hasPicker':
+          return true;
         case 'openBackup':
           return open;
         case 'saveBackup':
@@ -147,6 +152,30 @@ void main() {
     );
 
     expect(find.textContaining('本次备份不含书架分组'), findsOneWidget);
+  });
+
+  testWidgets('a host without a file picker disables the entries', (
+    tester,
+  ) async {
+    // A host that answers "no picker" must not offer buttons that can only
+    // fail: the page explains instead of erroring after the press.
+    final messenger = tester.binding.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'hasPicker') return false;
+      return null;
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+    await pumpPage(tester);
+
+    expect(find.text(LibraryBackupService.unsupportedMessage), findsOneWidget);
+    for (final key in const [
+      ValueKey('backup-export'),
+      ValueKey('backup-export-ai'),
+      ValueKey('backup-import'),
+    ]) {
+      final button = tester.widget<GlassTextButton>(find.byKey(key));
+      expect(button.onPressed, isNull, reason: '$key should be disabled');
+    }
   });
 }
 
