@@ -76,6 +76,13 @@ if [ "${FQAPP_LIVE_PROBE:-1}" = "1" ]; then
   ( cd "$APP_DIR" && cargo test --locked --manifest-path "$MANIFEST" \
       --test audio_live_probe -- --ignored --nocapture ) \
     || echo "    (探针失败，不影响出包)"
+  # 真机报「这个声音需要解码 / 音频加载失败」，答不出失败发生在下载、缓存
+  # 还是按 Range 解密。这条探针把 iOS 走的那条路（mode=plain：核心缓存整章
+  # 再按 Range 解密）完整跑一遍，并把核心的真实回答原样打出来。
+  echo "==> live upstream audio cache probe"
+  ( cd "$APP_DIR" && cargo test --locked --manifest-path "$MANIFEST" \
+      --test audio_cache_probe -- --ignored --nocapture ) \
+    || echo "    (缓存探针失败，不影响出包)"
 fi
 
 if [ "$SIMULATOR" -eq 1 ]; then
