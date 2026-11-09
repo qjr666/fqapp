@@ -454,10 +454,24 @@ async fn probe_flakiness(srv: &Arc<Server>, book_id: &str, chapter_id: &str, ton
     println!("[flakiness] ok={ok} empty_body={empty}");
 }
 
+/// 一本候选书，以及它身上两种听法的入口。
+struct Candidate {
+    /// 书号本身。
+    id: String,
+    /// 智能朗读的音色 id（`tts_tones`）。
+    tts_tones: Vec<String>,
+    /// 真人讲书主播的 abook_id（`audio_tones`）。
+    narrators: Vec<String>,
+    /// 智能朗读实际要用的原著书号（TTS 走原著的章节 id）。
+    related_novel: Option<String>,
+}
+
 /// 找出真机上那本书的「智能朗读」音色与「真人讲书」主播。
-async fn resolve_target(
-    srv: &Arc<Server>,
-) -> Option<(String, Vec<String>, Vec<String>, Option<String>)> {
+///
+/// 返回**全部**候选：搜索会命中好几本同名的书，其中只有一部分带
+/// `tts_tones`、只有一部分带 `audio_tones`。早先的版本命中第一本就返回，
+/// 于是「智能朗读」那一支经常一次都没跑过——书找到了，音色却是空的。
+async fn resolve_candidates(srv: &Arc<Server>) -> Vec<Candidate> {
     let search = srv.handler("search")?;
     let tones = srv.handler("tones")?;
     let directory = srv.handler("directory")?;
@@ -472,9 +486,10 @@ async fn resolve_target(
         Err(err) => println!("search failed: {err:?}"),
     }
     if ids.is_empty() {
-        return None;
+        return Vec::new();
     }
 
+    let mut out = Vec::new();
     for id in ids.iter().take(8) {
         let params = Params::from_pairs(vec![("book_id".to_string(), id.clone())]);
         let detail = match tones(&srv.ctx, &params).await {
@@ -503,30 +518,48 @@ async fn resolve_target(
         if tts.is_empty() && narrators.is_empty() {
             continue;
         }
+        // 章节是否能取到决定这本书能不能被探针真的跑起来，顺手记下来。
         let mut chapters: Vec<String> = Vec::new();
         if let Ok(value) = directory(&srv.ctx, &params).await {
             collect_strings(&value, ITEM_KEYS, &mut chapters);
         }
         if chapters.is_empty() {
             println!("book {id} has no chapter id");
-            continue;
         }
-        return Some((id.clone(), tts, narrators, novel));
+        out.push(Candidate {
+            id: id.clone(),
+            tts_tones: tts,
+            narrators,
+            related_novel: novel,
+        });
     }
-    None
+    out
 }
 
 /// 取一本书的第一章 id。
+///
+/// 三条路都要试：真人讲书那本走音频详情，智能朗读关联的原著走目录，而
+/// 目录又有「阅读目录」和「小说目录」两种上游。
 async fn first_chapter(srv: &Arc<Server>, book_id: &str) -> Option<String> {
     let detail = srv.handler("audio_book_detail")?;
     let directory = srv.handler("directory")?;
-    let params = Params::from_pairs(vec![("book_id".to_string(), book_id.to_string())]);
+
     let mut items: Vec<String> = Vec::new();
+    let params = Params::from_pairs(vec![("book_id".to_string(), book_id.to_string())]);
     if let Ok(value) = detail(&srv.ctx, &params).await {
         collect_strings(&value, ITEM_KEYS, &mut items);
     }
     if items.is_empty() {
         if let Ok(value) = directory(&srv.ctx, &params).await {
+            collect_strings(&value, ITEM_KEYS, &mut items);
+        }
+    }
+    if items.is_empty() {
+        let novel = Params::from_pairs(vec![
+            ("book_id".to_string(), book_id.to_string()),
+            ("api_type".to_string(), "novel".to_string()),
+        ]);
+        if let Ok(value) = directory(&srv.ctx, &novel).await {
             collect_strings(&value, ITEM_KEYS, &mut items);
         }
     }
@@ -603,29 +636,40 @@ async fn live_audio_cache_probe() {
     }
 
     // ---- 目标书：真机上正在听的那本 ----
-    if let Some((book_id, tts_tones, narrators, related_novel)) = resolve_target(&srv).await {
-        // 智能朗读：TTS 走的是**原著**的章节 id，音色取 tts_tones。
-        let tts_book = related_novel.clone().unwrap_or_else(|| book_id.clone());
+    let candidates = resolve_candidates(&srv).await;
+    println!("=== candidates: {}", candidates.len());
+
+    // ---- 智能朗读：TTS 走的是**原著**的章节 id，音色取 tts_tones ----
+    // App 选中智能朗读后会切到关联原著，用原著的章节 id 请求，tone_id 是
+    // tts_tones 里的 id（绝不会是 0——0 属于真人讲书那一支）。
+    for candidate in candidates.iter().filter(|c| !c.tts_tones.is_empty()) {
+        let tts_book = candidate
+            .related_novel
+            .clone()
+            .unwrap_or_else(|| candidate.id.clone());
         let tts_chapter = first_chapter(&srv, &tts_book).await;
         println!("=== 智能朗读 book={tts_book} chapter={tts_chapter:?}");
-        if let Some(chapter_id) = tts_chapter {
-            for tone in tts_tones.iter().take(3) {
-                probe_case(
-                    &srv,
-                    &lb,
-                    &Case {
-                        label: format!("智能朗读 {tts_book} tone {tone}"),
-                        book_id: tts_book.clone(),
-                        chapter_id: chapter_id.clone(),
-                        tone_id: tone.clone(),
-                    },
-                )
-                .await;
-            }
+        let Some(chapter_id) = tts_chapter else {
+            continue;
+        };
+        for tone in candidate.tts_tones.iter().take(3) {
+            probe_case(
+                &srv,
+                &lb,
+                &Case {
+                    label: format!("智能朗读 {tts_book} tone {tone}"),
+                    book_id: tts_book.clone(),
+                    chapter_id: chapter_id.clone(),
+                    tone_id: tone.clone(),
+                },
+            )
+            .await;
         }
+    }
 
-        // 真人讲书：主播那一本的章节 id，音色是 0（App 就是这么问的）。
-        for narrator in narrators.iter().take(2) {
+    // ---- 真人讲书：主播那一本的章节 id，音色是 0（App 就是这么问的）----
+    for candidate in candidates.iter() {
+        for narrator in candidate.narrators.iter().take(2) {
             let abook_chapter = first_chapter(&srv, narrator).await;
             println!("=== 真人讲书 book={narrator} chapter={abook_chapter:?}");
             let Some(chapter_id) = abook_chapter else {
