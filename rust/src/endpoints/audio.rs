@@ -285,9 +285,8 @@ fn cached_audio_payload(chapter_id: &str, served: String, attempts: &[String]) -
 /// query, which carry the signature, are dropped.
 fn sanitize_cache_error(err: &str) -> String {
     static URL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = URL_RE.get_or_init(|| {
-        regex::Regex::new(r"https?://([^\s/?#]+)[^)\s]*").expect("url regex")
-    });
+    let re = URL_RE
+        .get_or_init(|| regex::Regex::new(r"https?://([^\s/?#]+)[^)\s]*").expect("url regex"));
     let cleaned = re.replace_all(err, "host=$1").to_string();
     cleaned.chars().take(160).collect()
 }
@@ -318,9 +317,7 @@ fn encrypted_audio_candidates(payload: &Value) -> AudioScan {
             if let Some(rows) = data.get("video_model_datas").and_then(|v| v.as_array()) {
                 for row in rows {
                     if let Some(raw) = row.get("video_model").and_then(|v| v.as_str()) {
-                        if let Some(model) =
-                            crate::endpoints::video::decode_video_model_str(raw)
-                        {
+                        if let Some(model) = crate::endpoints::video::decode_video_model_str(raw) {
                             models.push(model);
                         }
                     }

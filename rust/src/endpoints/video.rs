@@ -1339,10 +1339,7 @@ fn streaming_client_ipv4() -> Option<&'static reqwest::Client> {
             reqwest::Client::builder()
                 .timeout(CLIENT_DOWNLOAD_TIMEOUT)
                 .http1_only()
-                .local_address(Some(std::net::SocketAddr::from((
-                    [0, 0, 0, 0],
-                    0,
-                ))))
+                .local_address(std::net::IpAddr::from([0, 0, 0, 0]))
                 .build()
                 .ok()
         })
@@ -1445,7 +1442,7 @@ async fn stream_download_to_file_with_cap(
             .await;
             match second {
                 Ok(total) => Ok(total),
-                Err(err) => {
+                Err(_) => {
                     download_once(
                         url,
                         user_agent,
