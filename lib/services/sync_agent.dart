@@ -51,21 +51,16 @@ class SyncAgent {
     Future<LibraryBackup> Function()? capture,
     Future<void> Function(LibraryBackup merged)? applyMerged,
     LanSyncPreferences? preferences,
-    String? localBaseUrl,
-    String? localCapability,
-    String? deviceId,
-    String? deviceName,
-    String? platform,
+    this.localBaseUrlOverride,
+    this.localCapabilityOverride,
+    this.deviceIdOverride,
+    this.deviceNameOverride,
+    this.platformOverride,
   }) : _client = client ?? http.Client(),
        _ownsClient = client == null,
        _capture = capture ?? (() => LibraryBackupService().capture()),
        _applyMerged = applyMerged ?? _defaultApplyMerged,
-       _prefs = preferences ?? LanSyncPreferences.instance,
-       _localBaseUrl = localBaseUrl,
-       _localCapability = localCapability,
-       _deviceId = deviceId,
-       _deviceName = deviceName,
-       _platform = platform;
+       _prefs = preferences ?? LanSyncPreferences.instance;
 
   static const requestTimeout = Duration(seconds: 20);
 
@@ -74,17 +69,20 @@ class SyncAgent {
   final Future<LibraryBackup> Function() _capture;
   final Future<void> Function(LibraryBackup merged) _applyMerged;
   final LanSyncPreferences _prefs;
-  final String? _localBaseUrl;
-  final String? _localCapability;
-  final String? _deviceId;
-  final String? _deviceName;
-  final String? _platform;
+
+  /// Test seams: when null, the running backend's address/capability and the
+  /// persisted device identity are used.
+  final String? localBaseUrlOverride;
+  final String? localCapabilityOverride;
+  final String? deviceIdOverride;
+  final String? deviceNameOverride;
+  final String? platformOverride;
 
   String get localBaseUrl =>
-      _localBaseUrl ?? BackendService.instance.baseUrl;
+      localBaseUrlOverride ?? BackendService.instance.baseUrl;
 
   String get localCapability =>
-      _localCapability ?? BackendService.instance.transport.capability;
+      localCapabilityOverride ?? BackendService.instance.transport.capability;
 
   void close() {
     if (_ownsClient) _client.close();
@@ -104,9 +102,9 @@ class SyncAgent {
     }
     await _prefs.load();
     final device = SyncDevice(
-      id: _deviceId ?? _prefs.deviceId,
-      name: _deviceName ?? _prefs.deviceName,
-      platform: _platform ?? LanSyncPreferences.platformName,
+      id: deviceIdOverride ?? _prefs.deviceId,
+      name: deviceNameOverride ?? _prefs.deviceName,
+      platform: platformOverride ?? LanSyncPreferences.platformName,
     );
     final sentAt = DateTime.now().millisecondsSinceEpoch;
 

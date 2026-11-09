@@ -75,11 +75,11 @@ void main() {
       capture: () async => emptyBackup(),
       applyMerged: (merged) async => applied.add(merged),
       preferences: LanSyncPreferences.instance,
-      localBaseUrl: 'http://127.0.0.1:12345',
-      localCapability: 'local-token',
-      deviceId: 'device-a',
-      deviceName: 'mine',
-      platform: 'android',
+      localBaseUrlOverride: 'http://127.0.0.1:12345',
+      localCapabilityOverride: 'local-token',
+      deviceIdOverride: 'device-a',
+      deviceNameOverride: 'mine',
+      platformOverride: 'android',
     );
     addTearDown(agent.close);
 
@@ -107,8 +107,8 @@ void main() {
       capture: () async => emptyBackup(),
       applyMerged: (_) async {},
       preferences: LanSyncPreferences.instance,
-      localBaseUrl: 'http://127.0.0.1:12345',
-      localCapability: 'local-token',
+      localBaseUrlOverride: 'http://127.0.0.1:12345',
+      localCapabilityOverride: 'local-token',
     );
     addTearDown(agent.close);
 
@@ -131,11 +131,11 @@ void main() {
       capture: () async => emptyBackup(),
       applyMerged: (_) async {},
       preferences: LanSyncPreferences.instance,
-      localBaseUrl: 'http://127.0.0.1:12345',
-      localCapability: 'local-token',
-      deviceId: 'device-a',
-      deviceName: 'mine',
-      platform: 'android',
+      localBaseUrlOverride: 'http://127.0.0.1:12345',
+      localCapabilityOverride: 'local-token',
+      deviceIdOverride: 'device-a',
+      deviceNameOverride: 'mine',
+      platformOverride: 'android',
     );
     addTearDown(agent.close);
 
@@ -180,11 +180,11 @@ void main() {
       capture: () async => emptyBackup(),
       applyMerged: (merged) async => applied.add(merged),
       preferences: LanSyncPreferences.instance,
-      localBaseUrl: 'http://127.0.0.1:12345',
-      localCapability: 'local-token',
-      deviceId: 'device-a',
-      deviceName: 'mine',
-      platform: 'android',
+      localBaseUrlOverride: 'http://127.0.0.1:12345',
+      localCapabilityOverride: 'local-token',
+      deviceIdOverride: 'device-a',
+      deviceNameOverride: 'mine',
+      platformOverride: 'android',
     );
     addTearDown(agent.close);
 

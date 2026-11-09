@@ -19,7 +19,7 @@ LibraryBackup backup({
     'history': history,
     'watched': watched,
     'excludedLocalRecords': 0,
-    if (groups != null) 'groups': groups,
+    'groups': ?groups,
   };
   return LibraryBackup.decode(
     Uint8List.fromList(utf8.encode(jsonEncode(payload))),
