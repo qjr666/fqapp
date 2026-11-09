@@ -1472,8 +1472,13 @@ pub fn cdn_host_candidates(url: &str) -> Vec<String> {
     };
 
     let mut hosts: Vec<String> = Vec::new();
-    // 上游给的那个主机名本身排在最前：它知道这条路径。
-    push_cdn_host(&mut hosts, host.clone());
+    // 上游给的那个主机名本身排在最前：它知道这条路径。带签名的那个地址
+    // 已经是第一项了，这里再放一次是为了留一个「同一个主机、去掉签名」
+    // 的地址 —— 有些代会拒收外来的签名。
+    // `fqnovel.com` 是已确认解析不出来的老域名，别为它再花一次往返。
+    if !host.ends_with(".fqnovel.com") {
+        push_cdn_host(&mut hosts, host.clone());
+    }
     if !version.is_empty() {
         // 同代同族、只把域名换成能解析的那个。
         push_cdn_host(&mut hosts, format!("{version}-{family}.fqnovelvod.com"));
