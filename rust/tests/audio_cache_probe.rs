@@ -336,15 +336,17 @@ async fn probe_case(srv: &Arc<Server>, lb: &Loopback, case: &Case) {
     };
     println!("[direct] streams: {}", urls.len());
     for (url, encrypted) in urls.iter().take(4) {
-        println!(
-            "[direct]   encrypted={encrypted} url={}",
-            sanitize(url)
-        );
+        println!("[direct]   encrypted={encrypted} url={}", sanitize(url));
     }
     // 路径是对象的身份，域名只是它当前被下发到哪个 CDN。打印路径（去掉
     // 签名）才能把「哪个代能服务这条路径」和「哪个域名解析不了」分开。
     if let Some((url, _)) = urls.first() {
-        let path = url.split("://").nth(1).unwrap_or("").split_once('/').map(|(_, rest)| rest);
+        let path = url
+            .split("://")
+            .nth(1)
+            .unwrap_or("")
+            .split_once('/')
+            .map(|(_, rest)| rest);
         if let Some(path) = path {
             let path = path.split('?').next().unwrap_or(path);
             println!("[direct]   path={path}");
@@ -428,10 +430,7 @@ async fn probe_case(srv: &Arc<Server>, lb: &Loopback, case: &Case) {
             return;
         }
     };
-    println!(
-        "[plain] loopback status={status} bytes={}",
-        decrypted.len()
-    );
+    println!("[plain] loopback status={status} bytes={}", decrypted.len());
 
     let Some((raw_url, _)) = urls
         .iter()
@@ -561,7 +560,10 @@ async fn probe_flakiness(srv: &Arc<Server>, book_id: &str, chapter_id: &str, ton
                 if message.starts_with("parse upstream json: EOF") {
                     empty += 1;
                 }
-                println!("[round {round}] failed in {:?}: {message}", started.elapsed());
+                println!(
+                    "[round {round}] failed in {:?}: {message}",
+                    started.elapsed()
+                );
             }
         }
     }
@@ -637,14 +639,25 @@ async fn resolve_candidates(srv: &Arc<Server>) -> Vec<Candidate> {
             .iter()
             .filter(|tone| !offline.contains(*tone) && !narrators.contains(*tone))
             .collect();
-        println!("[tones] offline_tts_tones={:?} selectable={:?}", offline, selectable);
+        println!(
+            "[tones] offline_tts_tones={:?} selectable={:?}",
+            offline, selectable
+        );
         println!(
             "[tones] tts_tones[0] = {}",
-            json_line(data.get("tts_tones").and_then(|v| v.as_array()).and_then(|l| l.first()))
+            json_line(
+                data.get("tts_tones")
+                    .and_then(|v| v.as_array())
+                    .and_then(|l| l.first())
+            )
         );
         println!(
             "[tones] audio_tones[0] = {}",
-            json_line(data.get("audio_tones").and_then(|v| v.as_array()).and_then(|l| l.first()))
+            json_line(
+                data.get("audio_tones")
+                    .and_then(|v| v.as_array())
+                    .and_then(|l| l.first())
+            )
         );
         if tts.is_empty() && narrators.is_empty() {
             continue;
@@ -809,7 +822,11 @@ async fn resolve_audio_book(srv: &Arc<Server>) -> Option<(String, String)> {
         let params = Params::from_pairs(vec![("tab_type".to_string(), tab_type.to_string())]);
         if let Ok(value) = home(&srv.ctx, &params).await {
             let mut found: Vec<String> = Vec::new();
-            collect_strings(&value, &["audio_book_id", "audio_id", "book_id"], &mut found);
+            collect_strings(
+                &value,
+                &["audio_book_id", "audio_id", "book_id"],
+                &mut found,
+            );
             for id in found {
                 if !ids.contains(&id) {
                     ids.push(id);

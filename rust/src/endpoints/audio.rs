@@ -84,9 +84,7 @@ async fn fetch_playinfo_with_retry(
             Ok(value) => return Ok(value),
             Err(err) => {
                 let empty_body = match &err {
-                    ApiError::Internal(message) => {
-                        message.starts_with("parse upstream json: EOF")
-                    }
+                    ApiError::Internal(message) => message.starts_with("parse upstream json: EOF"),
                     _ => false,
                 };
                 if !empty_body || attempt + 1 >= attempts {
@@ -291,14 +289,8 @@ fn handle_chapter_info<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Ap
                 // 轮：这一轮失败就换一台设备再问一次上游，直到拿到一个没
                 // 试过的主机名为止。
                 for round in 0..AUDIO_HOST_ROUNDS {
-                    match cache_audio_chapter(
-                        ctx,
-                        &chapter_id,
-                        &tone_id,
-                        &current,
-                        &mut attempts,
-                    )
-                    .await
+                    match cache_audio_chapter(ctx, &chapter_id, &tone_id, &current, &mut attempts)
+                        .await
                     {
                         Ok(path) => {
                             served = Some(path);

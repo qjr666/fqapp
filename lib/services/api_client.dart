@@ -577,7 +577,8 @@ class ApiClient {
           mode: null,
         );
         if (fallback.keyHex.isNotEmpty) {
-          throw error;
+          // 直连流带密钥：iPhone 解不开，把服务端给出的真实原因抛回去。
+          rethrow;
         }
         return fallback;
       } catch (_) {

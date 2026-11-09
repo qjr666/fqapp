@@ -6,9 +6,7 @@
 //! decoder rejected a perfectly decrypted file). The tests below pin both
 //! behaviours so they cannot silently regress.
 
-use super::{
-    apply_cenc_index, build_cenc_index, cdn_host_candidates, host_of, u32_be,
-};
+use super::{apply_cenc_index, build_cenc_index, cdn_host_candidates, host_of, u32_be};
 
 /// Wraps `payload` in a box of the given type.
 fn box_of(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -172,9 +170,8 @@ fn the_cdn_ladder_swaps_a_dead_host_for_one_that_serves_the_path() {
     assert!(
         candidates
             .iter()
-            .any(|candidate| candidate.starts_with(
-                "https://v3-novelapp.fqnovelvod.com/a/b/video.mp4"
-            )),
+            .any(|candidate| candidate
+                .starts_with("https://v3-novelapp.fqnovelvod.com/a/b/video.mp4")),
         "the family must be retried on the generation that serves it: {candidates:?}"
     );
     assert!(
@@ -184,7 +181,9 @@ fn the_cdn_ladder_swaps_a_dead_host_for_one_that_serves_the_path() {
         "the backup CDN must be in the ladder: {candidates:?}"
     );
     assert!(
-        candidates.iter().any(|candidate| candidate.ends_with("?sign=1")),
+        candidates
+            .iter()
+            .any(|candidate| candidate.ends_with("?sign=1")),
         "the signature must be kept for the hosts that accept it"
     );
     assert!(

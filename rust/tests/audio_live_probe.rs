@@ -327,16 +327,13 @@ async fn live_audio_probe() {
         let params = Params::from_pairs(vec![("tab_type".to_string(), tab_type.to_string())]);
         match home(&srv.ctx, &params).await {
             Ok(value) => {
-                println!("=== homepage tab {tab_type} outline ===\n{}", outline(&value));
+                println!(
+                    "=== homepage tab {tab_type} outline ===\n{}",
+                    outline(&value)
+                );
                 find_all_str_tagged(
                     &value,
-                    &[
-                        "audio_book_id",
-                        "audio_id",
-                        "book_id",
-                        "bookId",
-                        "item_id",
-                    ],
+                    &["audio_book_id", "audio_id", "book_id", "bookId", "item_id"],
                     &mut tagged,
                 );
             }
@@ -365,7 +362,10 @@ async fn live_audio_probe() {
             }
         }
     }
-    println!("=== audio candidates: {audio_candidates}, total candidates: {}", candidates.len());
+    println!(
+        "=== audio candidates: {audio_candidates}, total candidates: {}",
+        candidates.len()
+    );
     if candidates.is_empty() {
         panic!("no book id could be discovered; the upstream search is unreachable");
     }
@@ -379,7 +379,10 @@ async fn live_audio_probe() {
         let mut items: Vec<String> = Vec::new();
         match detail(&srv.ctx, &params).await {
             Ok(value) => {
-                println!("=== audio detail {candidate} outline ===\n{}", outline(&value));
+                println!(
+                    "=== audio detail {candidate} outline ===\n{}",
+                    outline(&value)
+                );
                 find_all_str(&value, ITEM_KEYS, &mut items);
             }
             Err(err) => println!("audio detail {candidate} failed: {err:?}"),
@@ -388,7 +391,10 @@ async fn live_audio_probe() {
             let params = Params::from_pairs(vec![("book_id".to_string(), candidate.clone())]);
             match directory(&srv.ctx, &params).await {
                 Ok(value) => {
-                    println!("=== audio directory {candidate} outline ===\n{}", outline(&value));
+                    println!(
+                        "=== audio directory {candidate} outline ===\n{}",
+                        outline(&value)
+                    );
                     find_all_str(&value, ITEM_KEYS, &mut items);
                 }
                 Err(err) => println!("directory {candidate} failed: {err:?}"),

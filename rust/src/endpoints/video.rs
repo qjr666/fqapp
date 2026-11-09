@@ -1481,7 +1481,10 @@ pub fn cdn_host_candidates(url: &str) -> Vec<String> {
     // 同一业务族的其它代。`v5-novelapp` 是唯一被线上探针确认能服务同一条
     // 路径的主机，所以它排在最前。
     for candidate_version in ["v5", "v3", "v11", "v26"] {
-        push_cdn_host(&mut hosts, format!("{candidate_version}-{family}.fqnovelvod.com"));
+        push_cdn_host(
+            &mut hosts,
+            format!("{candidate_version}-{family}.fqnovelvod.com"),
+        );
     }
     if !cluster.is_empty() {
         // 同一族、同一集群的其它代。
@@ -1890,7 +1893,8 @@ pub(crate) async fn download_and_save_with_timeout(
                 }
             }
             let _ = tokio::fs::remove_file(&part_path).await;
-            match stream_download_to_file(candidate, UA_WINDOWS_BROWSER, &part_path, timeout).await {
+            match stream_download_to_file(candidate, UA_WINDOWS_BROWSER, &part_path, timeout).await
+            {
                 Ok(_) => {
                     downloaded = true;
                     break;
@@ -3168,9 +3172,9 @@ pub fn register(s: &mut Server) {
 }
 
 #[cfg(test)]
-mod cenc_sample_fixture;
-#[cfg(test)]
 mod cdn_hosts;
+#[cfg(test)]
+mod cenc_sample_fixture;
 #[cfg(test)]
 mod spade_vectors;
 #[cfg(test)]
