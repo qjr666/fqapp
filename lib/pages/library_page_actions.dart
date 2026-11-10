@@ -222,7 +222,13 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
     final preferences = BookOpenPreferences.instance;
     await preferences.load();
     if (!mounted) return;
-    if (item.source == ShelfIdentity.fanqie &&
+    // 「书架点书先看详情页」打开时，书架点书不再抢在详情页前面直达阅读器。
+    // 以前只有「书架点书直达阅读器」一条（默认开），于是书架上的小说点开
+    // 直接被顶进阅读器，简介、目录、评分一个都看不到，而推荐页（默认关）
+    // 却能正常进详情页 —— 这正是「书架进不了详情页、推荐页可以」的成因。
+    final detailFirst = preferences.opensDetailFirst(BookOpenEntry.shelf);
+    if (!detailFirst &&
+        item.source == ShelfIdentity.fanqie &&
         (importedResume || preferences.shelfDirectReader.value) &&
         await openRecentBook(
           context,
@@ -243,7 +249,10 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
           builder: (_) => DetailPage(
             item: item,
             readerStore: widget.readerStore,
-            autoOpenReader: true,
+            // 番茄导入的书原来把 autoOpenReader 硬编码成 true，绕过了用户
+            // 的「书架点书直达阅读」设置：现在跟着设置走，要看详情页就能看。
+            autoOpenReader:
+                !detailFirst && preferences.shelfDirectReader.value,
           ),
         ),
       );
@@ -433,7 +442,14 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
 
   void _tapItem(MediaItem item) {
     final entry = _entryForItem(item);
-    if (entry != null) _tap(entry);
+    if (entry != null) {
+      _tap(entry);
+      return;
+    }
+    // 立体书架的封面轮播用 item 反查条目。两边的 contentKey 算法不一样
+    // （书架条目用 seriesId ?? id，历史条目用 contentId ?? id），查不到时
+    // 不能静默丢弃点击 —— 用户点了书却毫无反应。退化成直接打开这本书。
+    unawaited(_open(item));
   }
 
   void _longPressItem(MediaItem item) {

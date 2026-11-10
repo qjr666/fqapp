@@ -18,10 +18,22 @@ void main() {
   });
 
   testWidgets('书架入口与发现入口各读各自的开关', (tester) async {
+    // 「点书先看详情页」默认开着，会盖掉书架那条直达阅读器偏好；这里先
+    // 关掉它，单独验证两条「直达阅读」开关各管各的。
+    await BookOpenPreferences.instance.setOpenDetailFirst(false);
     await BookOpenPreferences.instance.setShelfDirectReader(true);
     await BookOpenPreferences.instance.setDiscoverDirectReader(false);
 
     expect(await _autoOpenReaderOf(tester, BookOpenEntry.shelf), isTrue);
+    expect(await _autoOpenReaderOf(tester, BookOpenEntry.discover), isFalse);
+  });
+
+  testWidgets('「先看详情页」打开时书架入口不再直达阅读器', (tester) async {
+    await BookOpenPreferences.instance.setOpenDetailFirst(true);
+    await BookOpenPreferences.instance.setShelfDirectReader(true);
+
+    expect(await _autoOpenReaderOf(tester, BookOpenEntry.shelf), isFalse);
+    // 发现入口不受「先看详情页」影响。
     expect(await _autoOpenReaderOf(tester, BookOpenEntry.discover), isFalse);
   });
 

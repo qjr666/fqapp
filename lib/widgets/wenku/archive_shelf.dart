@@ -288,9 +288,16 @@ class ArchiveFileCarouselState extends State<ArchiveFileCarousel>
     if ((_pose.focus - index).abs() < .03 &&
         _scroll?.position.isScrollingNotifier.value == false) {
       _open(index);
-    } else {
-      unawaited(_centre(_pose.logicalLane(index)));
+      return;
     }
+    // 点到还没转到眼前的那本：先把它转到眼前，再打开它。原来只居中不打开，
+    // 窄屏上点到旁边那本时用户只看到书脊挪了一下，容易当成「点了没反应」。
+    unawaited(
+      _centre(_pose.logicalLane(index))
+          .then((_) => _open(index))
+          // 居中被打断（用户中途拖动）时照样打开：书已经选中了。
+          .catchError((Object _) => _open(index)),
+    );
   }
 
   Future<void> _centre(int index) async {

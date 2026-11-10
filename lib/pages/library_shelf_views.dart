@@ -56,7 +56,9 @@ mixin _LibraryShelfViews on _LibraryShelfChrome {
       entries: [for (final entry in entries.take(count)) entry.toArchive()],
       onOpen: (entry) => _tapItem(entry.item),
       onLongPress: (entry) => _longPressItem(entry.item),
-      directReading: BookOpenPreferences.instance.shelfDirectReader.value,
+      directReading: BookOpenPreferences.instance.directReaderFor(
+        BookOpenEntry.shelf,
+      ),
       reduceMotion: _reduceMotion,
       animateEntrance: !_carouselEntrancePlayed,
       repeatFill: preferences.repeatFill,

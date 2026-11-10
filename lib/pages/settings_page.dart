@@ -93,6 +93,7 @@ class SettingsPage extends StatelessWidget {
         title: '阅读',
         subtitle: '阅读入口、正文替换、AI 阅读优化',
         items: [
+          _openDetailFirstItem(),
           _shelfDirectReaderItem(),
           _discoverDirectReaderItem(),
           SettingsItem(
@@ -522,6 +523,29 @@ class SettingsPage extends StatelessWidget {
     }
   }
 
+  /// 「书架点书先看详情页」：书架、阅读历史、收藏里点书时先打开详情页。
+  ///
+  /// 默认开。以前书架点书只有「直达阅读器」一条路（默认开），点开任何一本
+  /// 小说都会被抢在详情页前面顶进阅读器，简介、目录、评分一个都看不到；
+  /// 而首页/搜索的发现入口默认进详情页，于是同一个 App 里两处行为相反。
+  /// 详情页上本来就有「继续阅读 · 第N章」按钮，续读并不需要跳过详情页。
+  ///
+  /// 这条开关关掉后，才轮到下面的「书架点书直接进入阅读」生效。
+  SettingsItem _openDetailFirstItem() => SettingsItem(
+    icon: CupertinoIcons.book,
+    title: '书架点书先看详情页',
+    rowBuilder: (context) => ValueListenableBuilder<bool>(
+      valueListenable: BookOpenPreferences.instance.openDetailFirst,
+      builder: (context, value, _) => SettingsToggleRow(
+        icon: CupertinoIcons.book,
+        title: '书架点书先看详情页',
+        description: '在书架、阅读历史、收藏里点书时先打开小说详情页，再从详情页开始阅读',
+        value: value,
+        onChanged: (v) => BookOpenPreferences.instance.setOpenDetailFirst(v),
+      ),
+    ),
+  );
+
   /// 默认关＝现有行为（先进详情页）。听书/短剧与加载失败时仍停留在详情页。
   ///
   /// 书架的「我的书」和发现入口分成两条（issue #103）：书架里的书点开多半是
@@ -534,7 +558,7 @@ class SettingsPage extends StatelessWidget {
       builder: (context, value, _) => SettingsToggleRow(
         icon: CupertinoIcons.book,
         title: '书架点书直接进入阅读',
-        description: '在书架、阅读历史里点书时跳过详情页，接着上次进度读',
+        description: '在书架、阅读历史里点书时跳过详情页，接着上次进度读（需先关闭「书架点书先看详情页」）',
         value: value,
         onChanged: (v) => BookOpenPreferences.instance.setShelfDirectReader(v),
       ),

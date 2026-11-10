@@ -8,9 +8,42 @@ void main() {
 
   final prefs = BookOpenPreferences.instance;
 
-  setUp(() {
+  setUp(() async {
     SharedPreferences.setMockInitialValues({});
     prefs.resetForTest();
+    // 这组用例只关心两条「直达阅读器」偏好本身。「点书先看详情页」默认
+    // 开着，会把书架那条盖掉，所以这里显式关掉它。
+    await prefs.setOpenDetailFirst(false);
+  });
+
+  test('「先看详情页」默认开着，书架入口默认不再直达阅读器', () async {
+    SharedPreferences.setMockInitialValues({});
+    prefs.resetForTest();
+    await prefs.load();
+    expect(prefs.openDetailFirst.value, isTrue);
+    expect(prefs.opensDetailFirst(BookOpenEntry.shelf), isTrue);
+    expect(prefs.directReaderFor(BookOpenEntry.shelf), isFalse);
+    // 发现入口不受它影响。
+    expect(prefs.opensDetailFirst(BookOpenEntry.discover), isFalse);
+    expect(prefs.directReaderFor(BookOpenEntry.discover), isFalse);
+  });
+
+  test('关掉「先看详情页」后书架入口回到直达阅读器', () async {
+    await prefs.setOpenDetailFirst(false);
+    await prefs.setShelfDirectReader(true);
+    prefs.resetForTest();
+    await prefs.load();
+    expect(prefs.opensDetailFirst(BookOpenEntry.shelf), isFalse);
+    expect(prefs.directReaderFor(BookOpenEntry.shelf), isTrue);
+  });
+
+  test('「先看详情页」自己也会持久化', () async {
+    await prefs.setOpenDetailFirst(false);
+    prefs.resetForTest();
+    await prefs.load();
+    expect(prefs.openDetailFirst.value, isFalse);
+    final sp = await SharedPreferences.getInstance();
+    expect(sp.getBool(BookOpenPreferences.detailFirstKey), isFalse);
   });
 
   test('书架默认直达阅读器，发现入口默认先看详情页', () async {

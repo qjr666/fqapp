@@ -834,6 +834,9 @@ void main() {
         });
         ShelfViewStore.instance.resetForTest();
         BookOpenPreferences.instance.resetForTest();
+        // 「点书先看详情页」默认开着，书架点书会先停在详情页。这条用例验的
+        // 是「有缓存就续读，不碰详情页也不探测网络」那条路，所以先关掉它。
+        await BookOpenPreferences.instance.setOpenDetailFirst(false);
         final saved = <String, dynamic>{
           'id': 'recent-book',
           'title': '最近读过的书',
@@ -941,6 +944,7 @@ void main() {
     testWidgets('关闭书架直读时即使有最近章节缓存也先看详情', (tester) async {
       addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
       BookOpenPreferences.instance.resetForTest();
+      await BookOpenPreferences.instance.setOpenDetailFirst(false);
       await BookOpenPreferences.instance.setShelfDirectReader(false);
       await tester.runAsync(
         () => ShelfStore.instance.add(_item('cached', title: '有缓存的书')),
@@ -974,6 +978,9 @@ void main() {
 
   group('书架离线直读', () {
     testWidgets('导入章节的小说开启自动续读，普通书籍仍走原入口', (tester) async {
+      // 导入的书要续读：先把「先看详情页」关掉，才轮得到自动续读这条。
+      BookOpenPreferences.instance.resetForTest();
+      await BookOpenPreferences.instance.setOpenDetailFirst(false);
       await tester.runAsync(() async {
         await ShelfStore.instance.add(_item('101', title: '已导入的小说'));
         await LibraryStore.instance.mergeFanqie([
@@ -1008,7 +1015,7 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
     });
 
-    testWidgets('普通书籍默认直达阅读器，关掉书架开关后停在详情页', (tester) async {
+    testWidgets('普通书籍默认先看详情页，关掉「先看详情页」才直达阅读器', (tester) async {
       await tester.runAsync(() async {
         await ShelfStore.instance.add(_item('plain', title: '普通小说'));
       });
@@ -1038,6 +1045,18 @@ void main() {
         }
       }
 
+      // 默认：书架点书先停在详情页，不会加载完目录就跳进阅读器。
+      await openPlainBook();
+      expect(
+        tester
+            .widget<DetailPage>(find.byType(DetailPage, skipOffstage: false))
+            .autoOpenReader,
+        isFalse,
+      );
+      await tester.pumpWidget(const SizedBox.shrink());
+
+      // 关掉「先看详情页」：回到旧的直达阅读器行为。
+      await BookOpenPreferences.instance.setOpenDetailFirst(false);
       await openPlainBook();
       expect(
         tester
@@ -1047,6 +1066,7 @@ void main() {
       );
       await tester.pumpWidget(const SizedBox.shrink());
 
+      // 再关掉书架直读：又停在详情页。
       await BookOpenPreferences.instance.setShelfDirectReader(false);
       await openPlainBook();
       expect(
@@ -1061,7 +1081,10 @@ void main() {
     testWidgets('冷启动读取书架直读偏好：关闭时宽屏信息栏显示「查看详情」', (tester) async {
       addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
       // 新进程：内存里还是默认 true，磁盘上用户已关掉书架直读。
-      setSingleChapterPrefs({BookOpenPreferences.shelfKey: false});
+      setSingleChapterPrefs({
+        BookOpenPreferences.shelfKey: false,
+        BookOpenPreferences.detailFirstKey: false,
+      });
       ShelfViewStore.instance.resetForTest();
       BookOpenPreferences.instance.resetForTest();
       await tester.runAsync(() async {
@@ -1076,6 +1099,29 @@ void main() {
       expect(find.text('查看详情'), findsOneWidget);
       expect(find.text('继续阅读'), findsNothing);
       expect(find.text('开始阅读'), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('默认「先看详情页」时宽屏信息栏显示「查看详情」', (tester) async {
+      addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+      // 全新安装：没有写过任何偏好，两条开关都是默认值。
+      setSingleChapterPrefs({});
+      ShelfViewStore.instance.resetForTest();
+      BookOpenPreferences.instance.resetForTest();
+      await tester.runAsync(() async {
+        await ShelfStore.instance.add(_item('wide-default', title: '默认的书'));
+      });
+      await tester.binding.setSurfaceSize(const Size(1000, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(_app(cache: MemoryChapterCache()));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const ValueKey('archive-shelf-wide-default')),
+        findsOneWidget,
+      );
+      expect(find.text('查看详情'), findsOneWidget);
+      expect(find.text('继续阅读'), findsNothing);
       expect(tester.takeException(), isNull);
     });
 

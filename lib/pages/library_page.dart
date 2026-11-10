@@ -181,7 +181,9 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
   /// 立体书架宽屏信息栏的按钮文案取决于「书架点书直达阅读器」偏好。
   /// 页面必须在冷启动时加载它并跟随变化，否则用户关掉开关后仍显示
   /// 「继续阅读 / 开始阅读」（design §2.5：传实际值）。
-  late final ValueNotifier<bool> _shelfDirectReader;
+  ///
+  /// 合成「先看详情页」与「直达阅读」两条：后者只有前者关掉时才生效。
+  late final Listenable _shelfDirectReader;
 
   @override
   void initState() {
@@ -197,8 +199,10 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
     unawaited(_classicLayout.load());
     _groupChanges = ShelfGroupStore.instance.listenable
       ..addListener(_storeChanged);
-    _shelfDirectReader = BookOpenPreferences.instance.shelfDirectReader
-      ..addListener(_storeChanged);
+    _shelfDirectReader = Listenable.merge([
+      BookOpenPreferences.instance.shelfDirectReader,
+      BookOpenPreferences.instance.openDetailFirst,
+    ])..addListener(_storeChanged);
     unawaited(BookOpenPreferences.instance.load());
     unawaited(_loadViewPreferences());
     unawaited(_scanCache());

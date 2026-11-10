@@ -614,7 +614,7 @@ void main() {
     expect(opened?.identity, 'book:b');
   });
 
-  testWidgets('非编辑态点按非中心条目先居中而不打开', (tester) async {
+  testWidgets('非编辑态点按非中心条目先居中再打开', (tester) async {
     await _setSurface(tester, const Size(400, 800));
     final entries = [_entry('a'), _entry('b'), _entry('c')];
     ArchiveShelfEntry? opened;
@@ -632,7 +632,9 @@ void main() {
     );
     _tapCover(tester, 1);
     await tester.pump();
-    expect(opened, isNull);
+    // 先把书转到眼前，再打开它：点到旁边那本不该只是挪一下就没反应。
+    await tester.pump();
+    expect(opened?.item.id, 'b');
     final state = tester.state<ArchiveFileCarouselState>(
       find.byType(ArchiveFileCarousel),
     );
