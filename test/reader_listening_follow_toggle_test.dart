@@ -73,11 +73,7 @@ void main() {
     await tester.tapAt(Offset(rect.left + rect.width * .9, rect.center.dy));
     await tester.pump(const Duration(milliseconds: 400));
     await tester.pumpAndSettle();
-    expect(
-      ListeningSession.instance.followArmed,
-      isFalse,
-      reason: '手动翻页要退出跟随',
-    );
+    expect(ListeningSession.instance.followArmed, isFalse, reason: '手动翻页要退出跟随');
 
     // 这正是「开关无效」的现场：会话闩锁是 false，只放开偏好并不会让跟随
     // 回来。开关必须把它重新 arm 起来。
@@ -156,23 +152,16 @@ Future<void> _openMenu(WidgetTester tester) async {
 
 /// 「跟随翻页」那一行里的开关。
 ///
-/// 不能直接取「包含『跟随翻页』的第一个 Row」：面板里外层还有若干 Row，
-/// 先取第一个会拿到整个面板的外壳，里面的开关就变成多个了。这里从最里面
-/// 往外找第一个带开关的行。
+/// 用**文字**锚定那一行，不能按 widget 实例找：拨一次开关就会重建这一行，
+/// 按旧实例匹配的 finder 立刻失效（读状态时直接报 "Bad state: No element"）。
+/// `find.ancestor(...).first` 取的是离文字最近的那一行 —— 正是开关所在行 ——
+/// 而且每次都按当前控件树重新求值，重建后照旧有效（同
+/// `reader_system_bars_test.dart` 里的写法）。
 Finder _followSwitch() {
-  final rows = find
+  final row = find
       .ancestor(of: find.text('跟随翻页'), matching: find.byType(Row))
-      .evaluate()
-      .toList()
-      .reversed;
-  for (final element in rows) {
-    final candidates = find.descendant(
-      of: find.byWidget(element.widget),
-      matching: find.byType(AppGlassSwitch),
-    );
-    if (candidates.evaluate().isNotEmpty) return candidates.first;
-  }
-  return find.byType(AppGlassSwitch);
+      .first;
+  return find.descendant(of: row, matching: find.byType(AppGlassSwitch));
 }
 
 /// 拨动「跟随翻页」开关（前提：「听书」分类已经打开）。
@@ -189,7 +178,7 @@ Future<void> _setFollowSwitch(WidgetTester tester, {required bool on}) async {
     await tester.pumpAndSettle();
   }
   expect(
-    tester.widget<AppGlassSwitch>(toggle).value,
+    tester.widget<AppGlassSwitch>(_followSwitch()).value,
     on,
     reason: '开关本身要显示新的状态',
   );
