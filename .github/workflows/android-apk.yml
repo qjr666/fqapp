@@ -60,7 +60,23 @@ env:
   # this, so a package signed with the wrong key -- or not signed at all --
   # fails here instead of being published. The matching keystore is stored
   # as a repository secret.
-  RELEASE_SIGNER_SHA256: 'e8471cd8a935fd71fd8197355b5558d245449d5bc8294f60f88616f60451c550'
+  #
+  # This is the fingerprint of the project's own release key (the one every
+  # published build has been signed with). Keep it in sync with the keystore
+  # behind secrets.RELEASE_KEYSTORE_BASE64 -- the signing step refuses a
+  # keystore whose certificate does not match, so a wrong key can never ship.
+  RELEASE_SIGNER_SHA256: '39b4a0e9d0a46e1f3225d90c131df0b30d89f28bae5087e6a5a8a3d630dd209d'
+  # Release signing is MANDATORY for every build that can see the secrets:
+  # push, tag, and pull requests opened from a branch of this repository. A
+  # missing secret there is a broken setup, not a fork limitation, so the build
+  # fails loudly instead of shipping an unsigned package that Android refuses
+  # to install.
+  #
+  # Pull requests from a fork are the one exception: GitHub does not expose
+  # repository secrets to them at all. Those builds degrade to an UNSIGNED
+  # package (documented in the artifact report) so a contributor can still run
+  # the workflow.
+  REQUIRE_RELEASE_SIGNING: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
   FQAPP_USE_MAVEN_MIRRORS: 'false'
   # workers.max / CMAKE_BUILD_PARALLEL_LEVEL stay at 2. Raising them to 4 was
   # measured and made things WORSE on the 4-vCPU / 16 GB runner: the release APK
@@ -378,6 +394,11 @@ jobs:
       # without them the build continues and produces an UNSIGNED package. The
       # pin is still enforced whenever a signature exists, so a package can
       # never quietly ship under the public debug key.
+      #
+      # "A fork PR" is the only case where that degradation is allowed: every
+      # other event (push, tag, same-repository PR) REQUIRES a signed package,
+      # because a missing secret there means the release setup is broken and an
+      # unsigned APK is not installable at all.
       - name: Restore the release signing identity
         id: signing
         env:
@@ -391,6 +412,10 @@ jobs:
             [[ -n "${!name}" ]] || missing+=("$name")
           done
           if [ "${#missing[@]}" -gt 0 ]; then
+            if [ "$REQUIRE_RELEASE_SIGNING" = "true" ]; then
+              echo "::error::Missing release signing secrets ($(IFS=,; printf '%s' "${missing[*]}")). This build must produce a SIGNED release APK; see the '安卓 release 签名' section of DEVELOPMENT.md." >&2
+              exit 1
+            fi
             printf '::warning::No release signing secrets (%s); building an UNSIGNED package. It installs for inspection only and cannot be upgraded onto a signed build.\n' \
               "$(IFS=,; printf '%s' "${missing[*]}")"
             printf 'has_release_signing=false\n' >> "$GITHUB_OUTPUT"
