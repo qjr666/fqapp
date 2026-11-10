@@ -21,8 +21,8 @@ import 'support/reader_settings_nav.dart';
 /// - 打开 → 跟随必须**真的启动**（原先只会改一个字段，会话闩锁还是 false，
 ///   页面照旧不跟随，看着就是开关无效）。
 ///
-/// 正文上挂着双击识别器：单击要等双击超时（约 300ms）才生效，所以每次点按
-/// 之后都得显式推进 400ms，`pumpAndSettle` 不会替我们推进这段时间。
+/// 正文上挂着双击识别器：单击要等双击超时才生效，所以每次点按之后都得显式
+/// 推进 400ms，`pumpAndSettle` 不保证替我们走完那段等待。
 void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
@@ -126,21 +126,32 @@ void _startSession() {
 
 /// 打开阅读菜单 → 设置面板 → 「听书」分类。
 ///
-/// 菜单入口可能已经开着（正文中心点按是**切换**），所以先看它能不能被点到，
-/// 点不到才去点正文中心。开一次就够：面板开着的时候再点正文会打在遮罩上。
+/// 入口选坞上的「操作」而不是「外观」：外观进的是 appearance 分区，那个分区
+/// 的分类网格里**没有**「听书」卡片（网格只在 initialSection 不是 appearance
+/// 时才列它）。操作分区里退回网格就能看到「听书」。
 Future<void> _openListeningSettings(WidgetTester tester) async {
-  final entry = find.byKey(const ValueKey('reader-settings'));
+  await _openMenu(tester);
+  final operations = find.byKey(const ValueKey('reader-operations-entry'));
+  expect(operations, findsOneWidget, reason: '阅读坞里应有「操作」入口');
+  await tester.tap(operations);
+  await tester.pumpAndSettle();
+  await backToReaderSettingsCategories(tester);
+  await openReaderSettingsCategory(tester, 'listening');
+}
+
+/// 展开底部阅读坞。
+///
+/// 坞是 `Offstage` 控制的：收起时子树还在树里但不可命中，所以判显隐要用
+/// `hitTestable()`，不能用 `findsOneWidget`。
+Future<void> _openMenu(WidgetTester tester) async {
+  final entry = find.byKey(const ValueKey('reader-operations-entry'));
   for (var attempt = 0; attempt < 3; attempt++) {
     if (entry.hitTestable().evaluate().isNotEmpty) break;
     await tester.tapAt(tester.getRect(_surface).center);
     await tester.pump(const Duration(milliseconds: 400));
     await tester.pumpAndSettle();
   }
-  expect(entry.hitTestable(), findsOneWidget, reason: '阅读菜单里应有设置入口');
-  await tester.ensureVisible(entry.hitTestable());
-  await tester.tap(entry.hitTestable());
-  await tester.pumpAndSettle();
-  await openReaderSettingsCategory(tester, 'listening');
+  expect(entry.hitTestable(), findsOneWidget, reason: '阅读坞应已展开');
 }
 
 /// 「跟随翻页」那一行里的开关。
@@ -185,8 +196,10 @@ Future<void> _setFollowSwitch(WidgetTester tester, {required bool on}) async {
 }
 
 Future<void> _mountReader(WidgetTester tester) async {
-  await tester.binding.setSurfaceSize(const Size(320, 480));
-  addTearDown(() => tester.binding.setSurfaceSize(null));
+  tester.view.physicalSize = const Size(390, 844);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
   await tester.pumpWidget(
     MaterialApp(
       home: ReaderPage(
@@ -234,10 +247,13 @@ class _Device extends ReaderDevice {
     required double brightness,
   }) async => true;
 
-  // 平台通道在测试里没有实现，基类的 close/suspend 会去调通道。
+  // 平台通道在测试里没有实现，基类的这几个方法会去调通道。
   @override
   Future<void> suspend() async {}
 
   @override
   Future<void> close() async {}
+
+  @override
+  Future<ReaderFont?> pickFont() async => null;
 }
