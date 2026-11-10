@@ -128,6 +128,22 @@ void main() {
   );
 
   test(
+    'keep screen on forwards the switch state to the platform bridge',
+    () async {
+      final calls = <MethodCall>[];
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        calls.add(call);
+        return null;
+      });
+      final device = ReaderDevice();
+      await device.keepScreenOn(true);
+      await device.keepScreenOn(false);
+      expect(calls.map((call) => call.method), ['keepScreenOn', 'keepScreenOn']);
+      expect(calls.map((call) => call.arguments['on']), [true, false]);
+    },
+  );
+
+  test(
     'unavailable battery values remain unknown instead of displaying zero',
     () {
       final status = ReaderDeviceStatus.fromMap({

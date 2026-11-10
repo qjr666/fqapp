@@ -490,9 +490,29 @@ final class ReaderDeviceChannel: NSObject, UIDocumentPickerDelegate {
 
   private var channel: FlutterMethodChannel?
   private var pendingResult: FlutterResult?
+  /// 当前是否要求常亮。
+  ///
+  /// iOS 在应用退到后台再回前台时会重置 `isIdleTimerDisabled`，于是开关
+  /// 「看起来是开的、实际不生效」。这里记住最后一次的请求，回前台时重放一次。
+  private var keepScreenOnEnabled = false
+  private var foregroundObserver: NSObjectProtocol?
 
   override init() {
     super.init()
+    foregroundObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.didBecomeActiveNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self, self.keepScreenOnEnabled else { return }
+      UIApplication.shared.isIdleTimerDisabled = true
+    }
+  }
+
+  deinit {
+    if let foregroundObserver {
+      NotificationCenter.default.removeObserver(foregroundObserver)
+    }
   }
 
   func register(messenger: FlutterBinaryMessenger) {
@@ -511,13 +531,36 @@ final class ReaderDeviceChannel: NSObject, UIDocumentPickerDelegate {
     switch call.method {
     case "pickFont":
       pickFont(result)
-    case "start", "setBrightness", "keepScreenOn", "suspend", "stop", "setImmersive":
-      // 阅读器在 iOS 上没有亮度/常亮/沉浸式这些原生能力（`ReaderDevice` 的
+    case "keepScreenOn":
+      // 屏幕常亮：iOS 用 `isIdleTimerDisabled` 关掉系统的自动锁屏。
+      //
+      // 之前这个方法和「亮度」「沉浸式」一起被归到「回中性值」的分支里，
+      // 于是阅读器设置里的「屏幕常亮」开关在 iOS 上点了完全不生效 ——
+      // 开关的偏好存下来了，但原生什么都没做，屏幕照常按系统超时熄灭。
+      //
+      // 与 Android 的 `FLAG_KEEP_SCREEN_ON` 一致，开关是**全局**状态：
+      // 关闭时必须显式复位，否则阅读器退出后屏幕会一直亮着。
+      setKeepScreenOn(call.arguments as? [String: Any])
+      result(nil)
+    case "start", "setBrightness", "suspend", "stop", "setImmersive":
+      // 阅读器在 iOS 上没有亮度/沉浸式这些原生能力（`ReaderDevice` 的
       // 每个方法都自带 MissingPluginException 降级），这里明确回中性值，
       // 让 Dart 侧走同一条降级路径而不是整个方法找不到处理器。
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
+    }
+  }
+
+  /// 打开/关闭「屏幕常亮」。
+  ///
+  /// `isIdleTimerDisabled` 是 UIApplication 的全局开关：置为 true 后系统不再
+  /// 因为空闲而自动锁屏。阅读器退出时 Dart 侧会再调一次 `on: false` 复位。
+  private func setKeepScreenOn(_ arguments: [String: Any]?) {
+    let on = arguments?["on"] as? Bool ?? false
+    keepScreenOnEnabled = on
+    DispatchQueue.main.async {
+      UIApplication.shared.isIdleTimerDisabled = on
     }
   }
 
