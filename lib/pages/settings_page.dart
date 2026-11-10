@@ -650,7 +650,7 @@ class SettingsPage extends StatelessWidget {
           onTap: unknown
               ? null
               : () {
-                  unawaited(_openNotificationSettings());
+                  unawaited(_openNotificationSettings(context));
                 },
         );
       },
@@ -658,18 +658,21 @@ class SettingsPage extends StatelessWidget {
   );
 
   /// 申请通知权限；已经被拒过（系统不会再弹）就直接带去系统设置页。
-  Future<void> _openNotificationSettings() async {
+  ///
+  /// [context] 由调用方传入：这个页面是 StatelessWidget，没有自己的
+  /// BuildContext，而 SnackBar 必须在 await 之前就把 messenger 取出来 ——
+  /// await 之后再用 context 会触发 `use_build_context_synchronously`。
+  Future<void> _openNotificationSettings(BuildContext context) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
     // 申请之前的状态：用来区分「刚被用户拒绝」与「早就是拒绝状态」。
     final before = NotificationPermission.instance.state.value;
     final state = await NotificationPermission.instance.request();
     if (state == NotificationPermissionState.granted) return;
     if (before == NotificationPermissionState.notDetermined) {
       // 刚弹完系统框就被拒：这时把人直接弹到系统设置里既突兀又没意义。
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('已拒绝通知权限，可在系统设置 → 通知里重新开启')),
-        );
-      }
+      messenger?.showSnackBar(
+        const SnackBar(content: Text('已拒绝通知权限，可在系统设置 → 通知里重新开启')),
+      );
       return;
     }
     await NotificationPermission.instance.openSettings();
