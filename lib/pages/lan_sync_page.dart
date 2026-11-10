@@ -36,6 +36,14 @@ class _LanSyncPageState extends State<LanSyncPage> {
   StreamSubscription<List<DiscoveredDevice>>? _discoverySub;
   List<DiscoveredDevice> _discovered = const [];
   bool _discovering = false;
+  /// 发现通道没起来（套接字绑不上）：iOS 上最常见的原因是系统没给
+  /// 「本地网络」权限 —— 广播与连接都会被拦下，发现整条链路都不通。
+  bool _discoveryUnavailable = false;
+
+  /// iOS 特有：本地网络权限被拒时，UDP 广播与 TCP 连接都会被系统拦下，
+  /// 界面上必须说清楚这件事，否则用户只会看到「尚未发现设备」。
+  static bool get _isIOS =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
   List<String> _addresses = const [];
   int _port = 0;
   int _lastSyncAt = 0;
@@ -84,7 +92,7 @@ class _LanSyncPageState extends State<LanSyncPage> {
       if (mounted) setState(() => _discovered = devices);
     });
     if (mounted) setState(() => _discovering = true);
-    await _discovery.start();
+    final started = await _discovery.start();
     if (mounted) setState(() => _discovering = false);
     if (!mounted) return;
     setState(() {
@@ -97,6 +105,7 @@ class _LanSyncPageState extends State<LanSyncPage> {
       _paired = paired;
       _hosts = hosts;
       _pairAddress.text = paired?.address ?? _prefs.peerAddress;
+      _discoveryUnavailable = !started;
     });
   }
 
@@ -389,12 +398,22 @@ class _LanSyncPageState extends State<LanSyncPage> {
                   ],
                 ),
                 if (_discovering) const LinearProgressIndicator(minHeight: 2),
-                if (_discovered.isEmpty)
+                if (_discovered.isEmpty) ...[
                   Padding(
                     padding: const EdgeInsets.symmetric(vertical: 6),
                     child: AppText('尚未发现设备', style: muted),
-                  )
-                else
+                  ),
+                  if (_discoveryUnavailable)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: AppText(
+                        '本机的局域网通道没有启动。'
+                        '${_isIOS ? '请在系统设置 → 什锦铺 → 本地网络 中允许访问，' : ''}'
+                        '并确认对方已开启「局域网共享」。',
+                        style: muted,
+                      ),
+                    ),
+                ] else
                   for (final device in _discovered)
                     InkWell(
                       key: ValueKey('lan-sync-device-${device.id}'),

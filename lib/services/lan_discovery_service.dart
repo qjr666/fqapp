@@ -141,6 +141,21 @@ class LanDiscoveryService {
   Stream<List<DiscoveredDevice>> get devices => _controller.stream;
   List<DiscoveredDevice> get current => List.unmodifiable(_found.values);
 
+  /// 发现通道是否可用：套接字绑上了（或者测试里注入了发送桩）。
+  ///
+  /// 绑不上时（端口被占、没有网络、iOS 未授予「本地网络」权限）发现整条
+  /// 链路都不通，界面上要能说清楚，而不是让用户对着空列表干等。
+  bool get available => sendOverride != null || _socket != null;
+
+  /// 最近一次发送失败的原因，供界面给出可诊断的提示。
+  String? lastSendError;
+
+  /// iOS 上不能向 255.255.255.255 发包：系统直接拒绝这类发送，全局广播
+  /// 在 iPhone 上从来就不通（收不到对方的回包）。定向广播
+  /// （192.168.x.255）才收得到，所以 iOS 上只发定向广播。
+  static bool get _skipsGlobalBroadcast =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+
   int get _httpPort =>
       httpPortOverride ??
       Uri.tryParse(BackendService.instance.baseUrl)?.port ??
@@ -201,7 +216,8 @@ class LanDiscoveryService {
   Future<List<String>> _broadcastAddresses() async {
     final override = broadcastAddressesOverride;
     if (override != null) return override;
-    final result = <String>{'255.255.255.255'};
+    final result = <String>{};
+    if (!_skipsGlobalBroadcast) result.add('255.255.255.255');
     try {
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
@@ -221,6 +237,11 @@ class LanDiscoveryService {
     } catch (_) {
       // Keep the global broadcast at least.
     }
+    if (result.isEmpty) {
+      // 拿不到接口地址时仍然发一次全局广播：在 iOS 上这会触发系统的
+      // 「本地网络」授权弹框 —— 那是发现能不能工作的前提。
+      result.add('255.255.255.255');
+    }
     return result.toList();
   }
 
@@ -230,10 +251,17 @@ class LanDiscoveryService {
       override(bytes, target, port);
       return;
     }
+    final socket = _socket;
+    if (socket == null) {
+      lastSendError = '发现通道未就绪';
+      return;
+    }
     try {
-      _socket?.send(bytes, target, port);
-    } catch (_) {
+      socket.send(bytes, target, port);
+      lastSendError = null;
+    } catch (error) {
       // A broadcast target may be unreachable; other targets still get it.
+      lastSendError = '$error';
     }
   }
 

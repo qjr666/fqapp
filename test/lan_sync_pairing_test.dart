@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/services/lan_sync_pairing.dart';
 import 'package:fqapp/services/lan_sync_preferences.dart';
@@ -206,6 +208,52 @@ void main() {
     await expectLater(
       pairing.pairWithPeer(peerBaseUrl: 'not-a-url', code: '123456'),
       throwsA(isA<SyncException>()),
+    );
+  });
+
+  test('连接超时时给出可诊断的原因，而不是一句干巴巴的异常', () async {
+    final pairing = buildPairing(
+      MockClient((_) async => throw TimeoutException('future not completed')),
+      InMemorySecureKeyStorage(),
+    );
+    addTearDown(pairing.close);
+
+    await expectLater(
+      pairing.pairWithPeer(
+        peerBaseUrl: 'http://192.168.1.9:8080',
+        code: '042317',
+      ),
+      throwsA(
+        isA<SyncException>().having(
+          (e) => e.message,
+          'message',
+          allOf(contains('超时'), contains('局域网共享')),
+        ),
+      ),
+    );
+  });
+
+  test('iOS 上超时文案要点出「本地网络」权限', () async {
+    final pairing = buildPairing(
+      MockClient((_) async => throw TimeoutException('future not completed')),
+      InMemorySecureKeyStorage(),
+    );
+    addTearDown(pairing.close);
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+    await expectLater(
+      pairing.pairWithPeer(
+        peerBaseUrl: 'http://192.168.1.9:8080',
+        code: '042317',
+      ),
+      throwsA(
+        isA<SyncException>().having(
+          (e) => e.message,
+          'message',
+          allOf(contains('本地网络'), contains('局域网共享')),
+        ),
+      ),
     );
   });
 }

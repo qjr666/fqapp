@@ -304,6 +304,11 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
         switch (action) {
           case 'playPause':
             unawaited(toggle());
+          // iOS 的控制中心把「播放」和「暂停」分成两枚按钮，语义不是切换。
+          case 'play':
+            unawaited(resume());
+          case 'pause':
+            unawaited(pause());
           case 'prev':
             unawaited(openChapter(index - 1));
           case 'next':
@@ -512,6 +517,14 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
       unawaited(_fail(StateError('朗读引擎已停止，请重试')));
       return;
     }
+    if (value['type'] == 'cancelled') {
+      // 引擎把队列清空了：AVSpeechSynthesizer 停止时，队列里剩下的句子既不
+      // 读完也不取消，它们的回调永远不来。状态机必须自己重建，否则朗读与
+      // 高亮就此脱节（跟翻再也不动）。这里只重建队列，不动上报状态 ——
+      // 暂停/停止本身已经由调用方上报过了。
+      _resetQueue(_offset);
+      return;
+    }
     if (value['type'] == 'focus_resume') {
       if (!_resumeOnFocusGain) return;
       if (_allowed) {
@@ -546,9 +559,20 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
         _offset = _safeOffset(range.start + start);
         _publish(notification: false);
       case 'done':
-        _queued.remove(id);
+        // 事件里的 id 偶尔会过期（引擎清空队列后回调迟到）：先按事件 id
+        // 推进，对不上再按队列顺序兜底 —— 最早排进去的那句才是刚读完的，
+        // 用对它的高亮区间，推进位置才不会落到别的句子上。
+        var finished = _queued.remove(id);
+        if (finished == null) {
+          final earliest = _earliest();
+          if (earliest != null) {
+            _queued.remove(earliest.key);
+            if (_speakingId == earliest.key) _speakingId = null;
+            finished = earliest.value;
+          }
+        }
         if (_speakingId == id) _speakingId = null;
-        if (range != null) _offset = range.end;
+        if (finished != null) _offset = finished.end;
         // Engines that never call `onRangeStart` still fire `done`, so the
         // highlight is advanced here as well — the next sentence is already
         // playing by the time this lands.

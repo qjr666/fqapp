@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/services/lan_discovery_service.dart';
 import 'package:fqapp/services/lan_sync_preferences.dart';
@@ -172,5 +173,26 @@ void main() {
       expect(message.id, 'device-a');
       expect(entry.port, LanDiscoveryService.defaultPort);
     }
+  });
+
+  test('iOS 上只发定向广播：全局广播在 iPhone 上发不出去', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final sent = <({List<int> bytes, String address, int port})>[];
+    final service = LanDiscoveryService(
+      preferences: LanSyncPreferences.instance,
+      httpPortOverride: 8080,
+      deviceIdOverride: 'device-a',
+      deviceNameOverride: 'mine',
+      platformOverride: 'ios',
+      sendOverride: (bytes, address, port) {
+        sent.add((bytes: bytes, address: address.address, port: port));
+      },
+    );
+    addTearDown(service.dispose);
+
+    await service.probe();
+    expect(sent, isNotEmpty);
+    expect(sent.map((entry) => entry.address), isNot(contains('255.255.255.255')));
   });
 }

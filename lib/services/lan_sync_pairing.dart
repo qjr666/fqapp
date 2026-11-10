@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import 'backend_service.dart';
@@ -262,7 +264,7 @@ class LanSyncPairing {
     try {
       response = await send().timeout(requestTimeout);
     } catch (error) {
-      throw SyncException('无法连接对端，请检查地址、同一 Wi-Fi 与前台状态：$error');
+      throw SyncException(_connectFailure(error));
     }
     final status = response.statusCode;
     if (status >= 200 && status < 300) {
@@ -289,5 +291,28 @@ class LanSyncPairing {
       throw const SyncException('配对码不正确，或对方还没有生成配对码');
     }
     throw SyncException('对端返回 HTTP $status');
+  }
+
+  /// 连不上对端时的原因文案。
+  ///
+  /// iOS 上最容易被漏掉的一条：系统「本地网络」权限没给时，UDP 广播与
+  /// TCP 连接都会被系统拦下 —— 既发现不到对方，手工填地址也连不上，
+  /// 最后只剩一句没有方向的超时。这里把能指方向的话写清楚，其余异常
+  /// 保留原始文本便于排查。
+  static String _connectFailure(Object error) {
+    if (error is TimeoutException) {
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+        return '连接对端超时。请依次确认：'
+            '① 设置 → 什锦铺 → 本地网络，已允许访问；'
+            '② 对方已开启「局域网共享」；'
+            '③ 地址与端口照抄对方页面显示的那一组；'
+            '④ 两台设备连的是同一个 Wi-Fi。'
+            '（$error）';
+      }
+      return '连接对端超时。请确认：对方已开启「局域网共享」、'
+          '地址与端口照抄对方页面显示的那一组、两台设备连同一个 Wi-Fi。'
+          '（$error）';
+    }
+    return '无法连接对端，请检查地址、同一 Wi-Fi 与前台状态：$error';
   }
 }

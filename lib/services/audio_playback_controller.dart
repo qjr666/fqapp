@@ -415,6 +415,12 @@ class _AudioPlaybackController extends ChangeNotifier
     switch (action) {
       case 'playPause':
         unawaited(_togglePlayback());
+      // iOS 的控制中心把「播放」和「暂停」分成两枚按钮，语义不是切换：
+      // 正在播放时按「播放」应该是继续，而不是暂停。
+      case 'play':
+        unawaited(_resumePlayback());
+      case 'pause':
+        unawaited(_pausePlayback());
       case 'prev':
         if (_index > 0) unawaited(_openChapter(_index - 1));
       case 'next':
@@ -1138,16 +1144,19 @@ class _AudioPlaybackController extends ChangeNotifier
   }
 
   Future<void> _togglePlayback() async {
+    if (_wantPlay) {
+      await _pausePlayback();
+      return;
+    }
+    await _resumePlayback();
+  }
+
+  /// 恢复播放：切章后自动续播、控制中心的「播放」按钮都走这里。
+  Future<void> _resumePlayback() async {
     final player = _player;
     if (!_ready || player == null) return;
     final generation = _generation;
-    if (_wantPlay) {
-      _update(() => _wantPlay = false);
-      _listenTime.stop();
-      await _pause(player, generation);
-      _syncForeground();
-      return;
-    }
+    if (_wantPlay) return;
     // A replay seek must remain cancellable by backgrounding or pausing.
     _update(() => _wantPlay = true);
     try {
@@ -1168,6 +1177,18 @@ class _AudioPlaybackController extends ChangeNotifier
     } catch (error) {
       _fail(error, generation);
     }
+  }
+
+  /// 暂停播放：控制中心的「暂停」按钮走这里。
+  Future<void> _pausePlayback() async {
+    final player = _player;
+    if (!_ready || player == null) return;
+    final generation = _generation;
+    if (!_wantPlay) return;
+    _update(() => _wantPlay = false);
+    _listenTime.stop();
+    await _pause(player, generation);
+    _syncForeground();
   }
 
   Future<void> _seekTo(Duration position) async {

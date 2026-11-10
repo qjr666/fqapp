@@ -32,13 +32,35 @@ class IosPlatform {
   IosPlatform._();
   static final instance = IosPlatform._();
 
+  /// iOS 的系统媒体元数据通道：锁屏、控制中心、灵动岛上的播放器卡片。
+  ///
+  /// 与通知权限通道一样走**真实** MethodChannel —— 不能走 [invoke] 本身
+  /// （那会递归回自己），也不能靠 `PlatformChannels.callbacks`：那个方向是
+  /// Dart 主动调原生，这里要接的是原生 → Dart 的回推。
+  static const _nowPlayingChannel = MethodChannel('fqapp/ios_now_playing');
+
   final _events = <String, StreamController<dynamic>>{};
   final _players = <int, _IosPlayer>{};
   final _tts = FlutterTts();
 
+  /// 最近一次下发给系统媒体元数据的内容：朗读进度每次变化都会调过来，
+  /// 内容没变就别再走一次 IPC。
+  Map<String, dynamic>? _nowPlayingPayload;
+
   /// `SystemTtsPlayback` 一次预排两句，而 AVSpeechSynthesizer 会把 utterance
   /// 入队。done / start / range 必须按先进先出还给正确的 id。
+  ///
+  /// AVSpeechSynthesizer 的回调**不带 utterance id**，只有 range 回调带上
+  /// 了这一句的文本（flutter_tts 的 iOS 实现把 `utterance.speechString` 放在
+  /// 第一个参数里）。所以这里同时记下每句的文本：range 事件按文本精确对回
+  /// 它所属的句子，对不上才退回「队首」这种猜测。
+  ///
+  /// 只靠「队首」猜会踩一个坑：句切换的那一瞬间，引擎已经开始念下一句，
+  /// 而上一句的「读完」回调还没到 Dart —— 队首这时仍指上一句，猜错就会让
+  /// 系统朗读侧把 range 当成「不是当前正在读的那句」丢掉，从此每一个 range
+  /// 都被丢弃，高亮与跟翻再也不推进。
   final _utteranceQueue = <String>[];
+  final _utteranceTexts = <String, String>{};
   int _nextId = 1000000;
   bool _initialized = false;
   bool _mediaKitReady = false;
@@ -48,11 +70,22 @@ class IosPlatform {
 
   void _emit(String name, dynamic event) => _events[name]?.add(event);
 
-  void _ttsEvent(String type, {int? rangeStart}) {
+  void _ttsEvent(String type, {int? rangeStart, String? text}) {
+    if (type == 'cancelled') {
+      // 引擎把队列清空了：AVSpeechSynthesizer 停止时，队列里剩下的 utterance
+      // 既不读完也不取消，它们的回调永远不来。Dart 侧必须知道这件事，
+      // 否则朗读状态机与高亮就此脱节。
+      _utteranceQueue.clear();
+      _utteranceTexts.clear();
+      _emit('fqapp/system_tts_events', <String, dynamic>{'type': 'cancelled'});
+      return;
+    }
     if (_utteranceQueue.isEmpty) return;
     final id = type == 'done'
         ? _utteranceQueue.removeAt(0)
-        : _utteranceQueue.first;
+        : _idForEvent(text);
+    if (id == null) return;
+    if (type == 'done') _utteranceTexts.remove(id);
     _emit('fqapp/system_tts_events', <String, dynamic>{
       'type': type,
       'id': id,
@@ -60,11 +93,25 @@ class IosPlatform {
     });
   }
 
+  /// range 事件按句子文本精确对回它的 id；对不上（正文替换改写过文本等）
+  /// 才退回队首。
+  String? _idForEvent(String? text) {
+    if (text != null && text.isNotEmpty) {
+      for (final id in _utteranceQueue) {
+        if (_utteranceTexts[id] == text) return id;
+      }
+    }
+    return _utteranceQueue.first;
+  }
+
   Future<void> initialize() async {
     if (_initialized || !isIOSPlatform) return;
     // 先接管通道：即使 media_kit 的 iOS 原生库没装好，系统朗读仍能用。
     PlatformChannels.invoke = invoke;
     PlatformChannels.events = events;
+
+    // 原生 → Dart 的回推：控制中心 / 灵动岛上的播放、暂停、切章按钮。
+    _nowPlayingChannel.setMethodCallHandler(_handleNowPlayingCall);
 
     // iOS 默认音频会话是 ambient，静音键会直接把朗读静音。必须激活共享
     // 会话、设为 playback，并阻止每句念完自动 deactivate（第二句就哑了）。
@@ -85,13 +132,19 @@ class IosPlatform {
     _tts.setStartHandler(() => _ttsEvent('start'));
     _tts.setCompletionHandler(() => _ttsEvent('done'));
     // willSpeakRangeOfSpeechString：恢复精确到字的高亮（可选增强，缺了
-    // SystemTtsPlayback 会退化为整句高亮）。
-    _tts.setProgressHandler((String _, int start, int _, String _) {
-      _ttsEvent('range', rangeStart: start);
+    // SystemTtsPlayback 会退化为整句高亮）。第一个参数是这一句的**文本**
+    // —— AVSpeechSynthesizer 不回传 utterance id，靠它把 range 精确对回
+    // 正确的句子。
+    _tts.setProgressHandler((String text, int start, int _, String _) {
+      _ttsEvent('range', rangeStart: start, text: text);
     });
+    // 引擎队列被清空（停止朗读）：剩下的句子永远不会再有回调，通知 Dart
+    // 侧把状态机重建一遍。
+    _tts.setCancelHandler(() => _ttsEvent('cancelled'));
     _tts.setErrorHandler((dynamic _) {
       if (_utteranceQueue.isEmpty) return;
       final id = _utteranceQueue.removeAt(0);
+      _utteranceTexts.remove(id);
       _emit('fqapp/system_tts_events', {'type': 'error', 'id': id});
     });
 
@@ -206,6 +259,75 @@ class IosPlatform {
     }
   }
 
+  /// 把系统媒体控制中心的动作转成 `native_player` 的远控契约。
+  ///
+  /// 动作名与 Android 的媒体通知保持一致（`playPause` / `prev` / `next` /
+  /// `stop`）；iOS 额外的 `play` / `pause` 是分开的两枚按钮，语义不是切换，
+  /// 消费方按「恢复播放 / 暂停播放」处理。
+  Future<dynamic> _handleNowPlayingCall(MethodCall call) async {
+    if (call.method != 'onRemoteAction') return null;
+    final raw = call.arguments;
+    final action = raw is Map
+        ? raw['action'] as String?
+        : raw is String
+        ? raw
+        : null;
+    if (action == null || action.isEmpty) return null;
+    await PlatformChannels.notify(
+      'fqapp/native_player',
+      'onNotificationAction',
+      {'action': action},
+    );
+    return null;
+  }
+
+  /// 把当前在读/在听的内容发布成系统媒体元数据。
+  ///
+  /// 参数与 Android 的 `startListenForeground` 完全一致，iOS 这边只透传，
+  /// 由 Swift 侧的 `MPNowPlayingInfoCenter` 消费。
+  Future<void> _updateNowPlaying(Map args) async {
+    final payload = <String, dynamic>{
+      'title': args['title'] as String? ?? '',
+      'episode': args['episode'] as String? ?? '',
+      'coverUrl': args['coverUrl'] as String? ?? '',
+      'playing': args['playing'] == true,
+      'hasPrev': args['hasPrev'] == true,
+      'hasNext': args['hasNext'] == true,
+      'positionMs': (args['positionMs'] as num?)?.toInt() ?? 0,
+      'durationMs': (args['durationMs'] as num?)?.toInt() ?? 0,
+      'speed': (args['speed'] as num?)?.toDouble() ?? 1,
+    };
+    final previous = _nowPlayingPayload;
+    if (previous != null && _sameNowPlaying(previous, payload)) return;
+    _nowPlayingPayload = payload;
+    try {
+      await _nowPlayingChannel.invokeMethod<void>('update', payload);
+    } catch (error) {
+      debugPrint('[ios-now-playing] update failed: $error');
+    }
+  }
+
+  /// 停止播放后清掉系统媒体卡片：留着上一本书的卡片，系统会一直显示
+  /// 「暂停」按钮，用户按下去什么也不会发生。
+  Future<void> _clearNowPlaying() async {
+    if (_nowPlayingPayload == null) return;
+    _nowPlayingPayload = null;
+    try {
+      await _nowPlayingChannel.invokeMethod<void>('clear');
+    } catch (error) {
+      debugPrint('[ios-now-playing] clear failed: $error');
+    }
+  }
+
+  /// Map 的 `==` 是引用相等，比内容要自己逐项比。
+  static bool _sameNowPlaying(Map<String, dynamic> a, Map<String, dynamic> b) {
+    if (a.length != b.length) return false;
+    for (final entry in a.entries) {
+      if (b[entry.key] != entry.value) return false;
+    }
+    return true;
+  }
+
   Future<dynamic> _player(String method, Map args) async {
     switch (method) {
       case 'create':
@@ -239,17 +361,21 @@ class IosPlatform {
         return _notificationPermission('request');
       case 'openNotificationSettings':
         return _notificationPermission('openSettings');
-      // iOS 没有悬浮窗 / SMTC / 常亮原生实现。这些调用都带 catch 或是可选
+      // iOS 没有悬浮窗 / 常亮原生实现。这些调用都带 catch 或是可选
       // 增强，返回中性值即可，不伪装成「成功开启」。
       case 'setKeepScreenOn':
-      case 'startListenForeground':
-      case 'stopListenForeground':
       case 'startFloating':
       case 'showFloating':
       case 'updateFloating':
       case 'stopFloating':
       case 'swapFloatingPlayer':
         return null;
+      // 锁屏 / 控制中心 / 灵动岛上的播放器：iOS 用系统媒体元数据实现，
+      // 之前这里直接返回 null，于是灵动岛和控制中心一个播放器都没有。
+      case 'startListenForeground':
+        return _updateNowPlaying(args);
+      case 'stopListenForeground':
+        return _clearNowPlaying();
       case 'canDrawOverlays':
       case 'requestOverlayPermission':
         return false;
@@ -296,6 +422,7 @@ class IosPlatform {
         // 先清队列再 stop：stop 有可能触发 completion 回调，顺序反了会把
         // 上一句的 done 误发给新一句。
         _utteranceQueue.clear();
+        _utteranceTexts.clear();
         await _tts.stop();
         final engine = args['engine'];
         if (engine is String && engine.startsWith('{')) {
@@ -326,6 +453,7 @@ class IosPlatform {
         }
         final id = args['id'] as String;
         _utteranceQueue.add(id);
+        _utteranceTexts[id] = args['text'] as String;
         final result = await _tts.speak(args['text'] as String);
         if (result == 0) {
           _utteranceQueue.remove(id);
@@ -341,6 +469,7 @@ class IosPlatform {
         // iOS 没有 Android 那套音频焦点机制，pause 与 stop 等价：停引擎但
         // 不动 session，SystemTtsPlayback.resume() 会重新起播同一句。
         _utteranceQueue.clear();
+        _utteranceTexts.clear();
         await _tts.stop();
         return null;
       case 'settings':

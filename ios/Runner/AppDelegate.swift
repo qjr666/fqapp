@@ -1,4 +1,5 @@
 import Flutter
+import MediaPlayer
 import UIKit
 import UniformTypeIdentifiers
 import UserNotifications
@@ -17,6 +18,7 @@ import UserNotifications
   private let libraryBackupChannel = LibraryBackupChannel()
   private let readerDeviceChannel = ReaderDeviceChannel()
   private let notificationPermissionChannel = NotificationPermissionChannel()
+  private let nowPlayingChannel = NowPlayingChannel()
 
   override func application(
     _ application: UIApplication,
@@ -42,6 +44,7 @@ import UserNotifications
     libraryBackupChannel.register(messenger: messenger)
     readerDeviceChannel.register(messenger: messenger)
     notificationPermissionChannel.register(messenger: messenger)
+    nowPlayingChannel.register(messenger: messenger)
   }
 }
 
@@ -744,5 +747,166 @@ final class NotificationPermissionChannel {
     default:
       result(FlutterMethodNotImplemented)
     }
+  }
+}
+
+/// `fqapp/ios_now_playing`：把当前在读/在听的内容发布成系统媒体元数据，
+/// 并把锁屏、控制中心、灵动岛上的播放控制回抛给 Dart。
+///
+/// iOS 没有 Android 那套「通知栏媒体卡片」，但有等价的系统能力：
+/// `MPNowPlayingInfoCenter` 负责锁屏 / 控制中心 / 灵动岛上的播放器卡片，
+/// `MPRemoteCommandCenter` 负责播放、暂停、切章、停止。两边都要求音频会话
+/// 处于 `playback` 类别且 App 正在发声，否则系统一个卡片都不显示。
+///
+/// 元数据字段与 Android 的媒体会话对齐（`ListenKeepAliveService`）：
+/// title = 书名，artist = 章节名，封面图 = 书籍封面。
+final class NowPlayingChannel {
+  private var channel: FlutterMethodChannel?
+  private var artworkTask: URLSessionDataTask?
+  private var artworkURL: String?
+  private var artwork: MPMediaItemArtwork?
+  /// 最近一次下发的元数据：封面下载完成后要拿它整体重发一次。
+  private var info: [String: Any] = [:]
+
+  func register(messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(
+      name: "fqapp/ios_now_playing",
+      binaryMessenger: messenger
+    )
+    self.channel = channel
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self else {
+        result(FlutterError(code: "no_channel", message: "通道已释放", details: nil))
+        return
+      }
+      self.handle(call, result)
+    }
+    configureRemoteCommands()
+  }
+
+  /// 远控按钮。系统控制中心与锁屏上的「播放 / 暂停」是**两个**命令，
+  /// 这里分别回传 `play` / `pause` —— 不能都当成切换：正在播放时点「播放」
+  /// 应该是继续，而不是暂停。Android 那边只有一枚 playPause 按钮，
+  /// Dart 侧按同一套动作名处理两个平台。
+  private func configureRemoteCommands() {
+    let center = MPRemoteCommandCenter.shared()
+    // 引擎可能重建、register 被调用多次：先摘掉本 App 之前的 target。
+    center.playCommand.removeTarget(nil)
+    center.pauseCommand.removeTarget(nil)
+    center.togglePlayPauseCommand.removeTarget(nil)
+    center.nextTrackCommand.removeTarget(nil)
+    center.previousTrackCommand.removeTarget(nil)
+    center.stopCommand.removeTarget(nil)
+
+    center.playCommand.addTarget { [weak self] _ in
+      self?.sendRemoteAction("play")
+      return .success
+    }
+    center.pauseCommand.addTarget { [weak self] _ in
+      self?.sendRemoteAction("pause")
+      return .success
+    }
+    center.togglePlayPauseCommand.addTarget { [weak self] _ in
+      self?.sendRemoteAction("playPause")
+      return .success
+    }
+    center.nextTrackCommand.addTarget { [weak self] _ in
+      self?.sendRemoteAction("next")
+      return .success
+    }
+    center.previousTrackCommand.addTarget { [weak self] _ in
+      self?.sendRemoteAction("prev")
+      return .success
+    }
+    center.stopCommand.addTarget { [weak self] _ in
+      self?.sendRemoteAction("stop")
+      return .success
+    }
+  }
+
+  private func sendRemoteAction(_ action: String) {
+    channel?.invokeMethod("onRemoteAction", arguments: ["action": action])
+  }
+
+  private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+    switch call.method {
+    case "update":
+      let args = call.arguments as? [String: Any] ?? [:]
+      apply(args)
+      result(nil)
+    case "clear":
+      artworkTask?.cancel()
+      artworkTask = nil
+      artworkURL = nil
+      artwork = nil
+      info = [:]
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+      MPNowPlayingInfoCenter.default().playbackState = .stopped
+      result(nil)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  /// 把一次播放状态写成系统媒体元数据。
+  ///
+  /// `positionMs` 与 `durationMs` 必须一起给：系统按这两个值外推进度条，
+  /// 只给一个会让卡片两侧的时间对不上。
+  private func apply(_ args: [String: Any]) {
+    let title = args["title"] as? String ?? ""
+    let episode = args["episode"] as? String ?? ""
+    let playing = args["playing"] as? Bool ?? false
+    let hasPrev = args["hasPrev"] as? Bool ?? true
+    let hasNext = args["hasNext"] as? Bool ?? true
+    let positionMs = args["positionMs"] as? Double ?? 0
+    let durationMs = args["durationMs"] as? Double ?? 0
+    let speed = args["speed"] as? Double ?? 1
+    let coverUrl = args["coverUrl"] as? String ?? ""
+
+    var next: [String: Any] = [:]
+    if !title.isEmpty { next[MPMediaItemPropertyTitle] = title }
+    if !episode.isEmpty {
+      next[MPMediaItemPropertyArtist] = episode
+      next[MPMediaItemPropertyAlbumTitle] = episode
+    }
+    if durationMs > 0 { next[MPMediaItemPropertyPlaybackDuration] = durationMs / 1000 }
+    if positionMs > 0 { next[MPNowPlayingInfoPropertyElapsedPlaybackTime] = positionMs / 1000 }
+    next[MPNowPlayingInfoPropertyPlaybackRate] = playing ? speed : 0
+    next[MPNowPlayingInfoPropertyDefaultPlaybackRate] = speed
+    if let artwork = artwork { next[MPMediaItemPropertyArtwork] = artwork }
+
+    info = next
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = next
+    MPNowPlayingInfoCenter.default().playbackState = playing ? .playing : .paused
+
+    let center = MPRemoteCommandCenter.shared()
+    center.previousTrackCommand.isEnabled = hasPrev
+    center.nextTrackCommand.isEnabled = hasNext
+
+    loadArtwork(coverUrl)
+  }
+
+  /// 封面图：锁屏卡片没有图就只剩一行字，观感差很多。
+  ///
+  /// 下载是异步的，拿到图后要把整份元数据重发一次；同一个 URL 不重复下载。
+  private func loadArtwork(_ urlString: String) {
+    guard !urlString.isEmpty else { return }
+    if urlString == artworkURL { return }
+    artworkTask?.cancel()
+    artworkURL = urlString
+    guard let url = URL(string: urlString) else { return }
+    artworkTask = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+      guard let self, let data, let image = UIImage(data: data) else { return }
+      let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+      DispatchQueue.main.async {
+        // 下载期间可能已经切到别的内容了：只认最后一次请求的 URL。
+        guard self.artworkURL == urlString else { return }
+        self.artworkTask = nil
+        self.artwork = artwork
+        self.info[MPMediaItemPropertyArtwork] = artwork
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = self.info
+      }
+    }
+    artworkTask?.resume()
   }
 }
