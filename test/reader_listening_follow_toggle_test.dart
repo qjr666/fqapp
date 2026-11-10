@@ -77,7 +77,16 @@ void main() {
 
     // 这正是「开关无效」的现场：会话闩锁是 false，只放开偏好并不会让跟随
     // 回来。开关必须把它重新 arm 起来。
+    //
+    // 注意要**先关再开**：「跟随翻页」的偏好默认就是开的，只开不开等于
+    // 什么都没改，开关也就无从触发收口。
     await _openListeningSettings(tester);
+    await _setFollowSwitch(tester, on: false);
+    expect(
+      ListeningSession.instance.followArmed,
+      isFalse,
+      reason: '关掉总闸必须真的停掉跟随',
+    );
     await _setFollowSwitch(tester, on: true);
     expect(
       ListeningSession.instance.followArmed,
