@@ -1117,7 +1117,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(
-        find.byKey(const ValueKey('archive-shelf-wide-default')),
+        find.byKey(const ValueKey('archive-shelf-wide')),
         findsOneWidget,
       );
       expect(find.text('查看详情'), findsOneWidget);
