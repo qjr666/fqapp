@@ -280,7 +280,13 @@ class _ReaderPageState extends State<ReaderPage>
       unawaited(_onAiChanged());
     }
     final playing = session.playing && session.matchesBook(widget.bookId);
-    if (playing && !_listenWasPlaying) {
+    // 先把这一拍的播放态记下来，再做会触发通知的动作。下面
+    // [setFollowArmed] 是**同步** notify：重入进来的那一拍若还拿着旧的
+    // 「没在播」，就会把「用户手动翻页刚关掉的跟随」当成「刚恢复播放」
+    // 又打开，翻页等于没翻。
+    final wasPlaying = _listenWasPlaying;
+    _listenWasPlaying = playing;
+    if (playing && !wasPlaying) {
       // 官方 onPlayResume（AudioSyncReaderController.java:381）恢复播放时
       // 立刻恢复跟随，不受手动翻页那 15 秒闩锁影响。
       _listenFollowPausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
@@ -293,7 +299,6 @@ class _ReaderPageState extends State<ReaderPage>
         ListeningSession.instance.setFollowArmed(true);
       }
     }
-    _listenWasPlaying = playing;
     _followPoll.sync();
     // 会话起停时即使高亮不变，也要重建双击跳读手势。
     final armed = _listenDoubleTapArmed;
@@ -335,6 +340,12 @@ class _ReaderPageState extends State<ReaderPage>
     // 官方默认跟随：起播时（d.java:143-151）页面会自动同步到朗读处。阅读页
     // 可能是在起播之后才打开的，补上这一次。
     ListeningSession.instance.followIfPlaying(widget.bookId);
+    // 阅读页可能是在起播**之后**才打开的：起播那一刻的「恢复播放」本页没
+    // 赶上，_listenWasPlaying 还停在 false。第一次收到会话通知时若把它当成
+    // 「刚恢复播放」，用户手动翻页触发的 setFollowArmed(false) 通知就会把
+    // 跟随又打开 —— 翻页退出跟随就废了。
+    _listenWasPlaying = ListeningSession.instance.playing &&
+        ListeningSession.instance.matchesBook(widget.bookId);
     ListeningSession.instance.addListener(_onListeningTick);
     // 双击跳读的开关只在会话通知里算，而暂停的会话永远不发通知：开书前就
     // 已经暂停（或者从未播过）时手势得先就位。initState 里不能 setState，

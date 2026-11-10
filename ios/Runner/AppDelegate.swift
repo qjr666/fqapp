@@ -528,17 +528,39 @@ final class ReaderDeviceChannel: NSObject, UIDocumentPickerDelegate {
     // 字体在 iOS 上的 UTI 没有单一「字体」类型：TrueType / OpenType / 字体集合
     // 各自一个。把这几类都放进去，用户在「文件」里看到 .ttf/.otf/.ttc 就能选。
     let picker = UIDocumentPickerViewController(
-      forOpeningContentTypes: [
-        UTType.truetypeFont,
-        UTType.opentypeFont,
-        UTType.font,
-      ],
+      forOpeningContentTypes: ReaderDeviceChannel.fontContentTypes,
       asCopy: true
     )
     picker.delegate = self
     picker.allowsMultipleSelection = false
     presenter.present(picker, animated: true)
   }
+
+  /// 可选的字体类型。
+  ///
+  /// `UTType` 没有 `truetypeFont` / `opentypeFont` 这两个静态属性（Xcode 27
+  /// SDK 的公开接口里就不存在），只能按 UTI 标识符或文件扩展名构造。标识符
+  /// 优先、扩展名兜底：系统里 .ttf/.otf/.ttc 各对应一个类型，缺一类就少一类
+  /// 字体可选。
+  private static let fontContentTypes: [UTType] = {
+    var types: [UTType] = []
+    for identifier in [
+      "public.truetype-font",
+      "public.opentype-font",
+      "public.font",
+    ] {
+      if let type = UTType(identifier) { types.append(type) }
+    }
+    if types.isEmpty {
+      for ext in ["ttf", "otf", "ttc"] {
+        if let type = UTType(filenameExtension: ext) { types.append(type) }
+      }
+    }
+    if types.isEmpty {
+      types = [UTType.font]
+    }
+    return types
+  }()
 
   public func documentPicker(
     _ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]

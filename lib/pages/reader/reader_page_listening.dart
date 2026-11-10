@@ -36,7 +36,12 @@ extension _ReaderPageListening on _ReaderPageState {
     // 用户自己翻页 = 不想被拽回去。记下「用户接管过」，闩锁到期后可以自动
     // 恢复跟随；以前只暂停 15 秒，按钮还显示「跟随中」，看着像坏了。
     _listenFollowTakeover = true;
-    ListeningSession.instance.setFollowArmed(false);
+    // 接管前先记下当前播放态。下面的 [setFollowArmed] 会**同步**通知所有
+    // 监听者，阅读页的 tick 就在这条通知里重入一次 —— 它若还以为「刚恢复
+    // 播放」，就会把刚关掉的跟随立刻打开，翻页等于没翻。
+    final session = ListeningSession.instance;
+    _listenWasPlaying = session.playing && session.matchesBook(widget.bookId);
+    session.setFollowArmed(false);
   }
 
   /// 提示一次「正在播放的章节不在本书目录里」。

@@ -180,11 +180,11 @@ void main() {
   ) async {
     final session = _Session();
     await _mount(tester, session);
-    // 官方 `te`「%s后播放下一集」：播完先进倒计时窗口，不再立刻跳章。
+    // 用户要求取消「自动播放下一章的等待时间」：章末直接连播下一章，
+    // 不再插入官方那个可取消的倒计时窗口。
     session.players.first.emitCompleted();
     await _flush(tester);
-    expect(find.byKey(const Key('audio_advance_banner')), findsOneWidget);
-    expect(session.players, hasLength(1));
+    expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
     await tester.pump(const Duration(seconds: 3));
     await _flush(tester);
     expect(session.players, hasLength(2));
@@ -209,24 +209,22 @@ void main() {
     expect(session.players.last.isPlaying, true);
   });
 
-  testWidgets('cancelling the advance countdown stays on the chapter', (
+  testWidgets('the chapter advances immediately without a countdown', (
     tester,
   ) async {
     final session = _Session();
     await _mount(tester, session);
     session.players.first.emitCompleted();
     await _flush(tester);
-    expect(find.byKey(const Key('audio_advance_banner')), findsOneWidget);
-
-    await tester.tap(find.byKey(const Key('audio_advance_cancel')));
-    await _flush(tester);
+    // 等待时间被取消后，既没有倒计时横幅，也没有可以点「取消」的机会 ——
+    // 章末就是直接连播下一章。
     expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
-
-    // 取消之后即使等过倒计时窗口，也不能自己跳章。
-    await tester.pump(const Duration(seconds: 5));
+    expect(find.byKey(const Key('audio_advance_cancel')), findsNothing);
+    await tester.pump(const Duration(seconds: 3));
     await _flush(tester);
-    expect(session.players, hasLength(1));
-    expect(find.text('本章已播完'), findsOneWidget);
+    expect(session.players, hasLength(2));
+    expect(session.store.entry?['chapterId'], '2');
+    expect(session.players.last.isPlaying, true);
   });
 
   testWidgets(

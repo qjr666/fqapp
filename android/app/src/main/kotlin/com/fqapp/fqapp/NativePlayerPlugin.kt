@@ -22,7 +22,6 @@ import android.util.Log
 import android.view.WindowManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -341,6 +340,24 @@ class NativePlayerPlugin internal constructor(
     }
 
     /**
+     * 宿主 Activity 是否在前台（可见、已 resume）。
+     *
+     * `ActivityPluginBinding.getLifecycle()` 的返回类型是 `Object` —— 生命周期
+     * 库的版本由 `flutter_plugin_android_lifecycle` 这个插件决定，引擎只把
+     * 一个不透明对象递过来，取不到 `Lifecycle.State`。这里不去引那个插件，
+     * 直接用工程里已有的 `MainActivity.isResumed` 判定前台态（与
+     * `AiRequestPlugin` 同一套）。
+     *
+     * 拿不到 Activity（引擎已卸载）或不是本工程的 Activity 时按「不在前台」
+     * 处理：这时弹窗注定出不来。
+     */
+    private fun isActivityForeground(activity: Activity?): Boolean {
+        if (activity == null) return false
+        val main = activity as? MainActivity ?: return false
+        return main.isResumed
+    }
+
+    /**
      * 系统弹窗式申请通知权限。
      *
      * 只在「用户看得见的时刻」申请：Activity 不在前台时弹窗会被系统丢掉，
@@ -366,8 +383,7 @@ class NativePlayerPlugin internal constructor(
             result.success("denied")
             return
         }
-        val lifecycleState = activityBinding?.lifecycle?.currentState
-        if (lifecycleState != null && lifecycleState != Lifecycle.State.RESUMED) {
+        if (!isActivityForeground(currentActivity)) {
             // Activity 不在前台：这次申请注定弹不出来，别把「申请过」标记写上，
             // 等用户回到前台再申请。
             result.success("denied")
@@ -410,8 +426,7 @@ class NativePlayerPlugin internal constructor(
         ) {
             return
         }
-        val lifecycleState = activityBinding?.lifecycle?.currentState
-        if (lifecycleState != null && lifecycleState != Lifecycle.State.RESUMED) return
+        if (!isActivityForeground(currentActivity)) return
         notificationPermissionRequested = true
         try {
             ActivityCompat.requestPermissions(
