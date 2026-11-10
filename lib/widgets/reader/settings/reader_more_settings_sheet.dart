@@ -223,6 +223,12 @@ class _ReaderMoreSettingsSheetState
           value: value.keepScreenOn,
           onChanged: (on) => _apply((p) => p.copyWith(keepScreenOn: on)),
         ),
+        ReaderSettingsSwitchRow(
+          key: const ValueKey('reader-allow-landscape'),
+          label: '允许横屏',
+          value: value.allowLandscape,
+          onChanged: (on) => _apply((p) => p.copyWith(allowLandscape: on)),
+        ),
       ],
       if (_shows(ReaderBehaviorCategory.theme) &&
           (widget.einkOverride || value.themePreset == ReaderThemePreset.eink))

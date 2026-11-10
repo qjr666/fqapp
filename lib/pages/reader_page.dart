@@ -37,6 +37,7 @@ import '../services/text_replacement_store.dart';
 import '../services/library_store.dart';
 import '../services/listening_session.dart';
 import '../services/reader_device.dart';
+import '../services/reader_route_registry.dart';
 import '../services/reader_follow_poll.dart';
 import '../widgets/reader/eink_reading.dart';
 import '../widgets/reader/reader_player_pill.dart';
@@ -226,6 +227,8 @@ class _ReaderPageState extends State<ReaderPage>
       _replacement = result;
       _savedPosition = position;
       _narrationRange = null;
+      // 导航锚点指向的也是替换前的正文，一并清掉。
+      _followAnchor = null;
       _locationHighlight = null;
       _selection = null;
       _selectionBarOpen = false;
@@ -281,6 +284,14 @@ class _ReaderPageState extends State<ReaderPage>
       // 官方 onPlayResume（AudioSyncReaderController.java:381）恢复播放时
       // 立刻恢复跟随，不受手动翻页那 15 秒闩锁影响。
       _listenFollowPausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
+      // 这里原来只清了 15 秒闩锁，**没有**把跟随打开：真正 arm 的是
+      // `ListeningSession.update()`，它要求 `wasPlaying == false`。而「重新
+      // 起播但音频没停」的路径（点「从本页听」）playing 一直是 true，
+      // 于是永远不 arm —— 恢复播放后跟随依然是死的。
+      if (_listenFollowTakeover) {
+        _listenFollowTakeover = false;
+        ListeningSession.instance.setFollowArmed(true);
+      }
     }
     _listenWasPlaying = playing;
     _followPoll.sync();
@@ -294,28 +305,11 @@ class _ReaderPageState extends State<ReaderPage>
     _syncNarrationHighlight(narration);
     // 翻页**只**由 [_followPollTick] 负责：它按句内插值寻址到正在读的那个
     // 字。这条 1Hz 通知原来也翻，但锚的是句首；一句跨页时两路各拽一头，
-    // 于是就出现每秒回闪一页。这里只剩「朗读读完本章 → 跟到下一章」。
-    if (!_routeCurrent ||
-        !_appActive ||
-        !_preferences.listeningFollow ||
-        // 没按过定位键就是不跟随：老逻辑只认偏好，开着重播就会自己翻页。
-        !session.followArmed ||
-        _loading ||
-        _changingChapter ||
-        _error != null) {
-      return;
-    }
-    if (DateTime.now().isBefore(_listenFollowPausedUntil)) return;
-    if (!session.playing || !session.matchesBook(widget.bookId)) return;
-    if (!session.matchesChapter(_chapter.itemId)) {
-      // 真人讲书会按时间轴把当前音频章节别名成原著章节；跟随要翻到的是
-      // 原著那一章，而不是音频章节 id。
-      final next = widget.chapters.indexWhere(
-        (c) => c.itemId == session.readerChapterId,
-      );
-      // 控制栏展开 / 自动翻页中的闸门由 [_jumpToChapter] 自己再查一遍。
-      if (next >= 0) unawaited(_jumpToChapter(next, followListening: true));
-    }
+    // 于是就出现每秒回闪一页。
+    //
+    // 跨章跟随也只留 [_followPollTick] 一条路。这里原来还有一份 1Hz 的跨章
+    // 判定，与 10Hz 轮询竞争同一个 `_jumpToChapter`，两条路的闸门还不一致
+    // —— 结果是「有时跟过去、有时卡在旧章」。
   }
 
   /// Height of the reader's own bottom toolbar (目录/夜间/听书/设置) as measured
@@ -406,6 +400,9 @@ class _ReaderPageState extends State<ReaderPage>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    // 登记到「阅读页在栈里」的登记簿：听书页的「边听边读」要回到这一份，
+    // 而不是再 push 一份新的（两个阅读页实例会让进度与高亮各走各的）。
+    _registerReaderRoute();
     AudioFloatingRouteScope.configure(context, hidden: true);
     _reduceReaderMotion =
         _effectivePreset.isEink ||
@@ -428,6 +425,48 @@ class _ReaderPageState extends State<ReaderPage>
     }
     _syncSystemBars();
     _syncVolumeKeyEnabled();
+    // 方向锁定同样是引擎级的：本路由被盖住时交还给上层页面，
+    // 回到本页时再按当前偏好重新锁上。
+    if (current) {
+      _syncOrientationLock();
+    } else {
+      _releaseOrientationLock();
+    }
+  }
+
+  /// 把本页登记进 [ReaderRouteRegistry]。
+  ///
+  /// 听书页的「边听边读」要回到**已经在栈里**的这一份阅读页，而不是再 push
+  /// 一份新的：两个阅读页实例会让进度、高亮与跟随各走各的。登记的是路由
+  /// 对象，回退时才能精确停在这一页上，而不是一路退到根页面。
+  void _registerReaderRoute() {
+    if (_readerRouteRegistered) return;
+    final route = ModalRoute.of(context);
+    final navigator = Navigator.maybeOf(context);
+    if (route == null || navigator == null) return;
+    _readerRoute = route;
+    _readerRouteRegistered = true;
+    ReaderRouteRegistry.instance.register(
+      widget.bookId,
+      navigator,
+      route,
+      (chapterId) async {
+        // 按章节 id 找下标：调用方手里的目录与本页的目录可能不是同一份，
+        // 按下标跳会落到别的章节去。
+        final index = widget.chapters.indexWhere(
+          (chapter) => chapter.itemId == chapterId,
+        );
+        if (index < 0) return;
+        await _jumpToChapter(index);
+        if (!mounted) return;
+        // 章内的位置交给跟随那套机制：[_jumpToChapter] 会把跟随闩锁 15 秒，
+        // 这里清掉并把跟随重新打开，回到本页后轮询会自己寻址到正在读的那句。
+        _listenFollowPausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
+        _listenFollowTakeover = false;
+        ListeningSession.instance.setFollowArmed(true);
+        _addressToPlayback(quiet: true);
+      },
+    );
   }
 
   /// 迷你听书栏的「跳到播放位置」：按键不受任何闸门限制。
@@ -435,6 +474,11 @@ class _ReaderPageState extends State<ReaderPage>
     // 按键本身就是「回到朗读处」，回来之后要继续跟。不清闩锁的话轮询还要
     // 被挡最多 15 秒 —— 按钮点得动，跟随却是死的。
     _listenFollowPausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    // 也要把跟随重新打开：用户按了「跳到播放位置」显然是想继续跟着听，
+    // 但这里原来只清了 15 秒闩锁，`followArmed` 仍是 false —— 页面跳过去了，
+    // 跟随却还是关着的。
+    _listenFollowTakeover = false;
+    ListeningSession.instance.setFollowArmed(true);
     _addressToPlayback();
   }
 
@@ -452,6 +496,14 @@ class _ReaderPageState extends State<ReaderPage>
     _chapterRequestHandles.cancelAll();
     VolumeKeyService.instance.setOnVolumeKey(null);
     unawaited(VolumeKeyService.instance.setEnabled(false));
+    // 方向锁定是引擎级的，不随路由释放：离开阅读器必须还原，
+    // 否则后面的页面（听书页等）会被锁在竖屏。
+    _releaseOrientationLock();
+    // 退出登记簿：这一页已经不在栈里，听书页的「边听边读」不能再回退到它。
+    final readerRoute = _readerRoute;
+    if (readerRoute != null) {
+      ReaderRouteRegistry.instance.unregister(widget.bookId, readerRoute);
+    }
     ListeningSession.instance.removeListener(_onListeningTick);
     // 只清自己注册的：换章重建时新实例已经接管。
     if (ListeningSession.instance.jumpToPlaybackHandler ==

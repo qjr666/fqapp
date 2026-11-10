@@ -71,6 +71,19 @@ class SystemTtsPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventCha
         .setUsage(AudioAttributes.USAGE_MEDIA)
         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
     private val audio get() = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    /**
+     * 混播策略切到「允许与其他应用同时播放」时立刻交还已持有的音频焦点：
+     * 不交还的话，系统朗读会继续压制别的应用，直到下一次 stop。
+     * 切回独占模式不必在这里重新申请——下一句朗读前 requestFocus() 会申请。
+     */
+    private val audioMixListener: () -> Unit = {
+        main.post {
+            if (AudioMixPolicy.mixWithOthers) {
+                releaseFocus()
+            }
+        }
+    }
     private val noisyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) interrupt()
@@ -121,6 +134,7 @@ class SystemTtsPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventCha
         events.setStreamHandler(this)
         ContextCompat.registerReceiver(context, noisyReceiver,
             IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY), ContextCompat.RECEIVER_NOT_EXPORTED)
+        AudioMixPolicy.addListener(audioMixListener)
     }
 
     override fun onListen(arguments: Any?, eventSink: EventChannel.EventSink) { sink = eventSink }
@@ -364,6 +378,12 @@ class SystemTtsPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventCha
 
     @Suppress("DEPRECATION")
     private fun requestFocus(): Boolean {
+        // 允许与其他应用同时播放时不参与焦点竞争：系统朗读直接在媒体流上出声，
+        // 不申请焦点就不会把别的应用压下去，两边各播各的。
+        if (AudioMixPolicy.mixWithOthers) {
+            focusGranted = false
+            return true
+        }
         if (focusGranted) return true
         // 临时丢失焦点时旧 request 仍在；用户主动恢复必须先弃掉旧 request，
         // 再按当前系统状态重新申请，不能沿用已经失效的监听器。
@@ -461,6 +481,7 @@ class SystemTtsPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventCha
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        AudioMixPolicy.removeListener(audioMixListener)
         shutdown()
         context.unregisterReceiver(noisyReceiver)
         sink = null

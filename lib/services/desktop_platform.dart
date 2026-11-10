@@ -253,6 +253,12 @@ class DesktopPlatform with WindowListener {
           await _smtc?.disableSmtc();
           return null;
         }
+        // 通知权限是移动端概念：桌面端没有通知栏保活这一说。
+        if (method == 'notificationPermissionStatus' ||
+            method == 'requestNotificationPermission') {
+          return 'granted';
+        }
+        if (method == 'openNotificationSettings') return false;
         final id = (args['id'] as num?)?.toInt();
         final host = _players[id];
         if (method == 'dispose') {
@@ -306,6 +312,9 @@ class DesktopPlatform with WindowListener {
       case 'fqapp/volume-key':
         return null;
       case 'fqapp/fair_memory':
+        return null;
+      // 混播策略是移动端的音频焦点/会话概念，桌面端没有对应开关，直接忽略。
+      case 'fqapp/audio_mix':
         return null;
     }
     throw MissingPluginException('$channel/$method');

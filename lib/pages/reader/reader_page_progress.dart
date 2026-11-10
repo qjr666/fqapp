@@ -94,7 +94,10 @@ extension _ReaderPageProgress on _ReaderPageState {
     // 下一次通知，高亮（以及「高亮在屏」这条判据）会晚一拍。排版一就位就
     // 直接算一次，构建阶段不能 setState，所以只赋值。
     final narration = _narrationLayoutRange(layout);
+    // 显示态受「朗读句高亮」偏好控制；导航锚点不受 —— 关掉高亮不该连带
+    // 关掉跟随翻页（这是「听书跟随翻页无效」的直接原因之一）。
     _narrationRange = _preferences.narrationHighlight ? narration : null;
+    _followAnchor = narration;
     _layoutMode = _preferences.pageMode;
     // Late paragraph bubbles can add pages. Keep a backward chapter entry
     // anchored to the text end, not the first layout's last-page start.
@@ -473,9 +476,16 @@ extension _ReaderPageProgress on _ReaderPageState {
       return;
     }
     _changingChapter = true;
+    // 跟随触发的切章要记一笔：拼接模式跨章时靠它区分「用户滚过去的」与
+    // 「跟随带过去的」，后者不能退出跟随。
+    if (followListening) _followChapterJump = true;
     try {
       // 闸门要排在结算/存盘**前面**：被闩锁挡住的这次跟随切章什么都没做，
       // 而在后面的话轮询每 100ms 都会存一次进度。
+      //
+      // 这里用 `matchesBookChapter`（不看播放态）而不是 `matches`：章末会先
+      // 发一帧 `playing:false` 再起下一章，用 `matches` 的话那一帧永远过不了
+      // 闸门，「读完一章不翻章」就成了必然。
       if (followListening &&
           (!_routeCurrent ||
               !_appActive ||
@@ -483,7 +493,7 @@ extension _ReaderPageProgress on _ReaderPageState {
               !_preferences.listeningFollow ||
               _autoTurnTimer != null ||
               DateTime.now().isBefore(_listenFollowPausedUntil) ||
-              !ListeningSession.instance.matches(
+              !ListeningSession.instance.matchesBookChapter(
                 widget.bookId,
                 widget.chapters[index].itemId,
               ))) {
@@ -500,6 +510,9 @@ extension _ReaderPageProgress on _ReaderPageState {
       await _load();
     } finally {
       _changingChapter = false;
+      // 跨章完成后清除标志。拼接模式的 `_onJoinedPosition` 是在 `_load()`
+      // 期间回调的，所以这里清得比它晚一点才对。
+      _followChapterJump = false;
     }
   }
 

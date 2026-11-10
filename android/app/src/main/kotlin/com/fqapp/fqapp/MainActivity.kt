@@ -46,6 +46,23 @@ class MainActivity : FlutterActivity() {
         flutterEngine.plugins.add(FairMemoryPlugin())
         flutterEngine.plugins.add(AiRequestPlugin())
 
+        // 混播策略通道：Dart -> 原生切换「是否允许与其他应用同时播放」。
+        // 全局开关的落点在 AudioMixPolicy，各音频出口（听书 ExoPlayer、系统
+        // 朗读、浮窗视频）都读同一份状态。
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "fqapp/audio_mix",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "setPolicy" -> {
+                    val mix = call.argument<Boolean>("mixWithOthers") ?: false
+                    AudioMixPolicy.apply(mix)
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         // 音量键翻页通道：Dart -> 原生 setEnabled 控制是否拦截；原生 -> Dart
         // volumeKey 回调翻页方向（+1 下一页 / -1 上一页）。
         volumeChannel = MethodChannel(

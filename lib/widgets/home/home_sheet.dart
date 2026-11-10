@@ -147,6 +147,10 @@ Future<T?> showHomeSheet<T>({
   EdgeInsetsGeometry contentPadding = const EdgeInsets.fromLTRB(20, 4, 20, 16),
   bool showHandle = true,
   Key? scrollKey,
+
+  /// 弹层自己的外观覆盖。弹层是独立路由，拿不到页面上的 [Theme] 覆盖，
+  /// 需要调用方显式传进来（听书页的深浅主题切换就是这条路）。
+  ThemeData? theme,
 }) {
   final palette = HomePalette.of(context);
   return showModalBottomSheet<T>(
@@ -156,14 +160,17 @@ Future<T?> showHomeSheet<T>({
     backgroundColor: homeSheetColor(palette),
     clipBehavior: Clip.antiAlias,
     shape: homeSheetShape(palette, top: HomeSheetFrame.radius),
-    builder: (sheetContext) => HomeSheetFrame(
-      title: title,
-      closeTooltip: closeTooltip ?? '关闭',
-      maxHeightFactor: maxHeightFactor,
-      contentPadding: contentPadding,
-      showHandle: showHandle,
-      scrollKey: scrollKey,
-      children: children,
-    ),
+    builder: (sheetContext) {
+      final frame = HomeSheetFrame(
+        title: title,
+        closeTooltip: closeTooltip ?? '关闭',
+        maxHeightFactor: maxHeightFactor,
+        contentPadding: contentPadding,
+        showHandle: showHandle,
+        scrollKey: scrollKey,
+        children: children,
+      );
+      return theme == null ? frame : Theme(data: theme, child: frame);
+    },
   );
 }

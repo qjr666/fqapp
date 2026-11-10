@@ -8,6 +8,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+import 'audio_preferences.dart';
 import 'platform_channel.dart';
 
 bool get isIOSPlatform =>
@@ -67,15 +68,15 @@ class IosPlatform {
 
     // iOS 默认音频会话是 ambient，静音键会直接把朗读静音。必须激活共享
     // 会话、设为 playback，并阻止每句念完自动 deactivate（第二句就哑了）。
+    //
+    // 混播策略在这里一并落地：默认独占（playback 不带 mixWithOthers，会打断
+    // 别的 App）；用户打开「允许同时播放」后换成 mixWithOthers。
     try {
+      // 先激活再定类别：激活时用的还是默认的 ambient 类别，不会一开应用就
+      // 打断别的 App；类别改完之后，下一次播放激活（AVPlayer / AVSpeech
+      // 自己会激活）才按新类别生效。
       await _tts.setSharedInstance(true);
-      await _tts.setIosAudioCategory(
-        IosTextToSpeechAudioCategory.playback,
-        <IosTextToSpeechAudioCategoryOptions>[
-          IosTextToSpeechAudioCategoryOptions.duckOthers,
-          IosTextToSpeechAudioCategoryOptions.allowBluetoothA2DP,
-        ],
-      );
+      await _applyAudioCategory();
       await _tts.autoStopSharedSession(false);
     } catch (error) {
       debugPrint('[ios-tts] audio session setup failed: $error');
@@ -103,6 +104,41 @@ class IosPlatform {
       debugPrint('[ios-player] MediaKit init failed: $error');
     }
     _initialized = true;
+  }
+
+  /// 应用当前的混播策略到 iOS 音频会话。
+  ///
+  /// 独占（默认）：`playback` 不带 `mixWithOthers` —— 起播会打断别的 App。
+  /// 混播：加 `mixWithOthers`，别的 App 照常出声，我们叠在上面。
+  ///
+  /// 之前这里恒开 `duckOthers`，而 `duckOthers` 隐含 `mixWithOthers`，
+  /// 于是听书永远和其它 App 混播，用户抱怨「后台播放会跟别的音频一起响」。
+  ///
+  /// [reactivate] 为 true 时改完类别再激活一次：AVAudioSession 在激活状态下
+  /// 改类别，**新选项要重新激活才生效**。不这么做的话，用户在播放中切换
+  /// 开关要等到下一次起播才看得出变化。
+  Future<void> _applyAudioCategory({
+    bool? mixWithOthers,
+    bool reactivate = false,
+  }) async {
+    final mix =
+        mixWithOthers ?? AudioPreferences.instance.mixWithOthers.value;
+    final options = <IosTextToSpeechAudioCategoryOptions>[
+      IosTextToSpeechAudioCategoryOptions.allowBluetoothA2DP,
+      if (mix) IosTextToSpeechAudioCategoryOptions.mixWithOthers,
+    ];
+    try {
+      await _tts.setIosAudioCategory(
+        IosTextToSpeechAudioCategory.playback,
+        options,
+      );
+      if (reactivate) {
+        // flutter_tts 的 setSharedInstance(true) 就是 setActive(true)。
+        await _tts.setSharedInstance(true);
+      }
+    } catch (error) {
+      debugPrint('[ios-tts] 设置音频会话类别失败：$error');
+    }
   }
 
   /// `NativePlayer.create()` 返回的是 `created` 事件里的 value，Windows 端
@@ -133,6 +169,16 @@ class IosPlatform {
         return _player(method, args);
       case 'fqapp/system_tts':
         return _speech(method, args);
+      case 'fqapp/audio_mix':
+        // 混播策略：直接改 iOS 音频会话的类别选项。
+        if (method == 'setPolicy') {
+          await _applyAudioCategory(
+            mixWithOthers: args['mixWithOthers'] == true,
+            reactivate: args['reactivate'] == true,
+          );
+          return null;
+        }
+        throw MissingPluginException(method);
       // iOS 没有这些原生桥：返回安全默认值，别让页面抛异常。
       case 'fqapp/player_system_ui':
       case 'fqapp/volume-key':
@@ -169,6 +215,13 @@ class IosPlatform {
         final host = _players.remove(id);
         await host?.dispose();
         return null;
+      // 通知权限是 Android 的概念：iOS 的后台听书靠音频会话（Info.plist 的
+      // UIBackgroundModes: audio），不需要通知授权，直接算已授权。
+      case 'notificationPermissionStatus':
+      case 'requestNotificationPermission':
+        return 'granted';
+      case 'openNotificationSettings':
+        return false;
       // iOS 没有悬浮窗 / SMTC / 常亮原生实现。这些调用都带 catch 或是可选
       // 增强，返回中性值即可，不伪装成「成功开启」。
       case 'setKeepScreenOn':

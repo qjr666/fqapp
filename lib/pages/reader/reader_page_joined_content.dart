@@ -135,7 +135,10 @@ extension _ReaderJoinedContent on _ReaderPageState {
     final changed = position.index != _index;
     if (position.index != _index) {
       _settleReadTime();
-      _pauseListenFollow();
+      // 只有**用户自己**滚过章界才退出跟随。跟随触发的跨章（朗读进下一章）
+      // 也会走到这里，原来在这里一律 `_pauseListenFollow()`，等于跟随自己
+      // 把自己关掉 —— 拼接模式下「听完一章不翻章」是必然事件。
+      if (!_followChapterJump) _pauseListenFollow();
       _closeSelectionBar(clearSelection: true);
       _clearLocationHighlight();
       _replacementCancellation?.cancel();
@@ -160,6 +163,8 @@ extension _ReaderJoinedContent on _ReaderPageState {
         _layoutIdeasRevision = ++_ideasRevision;
         _layoutUnderlineRevision = ++_underlineRevision;
         _narrationRange = null;
+        // 换章后旧锚点指向上一章的正文，一并清掉。
+        _followAnchor = null;
       });
       _saveTimer?.cancel();
     }

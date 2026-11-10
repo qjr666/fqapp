@@ -78,6 +78,16 @@ class ListeningSession extends ChangeNotifier {
   bool matches(String bookId, String chapterId) =>
       playing && matchesBook(bookId) && matchesChapter(chapterId);
 
+  /// Whether this session belongs to the given book/chapter, **ignoring**
+  /// whether it is currently playing.
+  ///
+  /// 章末会先发一帧 `playing:false` 再起下一章（`audio_playback_guard.dart`
+  /// 的 `onChapterFinished`），那一帧里 [matches] 恒为 false。跨章跟随的闸门
+  /// 用它判断「目标章是不是正在播的那一章」，于是章末那一拍永远过不去 ——
+  /// 表现就是「听完一章不翻章」。这个方法只看书与章，不看播放态。
+  bool matchesBookChapter(String bookId, String chapterId) =>
+      matchesBook(bookId) && matchesChapter(chapterId);
+
   /// Estimated chapter progress (0..1), from text position for system TTS or
   /// elapsed audio time for recordings. Reader page following is proportional.
   double get progress =>

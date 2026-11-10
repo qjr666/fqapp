@@ -149,8 +149,22 @@ class ReaderDevice {
     }
   }
 
+  /// 选一个字体文件导入。
+  ///
+  /// 返回 null 表示用户取消。平台没有这个能力时抛 [PlatformException]，
+  /// 而不是让 [MissingPluginException] 冒到 UI —— 后者会被字体面板显示成
+  /// 「无法载入字体，请选择有效的 TTF、OTF 或 TTC 文件」，那句话讲的是文件
+  /// 格式，而真实原因是这个平台压根没有通道。
   Future<ReaderFont?> pickFont() async {
-    final value = await _channel.invokeMapMethod<String, dynamic>('pickFont');
+    final Map<String, dynamic>? value;
+    try {
+      value = await _channel.invokeMapMethod<String, dynamic>('pickFont');
+    } on MissingPluginException {
+      throw PlatformException(
+        code: 'FONT_PICKER_UNSUPPORTED',
+        message: '当前平台不支持导入字体',
+      );
+    }
     if (value == null || _closed) return null;
     final path = value['path'];
     final name = value['name'];

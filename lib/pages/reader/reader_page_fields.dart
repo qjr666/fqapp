@@ -101,9 +101,46 @@ mixin _ReaderPageFields on State<ReaderPage> {
   /// 15 秒内被重新打开」的路径，恢复播放时由 [_onListeningTick] 清掉。
   DateTime _listenFollowPausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
+  /// 用户**手动接管**过跟随：拖一下页面、翻一页、换一章都会置位。
+  ///
+  /// 与 [ListeningSession.followArmed] 分开记的原因：`followArmed` 是一次性
+  /// 的闩锁，13 处手动操作都会把它清掉，而恢复只有「暂停再播放」「点原进度」
+  /// 两条路 —— 用户只是想把页面往前拖一点看看内容，跟随就**永久失效**了，
+  /// 界面上也没有任何提示（`followArmed` 在 UI 上完全不可见）。
+  ///
+  /// 有了这个标记就能区分两种「不跟随」：
+  /// - 用户接管过 → 闩锁到期后可以自动恢复（把页面拉回朗读处再继续跟）；
+  /// - 从没接管过 → 跟随本来就没开，不该自作主张地打开。
+  bool _listenFollowTakeover = false;
+
+  /// 跨章**由跟随触发**中：跟随把页面带到下一章时置位。
+  ///
+  /// 拼接模式（滚动连章）里，跨章会回调 `_onJoinedPosition`，那里要判断
+  /// 「这次跨章是用户滚过去的，还是跟随带过去的」—— 后者不能退出跟随，
+  /// 否则跟随自己把自己关掉。
+  bool _followChapterJump = false;
+
+  /// 上次提示「正在播放的章节不在本书目录里」的时刻，用于限频。
+  DateTime _followChapterMissingAt = DateTime.fromMillisecondsSinceEpoch(0);
+
   /// 朗读句高亮：与跟随翻页独立同步，跟随关闭时高亮仍可显示；切章、关闭
   /// 或未在读本章时清空。暂停保留（官方暂停时朗读标记仍在正文上）。
+  ///
+  /// 这是**显示态**：受「朗读句高亮」偏好控制，偏好关掉就为 null。
+  /// 跟随翻页要用的位置在 [_followAnchor]，两者不能混用一个字段 ——
+  /// 混用会让「关掉高亮」连带「关掉跟随」。
   (int, int)? _narrationRange;
+
+  /// 跟随翻页的**导航锚点**：正在朗读的那一句在正文里的字符区间。
+  ///
+  /// 与 [_narrationRange] 的区别只有一个：不受「朗读句高亮」偏好影响。
+  /// 整章没有字幕表时（系统朗读、字幕取不到），跟随只能靠这个锚点寻址；
+  /// 之前它和显示态共用一个字段，用户一关高亮，跟随就彻底失去锚点，
+  /// 表现为「听书跟随翻页无效」而且没有任何提示。
+  ///
+  /// 只由 [_narrationLayoutRange] 的结果写入，不做「保留上一拍」的延留：
+  /// 导航锚点要的是**当前**正在读的位置，延留会把页面停在上一句。
+  (int, int)? _followAnchor;
 
   /// 双击跳读是否可用：正在听这本书就行，本章或别的章都可以（跨章跳）。
   ///
@@ -181,6 +218,18 @@ mixin _ReaderPageFields on State<ReaderPage> {
   bool _deviceAvailable = false;
   bool _preferencesReady = false;
   bool _preferencesDirty = false;
+  /// 是否已经下发过方向锁定（`SystemChrome.setPreferredOrientations`）。
+  /// 引擎级设置不会随路由释放，离开阅读器时需要显式还原。
+  bool _orientationLocked = false;
+
+  /// 上一次下发方向锁定时对应的「允许横屏」取值，用来判断是否需要重发。
+  bool _orientationAllowLandscape = false;
+
+  /// 本页在导航栈里的路由对象（登记进 [ReaderRouteRegistry] 时用）。
+  Route<dynamic>? _readerRoute;
+
+  /// 是否已经登记进 [ReaderRouteRegistry]。登记只做一次：路由对象不会变。
+  bool _readerRouteRegistered = false;
   int _deviceGeneration = 0;
   int _brightnessGeneration = 0;
   int _fontGeneration = 0;

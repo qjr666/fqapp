@@ -61,12 +61,24 @@ void _startSleepTicker(_AudioPlaybackController c) {
 }
 
 /// 启动连播倒计时；归零后打开下一章。
+///
+/// 倒计时秒数为 0 时**不倒计时、直接连播**：用户要求取消「自动播放下一章的
+/// 等待时间」，所以章末要立刻接着播下一章，而不是停在章末等 3 秒。
+/// （原来 `seconds <= 0` 直接 return，等于章末根本不连播 —— 那是「取消等待」
+/// 改出来的新 bug，必须在这里补上立即连播。）
 void _beginAdvanceCountdown(
   _AudioPlaybackController c, {
   int seconds = kAdvanceCountdownSeconds,
 }) {
   _cancelAdvanceCountdown(c);
-  if (c._closed || seconds <= 0) return;
+  if (c._closed) return;
+  if (seconds <= 0) {
+    // 立即连播。没有倒计时就没有「取消」的机会 —— 用户要的就是这个。
+    if (c._index + 1 < c._chapters.length) {
+      unawaited(c._openChapter(c._index + 1));
+    }
+    return;
+  }
   c._advanceRemaining = seconds;
   c._advanceCountdown.value = seconds;
   c._advanceTimer = Timer.periodic(const Duration(seconds: 1), (timer) {

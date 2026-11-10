@@ -4,6 +4,18 @@ import UniformTypeIdentifiers
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+  /// 应用级通道实例必须被 AppDelegate **持有**。
+  ///
+  /// 这些通道早先是以临时变量创建的（`DownloadsChannel(...).register()`），
+  /// register() 返回后对象立刻释放 —— 而 `LibraryBackupChannel` 的 handler
+  /// 用 `[weak self]` 捕获自己，回调时 self 已经是 nil，于是每个调用都走
+  /// 「通道已释放」分支：备份页的 `hasPicker` 探针拿不到 true，界面就一直
+  /// 显示「当前运行环境没有系统文件选择器」。这里改成强持有的属性。
+  private let downloadsChannel = DownloadsChannel()
+  private let shareChannel = ShareChannel()
+  private let libraryBackupChannel = LibraryBackupChannel()
+  private let readerDeviceChannel = ReaderDeviceChannel()
+
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -16,25 +28,27 @@ import UniformTypeIdentifiers
     // iOS 没有共享的 Downloads 目录，日志导出与分享走系统能力：文件落到
     // 应用的 Documents（开了文件共享后能在「文件」App 里看到），同时调起
     // 系统分享面板，用户可以存到「文件」、发给自己或放进任何一个 App。
-    guard let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "FqappIosExport") else {
-      return
-    }
-    let messenger = registrar.messenger()
-    DownloadsChannel(messenger: messenger).register()
-    ShareChannel(messenger: messenger).register()
-    LibraryBackupChannel(messenger: messenger).register()
+    //
+    // messenger 取自 `applicationRegistrar` 而不是
+    // `pluginRegistry.registrar(forPlugin:)`：后者是**插件**注册表，给一个
+    // 从未注册过的插件名去要 registrar，语义上不对（引擎会现造一个，
+    // 但它不是「应用级」通道该用的入口）。应用级通道统一走
+    // `applicationRegistrar.messenger()`。
+    let messenger = engineBridge.applicationRegistrar.messenger()
+    downloadsChannel.register(messenger: messenger)
+    shareChannel.register(messenger: messenger)
+    libraryBackupChannel.register(messenger: messenger)
+    readerDeviceChannel.register(messenger: messenger)
   }
 }
 
 /// `fqapp/downloads`：把导出的文本写进应用目录，并调起系统分享面板。
 final class DownloadsChannel {
-  private let channel: FlutterMethodChannel
+  private var channel: FlutterMethodChannel?
 
-  init(messenger: FlutterBinaryMessenger) {
-    channel = FlutterMethodChannel(name: "fqapp/downloads", binaryMessenger: messenger)
-  }
-
-  func register() {
+  func register(messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(name: "fqapp/downloads", binaryMessenger: messenger)
+    self.channel = channel
     channel.setMethodCallHandler { call, result in
       guard call.method == "saveText" else {
         result(FlutterMethodNotImplemented)
@@ -95,13 +109,11 @@ final class DownloadsChannel {
 
 /// `fqapp/share`：分享一段文本。
 final class ShareChannel {
-  private let channel: FlutterMethodChannel
+  private var channel: FlutterMethodChannel?
 
-  init(messenger: FlutterBinaryMessenger) {
-    channel = FlutterMethodChannel(name: "fqapp/share", binaryMessenger: messenger)
-  }
-
-  func register() {
+  func register(messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(name: "fqapp/share", binaryMessenger: messenger)
+    self.channel = channel
     channel.setMethodCallHandler { call, result in
       guard call.method == "shareText" else {
         result(FlutterMethodNotImplemented)
@@ -162,16 +174,17 @@ final class LibraryBackupChannel: NSObject, UIDocumentPickerDelegate {
     case exportZip
   }
 
-  private let channel: FlutterMethodChannel
+  private var channel: FlutterMethodChannel?
   private var pendingResult: FlutterResult?
   private var pendingJob: Job?
 
-  init(messenger: FlutterBinaryMessenger) {
-    channel = FlutterMethodChannel(name: "fqapp/library_backup", binaryMessenger: messenger)
+  override init() {
     super.init()
   }
 
-  func register() {
+  func register(messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(name: "fqapp/library_backup", binaryMessenger: messenger)
+    self.channel = channel
     channel.setMethodCallHandler { [weak self] call, result in
       guard let self else {
         // The channel outlives the handler only if the app is tearing down;
@@ -442,5 +455,172 @@ final class LibraryBackupChannel: NSObject, UIDocumentPickerDelegate {
   /// 导出文件名必须是普通文件名。
   private static func isSafeName(_ name: String) -> Bool {
     name.range(of: safeNamePattern, options: .regularExpression) != nil
+  }
+}
+
+/// `fqapp/reader`：阅读器与设备相关的原生能力，其中 iOS 缺的是**导入字体**。
+///
+/// Android 用 `ACTION_OPEN_DOCUMENT` + `ACTION_OPEN_DOCUMENT` 的 mime 过滤，
+/// 桌面端用 `file_selector`；iOS 之前完全没有这个通道，于是阅读页的「导入字体」
+/// 一点就抛 `MissingPluginException`，面板上显示成「无法载入字体，请选择有效的
+/// TTF、OTF 或 TTC 文件」—— 那句文案讲的是文件格式，而真实原因是通道不存在。
+///
+/// 这里用 `UIDocumentPickerViewController` 选字体，复制到应用私有的
+/// `Documents/reader-fonts` 目录，再把**绝对路径**回给 Dart：Dart 侧用
+/// `FontLoader` 从文件字节加载，路径必须在应用沙盒里才读得到。
+///
+/// 契约与 Android 端 `ReaderDevicePlugin.pickFont` 完全一致：
+/// 成功返回 `{path, name}`，用户取消返回 null。
+final class ReaderDeviceChannel: NSObject, UIDocumentPickerDelegate {
+  /// 与 Android 端一致：字体文件不超过 32 MB。
+  private static let maxBytes = 32 * 1024 * 1024
+  /// 字体魔数：TTF / OTF / TTC / TrueType Collection。
+  private static let signatures: Set<String> = [
+    "00010000",  // TTF
+    "4f54544f",  // OTF
+    "74746366",  // ttc
+    "74727565",  // true
+  ]
+
+  private var channel: FlutterMethodChannel?
+  private var pendingResult: FlutterResult?
+
+  override init() {
+    super.init()
+  }
+
+  func register(messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(name: "fqapp/reader", binaryMessenger: messenger)
+    self.channel = channel
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self else {
+        result(FlutterError(code: "no_channel", message: "通道已释放", details: nil))
+        return
+      }
+      self.handle(call, result)
+    }
+  }
+
+  private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+    switch call.method {
+    case "pickFont":
+      pickFont(result)
+    case "start", "setBrightness", "keepScreenOn", "suspend", "stop", "setImmersive":
+      // 阅读器在 iOS 上没有亮度/常亮/沉浸式这些原生能力（`ReaderDevice` 的
+      // 每个方法都自带 MissingPluginException 降级），这里明确回中性值，
+      // 让 Dart 侧走同一条降级路径而不是整个方法找不到处理器。
+      result(nil)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private func pickFont(_ result: @escaping FlutterResult) {
+    guard pendingResult == nil else {
+      result(FlutterError(code: "FONT_PICKER_BUSY", message: "请先关闭已打开的字体选择器", details: nil))
+      return
+    }
+    guard let presenter = topViewController() else {
+      result(FlutterError(code: "FONT_PICKER_UNAVAILABLE", message: "无法打开文件选择器", details: nil))
+      return
+    }
+    pendingResult = result
+    // 字体在 iOS 上的 UTI 没有单一「字体」类型：TrueType / OpenType / 字体集合
+    // 各自一个。把这几类都放进去，用户在「文件」里看到 .ttf/.otf/.ttc 就能选。
+    let picker = UIDocumentPickerViewController(
+      forOpeningContentTypes: [
+        UTType.truetypeFont,
+        UTType.opentypeFont,
+        UTType.font,
+      ],
+      asCopy: true
+    )
+    picker.delegate = self
+    picker.allowsMultipleSelection = false
+    presenter.present(picker, animated: true)
+  }
+
+  public func documentPicker(
+    _ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]
+  ) {
+    guard let url = urls.first else {
+      finish(nil)
+      return
+    }
+    let scoped = url.startAccessingSecurityScopedResource()
+    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+    do {
+      let imported = try importFont(url)
+      finish(imported)
+    } catch {
+      finish(
+        FlutterError(
+          code: "FONT_IMPORT_FAILED",
+          message: error.localizedDescription,
+          details: nil))
+    }
+  }
+
+  public func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+    finish(nil)
+  }
+
+  /// 把字体复制进应用私有目录，并回传绝对路径。
+  ///
+  /// 沙盒外的原文件路径 Dart 读不到（而且可能随时被系统回收），必须复制。
+  /// 文件名用内容哈希，和 Android 端一样：同一份字体重复导入不会堆积副本。
+  private func importFont(_ url: URL) throws -> [String: String] {
+    let data = try Data(contentsOf: url)
+    guard data.count <= ReaderDeviceChannel.maxBytes else {
+      throw NSError(
+        domain: "fqapp.reader", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "请选择小于 32 MB 的字体文件"])
+    }
+    guard data.count >= 12 else {
+      throw NSError(
+        domain: "fqapp.reader", code: 2,
+        userInfo: [NSLocalizedDescriptionKey: "字体文件不完整"])
+    }
+    let signature = data.prefix(4).map { String(format: "%02x", $0) }.joined()
+    guard ReaderDeviceChannel.signatures.contains(signature) else {
+      throw NSError(
+        domain: "fqapp.reader", code: 3,
+        userInfo: [NSLocalizedDescriptionKey: "请选择 TTF、OTF 或 TTC 字体文件"])
+    }
+    let directory = try fontDirectory()
+    let hash = ReaderDeviceChannel.stableHash(data)
+    let target = directory.appendingPathComponent("\(hash).font")
+    if !FileManager.default.fileExists(atPath: target.path) {
+      try data.write(to: target, options: .atomic)
+    }
+    return ["path": target.path, "name": url.lastPathComponent]
+  }
+
+  /// 内容寻址的稳定哈希（FNV-1a 64 位）。
+  ///
+  /// 不能用 Swift 的 `hashValue`：它按进程随机种子生成，**每次启动都不一样**，
+  /// 同一份字体每开一次应用就会多出一个副本。
+  static func stableHash(_ data: Data) -> String {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in data {
+      hash ^= UInt64(byte)
+      hash = hash &* 0x0000_0100_0000_01b3
+    }
+    return String(format: "%016llx", hash)
+  }
+
+  /// 字体目录放在 Documents 下而不是 Application Support：与 Android 的
+  /// `filesDir` 不同，Dart 侧只需要一个能读到的绝对路径，放哪儿都能读。
+  private func fontDirectory() throws -> URL {
+    let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    let directory = documents.appendingPathComponent("reader-fonts", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+  }
+
+  private func finish(_ value: Any?) {
+    let result = pendingResult
+    pendingResult = nil
+    result?(value)
   }
 }

@@ -31,6 +31,7 @@ import '../services/app_style_tokens.dart';
 import '../services/audio_preferences.dart';
 import '../services/desktop_platform.dart';
 import '../services/native_player.dart';
+import '../services/notification_permission.dart';
 import '../services/player_layout_preferences.dart';
 import '../services/player_preferences.dart';
 import '../services/book_open_preferences.dart';
@@ -121,6 +122,8 @@ class SettingsPage extends StatelessWidget {
         items: [
           _backgroundAudioItem(),
           if (!isWindowsDesktop) _audioRateEngineItem(),
+          if (!isWindowsDesktop) _mixWithOthersItem(),
+          if (!isWindowsDesktop) _notificationPermissionItem(),
           SettingsItem(
             icon: CupertinoIcons.mic,
             title: '系统朗读',
@@ -593,8 +596,70 @@ class SettingsPage extends StatelessWidget {
     ),
   );
 
-  // ── 短剧 ──────────────────────────────────────────────────────────────
+  /// 听书是否与其他应用的音频同时播放。
+  ///
+  /// 默认独占：听书出声时向系统申请音频焦点，别人的音乐自动暂停（iOS 走
+  /// playback 类别不带 mixWithOthers，Android 走 AUDIOFOCUS_GAIN）。打开后
+  /// 改成混播，两边各播各的。策略要推给原生才能生效，见 AudioMixPolicy。
+  SettingsItem _mixWithOthersItem() => SettingsItem(
+    icon: CupertinoIcons.speaker_2,
+    title: '允许与其他应用同时播放',
+    rowBuilder: (context) => ValueListenableBuilder<bool>(
+      valueListenable: AudioPreferences.instance.mixWithOthers,
+      builder: (context, value, _) => SettingsToggleRow(
+        icon: CupertinoIcons.speaker_2,
+        title: '允许与其他应用同时播放',
+        description: value
+            ? '听书与其它 App 的声音叠加播放'
+            : '独占音频：听书时其它 App 自动暂停',
+        value: value,
+        onChanged: (v) => AudioPreferences.instance.setMixWithOthers(v),
+      ),
+    ),
+  );
 
+  /// 通知权限：后台保活的前台服务通知卡片需要它。
+  ///
+  /// Android 13 起是运行时权限，用户拒绝一次之后系统不会再弹，只能去系统
+  /// 「通知」设置里开。权限没有时前台服务照样能跑，但通知卡片不可见，厂商
+  /// 系统更容易把后台进程冻住 —— 听书在后台就断了。
+  SettingsItem _notificationPermissionItem() => SettingsItem(
+    icon: CupertinoIcons.bell,
+    title: '通知权限',
+    rowBuilder: (context) => ValueListenableBuilder<NotificationPermissionState>(
+      valueListenable: NotificationPermission.instance.state,
+      builder: (context, value, _) {
+        final unknown = value == NotificationPermissionState.unknown;
+        final denied = value == NotificationPermissionState.denied;
+        return SettingsLinkRow(
+          icon: CupertinoIcons.bell,
+          title: '通知权限',
+          subtitle: unknown
+              ? '当前平台不需要通知授权'
+              : denied
+              ? '未开启：后台听书容易被系统冻结，点了去开启'
+              : '已开启：后台听书有常驻控制卡片',
+          trailing: denied
+              ? const Icon(CupertinoIcons.chevron_right, size: 16)
+              : null,
+          onTap: unknown
+              ? null
+              : () {
+                  unawaited(_openNotificationSettings());
+                },
+        );
+      },
+    ),
+  );
+
+  /// 申请通知权限；已经被拒过（系统不会再弹）就直接带去系统设置页。
+  Future<void> _openNotificationSettings() async {
+    final state = await NotificationPermission.instance.request();
+    if (state == NotificationPermissionState.granted) return;
+    await NotificationPermission.instance.openSettings();
+  }
+
+  // ── 短剧 ──────────────────────────────────────────────────────────────
   /// 官方设置项「开启应用时默认静音」（`GlobalMuteConfig` 标题，持久层
   /// `open_mute_when_cold_start`，默认 false＝有声起播）。
   SettingsItem _muteWhenColdStartItem() => SettingsItem(

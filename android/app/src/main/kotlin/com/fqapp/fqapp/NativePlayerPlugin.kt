@@ -22,6 +22,7 @@ import android.util.Log
 import android.view.WindowManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -179,10 +180,27 @@ class NativePlayerPlugin internal constructor(
     private var activity: Activity? = null
     private var activityBinding: ActivityPluginBinding? = null
     private var notificationPermissionRequested = false
+
+    /** 等待系统通知权限弹窗结果的调用方；弹窗没有回来时不能一直挂着。 */
+    private var pendingNotificationPermission: MethodChannel.Result? = null
     private val players = ConcurrentHashMap<Int, PlayerInstance>()
     private val pendingPlayerIds = ConcurrentHashMap.newKeySet<Int>()
     private val nextId = AtomicInteger(1)
     private val handler = Handler(Looper.getMainLooper())
+
+    /**
+     * 混播策略变化后，把新的焦点策略立刻落到已经在播的听书播放器上，
+     * 不必等到下一次起播才生效（开关是随时可切的）。
+     */
+    private val audioMixListener: () -> Unit = {
+        handler.post {
+            players.values.forEach { instance ->
+                if (instance.audioOnly) {
+                    applyListenAudioMixPolicy(instance.player)
+                }
+            }
+        }
+    }
 
     private var floatingAllocation: FloatingAllocation? = null
 
@@ -237,7 +255,9 @@ class NativePlayerPlugin internal constructor(
         val player: ExoPlayer,
         val videoOutput: NativeVideoOutput,
         val diagnosticUrl: String? = null,
-        var positionUpdater: Runnable? = null
+        var positionUpdater: Runnable? = null,
+        /** 听书专用播放器：只有它参与音频焦点/混播策略。 */
+        val audioOnly: Boolean = false
     )
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -264,6 +284,7 @@ class NativePlayerPlugin internal constructor(
                 eventSink = null
             }
         })
+        AudioMixPolicy.addListener(audioMixListener)
     }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
@@ -288,11 +309,93 @@ class NativePlayerPlugin internal constructor(
         activityBinding = null
         activity = null
         originalWindowBrightness = null
+        // Activity 没了，权限弹窗的结果再也回不来：按「没给权限」收口。
+        pendingNotificationPermission?.success("denied")
+        pendingNotificationPermission = null
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean =
-        requestCode == POST_NOTIFICATIONS_REQUEST
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean {
+        if (requestCode != POST_NOTIFICATIONS_REQUEST) return false
+        val granted = grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+        // 等待系统弹窗结果的调用方在这里收口：拿不到结果就当没权限。
+        val pending = pendingNotificationPermission
+        pendingNotificationPermission = null
+        pending?.success(if (granted) "granted" else "denied")
+        return true
+    }
 
+    /**
+     * 通知权限的当前状态。
+     *
+     * Android 13 以下没有这个运行时权限，直接算已授权。
+     */
+    private fun notificationPermissionState(): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return "granted"
+        val context = activity ?: flutterBinding.applicationContext
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+        return if (granted) "granted" else "denied"
+    }
+
+    /**
+     * 系统弹窗式申请通知权限。
+     *
+     * 只在「用户看得见的时刻」申请：Activity 不在前台时弹窗会被系统丢掉，
+     * 而申请过的标记又会挡住第二次申请 —— 结果就是用户永远拿不到通知权限，
+     * 后台保活的通知卡片也就永远不出现。
+     *
+     * 已经申请过且被拒时不再弹窗（Android 也不会再弹），直接回 "denied"，
+     * 由 Dart 引导用户去系统设置里开。
+     */
+    private fun requestNotificationPermission(
+        currentActivity: Activity,
+        result: MethodChannel.Result
+    ) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            result.success("granted")
+            return
+        }
+        if (notificationPermissionState() == "granted") {
+            result.success("granted")
+            return
+        }
+        if (notificationPermissionRequested) {
+            result.success("denied")
+            return
+        }
+        val lifecycleState = activityBinding?.lifecycle?.currentState
+        if (lifecycleState != null && lifecycleState != Lifecycle.State.RESUMED) {
+            // Activity 不在前台：这次申请注定弹不出来，别把「申请过」标记写上，
+            // 等用户回到前台再申请。
+            result.success("denied")
+            return
+        }
+        notificationPermissionRequested = true
+        pendingNotificationPermission = result
+        try {
+            ActivityCompat.requestPermissions(
+                currentActivity,
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                POST_NOTIFICATIONS_REQUEST
+            )
+        } catch (error: Throwable) {
+            notificationPermissionRequested = false
+            pendingNotificationPermission = null
+            Log.w(TAG, "notification permission request failed", error)
+            result.success("denied")
+        }
+    }
+
+    /**
+     * 保活起播前的顺带申请：只在 Activity 处于前台时弹。
+     *
+     * 这里申请失败也不阻断起播 —— 前台服务在用户拒绝通知权限时照样能跑，
+     * 只是通知卡片不可见。没有通知卡片时，厂商系统的后台冻结更容易把进程
+     * 冻住，所以 Dart 侧还会单独引导用户去系统设置里开启。
+     */
     private fun requestNotificationPermissionIfNeeded() {
         val currentActivity = activity ?: return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -307,6 +410,8 @@ class NativePlayerPlugin internal constructor(
         ) {
             return
         }
+        val lifecycleState = activityBinding?.lifecycle?.currentState
+        if (lifecycleState != null && lifecycleState != Lifecycle.State.RESUMED) return
         notificationPermissionRequested = true
         try {
             ActivityCompat.requestPermissions(
@@ -320,8 +425,28 @@ class NativePlayerPlugin internal constructor(
         }
     }
 
+    /** 跳到本应用的「通知」系统设置页：权限被拒后唯一还能开的入口。 */
+    private fun openNotificationSettings(currentActivity: Activity, result: MethodChannel.Result) {
+        try {
+            val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                putExtra(Settings.EXTRA_APP_PACKAGE, currentActivity.packageName)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            currentActivity.startActivity(intent)
+            result.success(true)
+        } catch (error: Throwable) {
+            Log.w(TAG, "open notification settings failed", error)
+            result.success(false)
+        }
+    }
+
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         attachedToEngine = false
+        AudioMixPolicy.removeListener(audioMixListener)
+        // 通知权限弹窗的结果没人等时不能一直挂着 Result：引擎没了就没有
+        // 回来的路，直接按「没给权限」收口。
+        pendingNotificationPermission?.success("denied")
+        pendingNotificationPermission = null
         if (instance === this) instance = null
         floatingAllocation?.let { allocation ->
             try {
@@ -668,6 +793,31 @@ class NativePlayerPlugin internal constructor(
                 )
             }
 
+            // 通知权限：后台保活靠前台服务的常驻通知卡片。权限被拒时服务照样
+            // 能跑，但通知不可见，厂商系统更容易冻结后台进程 —— 所以要把状态
+            // 报给 Dart，由界面引导用户去系统设置里开。
+            "notificationPermissionStatus" -> {
+                result.success(notificationPermissionState())
+            }
+
+            "requestNotificationPermission" -> {
+                val currentActivity = activity
+                if (currentActivity == null) {
+                    result.success("denied")
+                    return
+                }
+                requestNotificationPermission(currentActivity, result)
+            }
+
+            "openNotificationSettings" -> {
+                val currentActivity = activity
+                if (currentActivity == null) {
+                    result.success(false)
+                    return
+                }
+                openNotificationSettings(currentActivity, result)
+            }
+
             "requestOverlayPermission" -> {
                 val currentActivity = activity
                 if (currentActivity == null ||
@@ -857,7 +1007,7 @@ class NativePlayerPlugin internal constructor(
             producer = textureRegistry.createSurfaceProducer()
             player = playerFactory(flutterBinding.applicationContext, options)
             output = NativeVideoOutput(player, producer)
-            players[playerId] = PlayerInstance(playerId, player, output, diagnosticUrl)
+            players[playerId] = PlayerInstance(playerId, player, output, diagnosticUrl, null, options.audioOnly)
             output.attach()
             setupPlayerListener(playerId, player, diagnosticUrl)
             configure(player)
@@ -1547,9 +1697,17 @@ internal fun buildPlayer(context: Context, options: PlayerBuildOptions): ExoPlay
     val loadControl = DefaultLoadControl.Builder()
         .setBufferDurationsMs(50_000, 50_000, 800, 5_000)
         .build()
-    return ExoPlayer.Builder(context, renderers)
+    val player = ExoPlayer.Builder(context, renderers)
         .setLoadControl(loadControl)
         .build()
+    if (options.audioOnly) {
+        // 听书播放器要参与音频焦点管理：独占模式下由 Media3 申请
+        // AUDIOFOCUS_GAIN，出声时其他应用的音乐自动暂停；允许混播时
+        // handleAudioFocus=false，本应用不碰焦点，两路声音叠加。
+        // 视频/短剧保持原样（不设属性、不参与焦点），避免改变既有行为。
+        applyListenAudioMixPolicy(player)
+    }
+    return player
 }
 
 /**

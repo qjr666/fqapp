@@ -315,6 +315,8 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
       // The old narration range points into the pre-AI text. Keep the wash
       // off until the next listening tick remaps it.
       _narrationRange = null;
+      // 导航锚点指向的也是旧文本，一并清掉（下一拍 tick 会重建）。
+      _followAnchor = null;
     });
     if (result.error != null) {
       _showMessage('本章替换失败，已显示原文：${result.error}');

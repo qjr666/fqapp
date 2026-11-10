@@ -67,6 +67,7 @@ class ReaderPreferences {
   static const _showParagraphBubblesKey = 'reader_show_paragraph_bubbles';
   static const _showVideoButtonKey = 'reader_show_video_button';
   static const _videoChapterSyncKey = 'reader_video_chapter_sync';
+  static const _allowLandscapeKey = 'reader_allow_landscape';
 
   final double fontSize;
   final int fontWeight;
@@ -177,6 +178,12 @@ class ReaderPreferences {
   final bool showVideoButton;
   final bool videoChapterSync;
 
+  /// 阅读页允许横屏。关着时阅读页锁定竖屏（`SystemChrome` 方向锁定），
+  /// 开着则跟随系统方向，支持横屏阅读。
+  ///
+  /// 默认关：绝大多数用户在竖屏下读书，横屏会打乱分页与工具条布局。
+  final bool allowLandscape;
+
   const ReaderPreferences({
     this.fontSize = 18,
     this.fontWeight = 400,
@@ -216,6 +223,7 @@ class ReaderPreferences {
     this.showParagraphBubbles = true,
     this.showVideoButton = true,
     this.videoChapterSync = true,
+    this.allowLandscape = false,
   }) : readingInfoMode = showReadingInfo == false
            ? ReaderInfoMode.hidden
            : readingInfoMode;
@@ -266,6 +274,7 @@ class ReaderPreferences {
     bool? showParagraphBubbles,
     bool? showVideoButton,
     bool? videoChapterSync,
+    bool? allowLandscape,
   }) {
     return ReaderPreferences(
       fontSize: fontSize ?? this.fontSize,
@@ -318,6 +327,7 @@ class ReaderPreferences {
       showParagraphBubbles: showParagraphBubbles ?? this.showParagraphBubbles,
       showVideoButton: showVideoButton ?? this.showVideoButton,
       videoChapterSync: videoChapterSync ?? this.videoChapterSync,
+      allowLandscape: allowLandscape ?? this.allowLandscape,
     ).normalized();
   }
 
@@ -370,6 +380,7 @@ class ReaderPreferences {
       showParagraphBubbles: showParagraphBubbles,
       showVideoButton: showVideoButton,
       videoChapterSync: videoChapterSync,
+      allowLandscape: allowLandscape,
     );
   }
 
@@ -454,6 +465,7 @@ class ReaderPreferences {
           _boolean(preferences, _showParagraphBubblesKey) ?? true,
       showVideoButton: _boolean(preferences, _showVideoButtonKey) ?? true,
       videoChapterSync: _boolean(preferences, _videoChapterSyncKey) ?? true,
+      allowLandscape: _boolean(preferences, _allowLandscapeKey) ?? false,
     ).normalized();
   }
 
@@ -537,6 +549,7 @@ class ReaderPreferences {
       preferences.setBool(_showParagraphBubblesKey, value.showParagraphBubbles),
       preferences.setBool(_showVideoButtonKey, value.showVideoButton),
       preferences.setBool(_videoChapterSyncKey, value.videoChapterSync),
+      preferences.setBool(_allowLandscapeKey, value.allowLandscape),
     ]);
   }
 }

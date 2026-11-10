@@ -18,9 +18,12 @@
 //   full-width `GlassSettingMenu` cannot be expressed as a trailing widget.
 //   It renders exactly the upstream row shape inside the shared panel.
 
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 
 import '../services/app_style_tokens.dart';
+import '../services/notification_permission.dart';
 import '../widgets/settings/classic_settings_icons.dart';
 import '../widgets/settings/settings_widgets.dart';
 
@@ -116,6 +119,16 @@ class SettingsCategoryPage extends StatefulWidget {
 }
 
 class _SettingsCategoryPageState extends State<SettingsCategoryPage> {
+  @override
+  void initState() {
+    super.initState();
+    // 「听书」分类里有通知权限这一行：进页面时读一次真实状态，别让用户
+    // 看到过期的「已开启」。
+    if (widget.title == '听书') {
+      unawaited(NotificationPermission.instance.refresh());
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final items = widget.itemsBuilder?.call(context) ?? widget.items;

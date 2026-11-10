@@ -1,6 +1,8 @@
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'audio_mix_policy.dart';
+
 /// 听书入口默认走哪条链路。
 ///
 /// - [smart] 智能朗读：作品音频，服务端合成，音色取自 `tts_tones`；
@@ -10,6 +12,33 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 智能朗读不受它影响。
 enum ListenEngine { smart, system }
 
+/// 听书页自己的外观（与全局主题无关）。
+///
+/// 听书页的底色来自封面取色，深浅两套是同一色相的两档；全局主题改了它
+/// 也会跟着变，但用户往往只想在听书时切深浅（例如夜里听书、书城仍要
+/// 浅色），所以这里给听书页单独一档。
+enum AudioThemeMode {
+  /// 跟随全局外观（默认）。
+  system('跟随系统'),
+
+  /// 强制浅色。
+  light('浅色'),
+
+  /// 强制深色。
+  dark('深色');
+
+  const AudioThemeMode(this.label);
+
+  /// 设置项展示用文案。
+  final String label;
+
+  static AudioThemeMode fromName(String? name) => values.firstWhere(
+    (value) => value.name == name,
+    orElse: () => AudioThemeMode.system,
+  );
+}
+
+
 /// 听书相关配置与持久化偏好设置。
 class AudioPreferences {
   AudioPreferences._();
@@ -18,6 +47,12 @@ class AudioPreferences {
 
   static const _backgroundPlaybackKey = 'audio_background_playback_enabled';
   static const _rateEngineKey = 'audio_rate_engine';
+
+  /// 听书页外观的持久化键。
+  static const _themeModeKey = 'audio_theme_mode';
+
+  /// 「允许与其他应用同时播放」的持久化键。
+  static const _mixWithOthersKey = 'audio_mix_with_others';
 
   /// 听书入口的默认引擎（[ListenEngine]）。
   static const _listenEngineKey = 'audio_listen_engine';
@@ -36,6 +71,18 @@ class AudioPreferences {
   /// 开启：切到后台或锁屏时继续播放，由 Android 前台保活服务常驻通知栏与提供控制卡片；
   /// 关闭：切到后台或锁屏时自动暂停播放并移除前台通知。
   final ValueNotifier<bool> backgroundPlayback = ValueNotifier<bool>(true);
+
+  /// 听书页外观（深色 / 浅色 / 跟随系统）。
+  final ValueNotifier<AudioThemeMode> themeMode = ValueNotifier(
+    AudioThemeMode.system,
+  );
+
+  /// 是否允许听书与其他应用的音频**同时**播放（默认 false = 独占）。
+  ///
+  /// 独占时听书会打断/暂停其它 App 的音频（iOS 走 playback 类别不带
+  /// mixWithOthers；Android 走 AUDIOFOCUS_GAIN），这是听书类应用的常规
+  /// 行为。打开后改成混播：别的 App 照常出声，我们的音频叠在上面。
+  final ValueNotifier<bool> mixWithOthers = ValueNotifier<bool>(false);
 
   /// 听书入口的默认引擎，默认智能朗读。
   ///
@@ -80,9 +127,14 @@ class AudioPreferences {
       listenEngine.value = sp.getString(_listenEngineKey) == 'system'
           ? ListenEngine.system
           : ListenEngine.smart;
+      themeMode.value = AudioThemeMode.fromName(sp.getString(_themeModeKey));
+      mixWithOthers.value = sp.getBool(_mixWithOthersKey) ?? false;
     } catch (_) {
       // 异常时退回默认值（后台播放开、系统变速、未锁定、分钟档）
     }
+    // 启动时把混播策略推给原生。iOS 的音频会话在偏好加载之前就已经建好，
+    // 这里补一次下发，让它跟用户上次的选择一致（默认独占）。
+    await AudioMixPolicy.apply(mixWithOthers.value);
   }
 
   /// 重置测试状态，让下一次 [load] 重新读取 SharedPreferences。
@@ -94,6 +146,8 @@ class AudioPreferences {
     rateLocked = false;
     sleepAtChapterEnd = false;
     listenEngine.value = ListenEngine.smart;
+    themeMode.value = AudioThemeMode.system;
+    mixWithOthers.value = false;
     _skipIntro.clear();
     _skipOutro.clear();
     _skipLoaded.clear();
@@ -166,6 +220,35 @@ class AudioPreferences {
     try {
       final sp = await SharedPreferences.getInstance();
       await sp.setBool(_backgroundPlaybackKey, value);
+    } catch (_) {
+      // 忽略持久化失败
+    }
+  }
+
+  /// 听书页外观。改完立刻落盘，下次进入听书页仍是同一档。
+  Future<void> setThemeMode(AudioThemeMode mode) async {
+    themeMode.value = mode;
+    try {
+      final sp = await SharedPreferences.getInstance();
+      await sp.setString(_themeModeKey, mode.name);
+    } catch (_) {
+      // 忽略持久化失败
+    }
+  }
+
+  /// 「允许与其他应用同时播放」。改完立刻生效并落盘。
+  ///
+  /// 策略要推给原生（iOS 的音频会话类别 / Android 的音频焦点），所以这里
+  /// 除了存盘还调 [AudioMixPolicy.apply]。
+  ///
+  /// [reactivate] 只在正在出声时传 true：iOS 改了会话类别要重新激活才生效，
+  /// 暂停时重新激活会白白打断别的 App。
+  Future<void> setMixWithOthers(bool value, {bool reactivate = false}) async {
+    mixWithOthers.value = value;
+    await AudioMixPolicy.apply(value, reactivate: reactivate);
+    try {
+      final sp = await SharedPreferences.getInstance();
+      await sp.setBool(_mixWithOthersKey, value);
     } catch (_) {
       // 忽略持久化失败
     }

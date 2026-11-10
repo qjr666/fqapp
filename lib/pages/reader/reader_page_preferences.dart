@@ -99,6 +99,49 @@ extension _ReaderPagePreferences on _ReaderPageState {
     );
   }
 
+  /// 按「允许横屏」偏好同步阅读页的方向锁定。
+  ///
+  /// `SystemChrome.setPreferredOrientations` 是**引擎级**的设置，不随路由
+  /// 释放：这里锁成竖屏后离开阅读器必须还原，否则后面的页面（听书页等）
+  /// 会被一起锁死。还原用空列表，表示交回系统 / Info.plist 决定的方向。
+  ///
+  /// 只在阅读页内锁：竖屏阅读是默认行为，横屏属于可选放宽。开了横屏也只
+  /// 允许横屏，不允许倒竖屏（倒竖屏在阅读里没有任何可用性）。
+  void _syncOrientationLock() {
+    if (!_preferencesReady) return;
+    final allowLandscape = _preferences.allowLandscape;
+    // 已经持有锁且目标没变：不重复下发，避免无谓的引擎往返。
+    if (_orientationLocked && _orientationAllowLandscape == allowLandscape) {
+      return;
+    }
+    _orientationLocked = true;
+    _orientationAllowLandscape = allowLandscape;
+    final orientations = allowLandscape
+        ? const <DeviceOrientation>[
+            DeviceOrientation.portraitUp,
+            DeviceOrientation.landscapeLeft,
+            DeviceOrientation.landscapeRight,
+          ]
+        : const <DeviceOrientation>[DeviceOrientation.portraitUp];
+    unawaited(_applyOrientation(orientations));
+  }
+
+  /// 交还方向控制权：离开阅读器，或被别的路由盖住时调用。
+  void _releaseOrientationLock() {
+    if (!_orientationLocked) return;
+    _orientationLocked = false;
+    unawaited(_applyOrientation(const <DeviceOrientation>[]));
+  }
+
+  /// 下发方向锁定。平台不支持时静默忽略（阅读器不能因此不可用）。
+  Future<void> _applyOrientation(List<DeviceOrientation> orientations) async {
+    try {
+      await SystemChrome.setPreferredOrientations(orientations);
+    } catch (_) {
+      // 部分平台 / 桌面端不支持方向锁定，忽略。
+    }
+  }
+
   Future<void> _loadPreferences() async {
     ReaderPreferences preferences;
     try {
@@ -117,6 +160,7 @@ extension _ReaderPagePreferences on _ReaderPageState {
     if (_controlsVisible) _loadReaderMenuData();
     _syncSystemBars();
     _syncVolumeKeyEnabled();
+    _syncOrientationLock();
     await _loadFont(preferences.fontPath);
     if (mounted && _appActive) unawaited(_refreshDevice());
   }
@@ -298,6 +342,8 @@ extension _ReaderPagePreferences on _ReaderPageState {
     });
     _syncSystemBars();
     _syncVolumeKeyEnabled();
+    // 「允许横屏」改了要立刻生效，不用等退出设置页。
+    _syncOrientationLock();
     unawaited(_device.keepScreenOn(_preferences.keepScreenOn));
     if (fontChanged) unawaited(_loadFont(preferences.fontPath));
     if (_controlsVisible) unawaited(_loadVideoMatch());

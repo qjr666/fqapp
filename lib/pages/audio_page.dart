@@ -32,8 +32,10 @@ import '../services/library_store.dart';
 import '../services/listening_session.dart';
 import '../services/media_history_store.dart';
 import '../services/native_player.dart';
+import '../services/notification_permission.dart';
 import '../services/playback_format.dart';
 import '../services/reader_preferences.dart';
+import '../services/reader_route_registry.dart';
 import '../services/shelf_store.dart';
 import '../services/transient_retry.dart';
 import '../services/system_tts.dart';
@@ -250,8 +252,16 @@ class _AudioPageState extends State<AudioPage> {
   bool _transcriptExpanded = false;
   int _expandedChapterIndex = -1;
 
+  /// 通知权限只查一次：进入听书页时读一次状态，够面板显示即可。
+  bool _notificationPermissionChecked = false;
+
   /// 「边听边读」打开原著阅读页的闸：目录请求期间重复点击不叠加路由。
   bool _openingReadAlong = false;
+
+  /// 听书页的外观覆盖（深色 / 浅色）。null 表示跟随全局外观。
+  ///
+  /// 弹层是独立路由，拿不到页面上的 [Theme] 覆盖，开面板时显式传进去。
+  ThemeData? _themeOverride;
 
   /// 展开态正文字号/行距来自阅读器排版设置；加载完成前用兜底 20sp / 2.1。
   ReaderPreferences _readerPreferences = const ReaderPreferences();
@@ -299,6 +309,10 @@ class _AudioPageState extends State<AudioPage> {
       unawaited(_attach());
     }
     _syncCoverTheme();
+    if (!_notificationPermissionChecked) {
+      _notificationPermissionChecked = true;
+      unawaited(NotificationPermission.instance.refresh());
+    }
   }
 
   Future<void> _attach() async {
@@ -473,6 +487,7 @@ class _AudioPageState extends State<AudioPage> {
     await showHomeSheet<void>(
       context: context,
       title: '播放速度',
+      theme: _themeOverride,
       children: [
         StatefulBuilder(
           builder: (context, setSheetState) {
@@ -636,6 +651,7 @@ class _AudioPageState extends State<AudioPage> {
     final selected = await showHomeSheet<int>(
       context: context,
       title: '目录 · ${c._chapters.length} $unit',
+      theme: _themeOverride,
       // 整宽列表：左右留白由列表项自己给，弹层只留上下。
       contentPadding: const EdgeInsets.fromLTRB(0, 4, 0, 16),
       children: [
@@ -654,6 +670,44 @@ class _AudioPageState extends State<AudioPage> {
 
   @override
   Widget build(BuildContext context) {
+    return ValueListenableBuilder<AudioThemeMode>(
+      valueListenable: AudioPreferences.instance.themeMode,
+      builder: (context, mode, _) {
+        final override = _listenThemeOverride(context, mode);
+        // 存一份给弹层用：弹层是独立路由，拿不到这里的 Theme 覆盖。
+        _themeOverride = override;
+        if (override == null) return _buildListeningPage(context);
+        // 覆盖 Theme 后，子树里 `HomePalette.of(context)` 读到的 brightness
+        // 就是听书页自己的深浅档，页内所有配色（正文、卡片、弹层）一起变。
+        return Theme(
+          data: override,
+          child: Builder(builder: _buildListeningPage),
+        );
+      },
+    );
+  }
+
+  /// 听书页自己的外观覆盖（深色 / 浅色）。
+  ///
+  /// 返回 null 表示跟随全局外观，不做任何覆盖。墨水屏恒为纯黑白，忽略
+  /// 这里的深浅选择（否则墨水屏上会出现深色画布，与该模式的初衷相反）。
+  ThemeData? _listenThemeOverride(BuildContext context, AudioThemeMode mode) {
+    if (mode == AudioThemeMode.system || einkModeNotifier.value) return null;
+    final brightness = mode == AudioThemeMode.dark
+        ? Brightness.dark
+        : Brightness.light;
+    if (Theme.of(context).brightness == brightness) return null;
+    return AppTheme.createTheme(
+      brightness,
+      // OLED 纯黑只在深色下成立（createTheme 内部会再判一次）。
+      // 用 oledActive() 而不是裸开关：HomePalette.of 也按它取 OLED，
+      // 两边必须同源，否则画布纯黑而卡片还是普通深色。
+      oledMode: oledActive(),
+      style: HomePalette.of(context).style,
+    );
+  }
+
+  Widget _buildListeningPage(BuildContext context) {
     if (_session == null) {
       return Scaffold(
         appBar: AppBar(title: const Text('听书')),
@@ -1023,6 +1077,17 @@ class _AudioPageState extends State<AudioPage> {
         _showReadAlongUnavailable('找不到对应的原著章节');
         return;
       }
+      // 导航栈里已经有这本书的阅读页时，回到**那一份**并同步到听书的进度，
+      // 而不是再 push 一份新的：两份阅读页实例会让进度、高亮与跟随各走各的，
+      // 用户看到的就是「打开了一个新页面」。
+      final navigator = Navigator.of(context);
+      final reader = ReaderRouteRegistry.instance.find(bookId);
+      if (reader != null && identical(reader.navigator, navigator)) {
+        await reader.jumpToChapter(chapterId);
+        if (!mounted) return;
+        navigator.popUntil((route) => identical(route, reader.route));
+        return;
+      }
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
           builder: (_) => ReaderPage(
@@ -1331,6 +1396,7 @@ class _AudioPageState extends State<AudioPage> {
     final picked = await showHomeSheet<SleepTimerChoice>(
       context: context,
       title: '定时关闭',
+      theme: _themeOverride,
       children: [
         Builder(
           builder: (sheetContext) {
@@ -1378,11 +1444,81 @@ class _AudioPageState extends State<AudioPage> {
     );
   }
 
+  /// 页内轻提示。听书页没有阅读器那套 _showMessage，用同一个 SnackBar 口径。
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// 引导用户开启通知权限。
+  ///
+  /// 先弹系统授权框；已经被拒过一次（系统不会再弹）就带去系统的「通知」设置页。
+  /// 后台保活靠的是前台服务的常驻通知卡片，没有它厂商系统更容易冻结进程。
+  Future<void> _ensureNotificationPermission() async {
+    final state = await NotificationPermission.instance.request();
+    if (!mounted) return;
+    if (state == NotificationPermissionState.granted) {
+      _toast('通知已开启，后台听书会有常驻控制卡片');
+      return;
+    }
+    final opened = await NotificationPermission.instance.openSettings();
+    if (!mounted) return;
+    _toast(
+      opened
+          ? '请在系统设置里允许本应用发送通知'
+          : '无法打开系统设置，请手动开启本应用的通知权限',
+    );
+  }
+
+  /// 听书页的深浅主题：跟随系统 / 浅色 / 深色。
+  ///
+  /// 墨水屏恒为纯黑白，选深浅没有意义，这里直接提示而不给出选项。
+  Future<void> _showThemeModePicker() async {
+    if (einkModeNotifier.value) {
+      _toast('墨水屏模式下听书页恒为纯黑白，暂不支持深浅切换');
+      return;
+    }
+    final current = AudioPreferences.instance.themeMode.value;
+    final picked = await showHomeSheet<AudioThemeMode>(
+      context: context,
+      title: '深浅主题',
+      theme: _themeOverride,
+      children: [
+        Builder(
+          builder: (sheetContext) {
+            final palette = HomePalette.of(sheetContext);
+            Widget tile(AudioThemeMode mode) => ListTile(
+              title: Text(mode.label),
+              trailing: mode == current
+                  ? Icon(LucideIcons.check, color: palette.accentText)
+                  : null,
+              onTap: () => Navigator.pop(sheetContext, mode),
+            );
+
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (final mode in AudioThemeMode.values) tile(mode),
+              ],
+            );
+          },
+        ),
+      ],
+    );
+    if (!mounted || picked == null) return;
+    await AudioPreferences.instance.setThemeMode(picked);
+    if (!mounted) return;
+    _toast('听书页主题：${picked.label}');
+  }
+
   Future<void> _showMore() async {
     c._publishMoreState();
     await showHomeSheet<void>(
       context: context,
       title: '播放设置',
+      theme: _themeOverride,
       contentPadding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
       children: [
         Builder(
@@ -1559,6 +1695,59 @@ class _AudioPageState extends State<AudioPage> {
                         indent: 68,
                         color: palette.line.withValues(alpha: 0.5),
                       ),
+                      ValueListenableBuilder<AudioThemeMode>(
+                        valueListenable: AudioPreferences.instance.themeMode,
+                        builder: (context, mode, _) => ListTile(
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 2,
+                          ),
+                          leading: Container(
+                            width: 38,
+                            height: 38,
+                            decoration: BoxDecoration(
+                              color: const Color(
+                                0xFF6366F1,
+                              ).withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: const Icon(
+                              LucideIcons.moon,
+                              size: 20,
+                              color: Color(0xFF6366F1),
+                            ),
+                          ),
+                          title: Text(
+                            '深浅主题',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 15,
+                              color: palette.ink,
+                            ),
+                          ),
+                          subtitle: Text(
+                            '当前：${mode.label}',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              color: palette.muted,
+                            ),
+                          ),
+                          trailing: Icon(
+                            LucideIcons.chevron_right,
+                            size: 18,
+                            color: palette.muted,
+                          ),
+                          onTap: () {
+                            Navigator.pop(context);
+                            unawaited(_showThemeModePicker());
+                          },
+                        ),
+                      ),
+                      Divider(
+                        height: 1,
+                        indent: 68,
+                        color: palette.line.withValues(alpha: 0.5),
+                      ),
                       ValueListenableBuilder<bool>(
                         valueListenable:
                             AudioPreferences.instance.backgroundPlayback,
@@ -1617,6 +1806,140 @@ class _AudioPageState extends State<AudioPage> {
                             );
                           },
                         ),
+                      ),
+                      Divider(
+                        height: 1,
+                        indent: 68,
+                        color: palette.line.withValues(alpha: 0.5),
+                      ),
+                      ValueListenableBuilder<bool>(
+                        valueListenable: AudioPreferences.instance.mixWithOthers,
+                        builder: (context, mixEnabled, _) => ListTile(
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 2,
+                          ),
+                          leading: Container(
+                            width: 38,
+                            height: 38,
+                            decoration: BoxDecoration(
+                              color: const Color(
+                                0xFF0EA5E9,
+                              ).withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: const Icon(
+                              LucideIcons.audio_lines,
+                              size: 20,
+                              color: Color(0xFF0EA5E9),
+                            ),
+                          ),
+                          title: Text(
+                            '允许与其他应用同时播放',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 15,
+                              color: palette.ink,
+                            ),
+                          ),
+                          subtitle: Text(
+                            mixEnabled
+                                ? '听书与其它 App 的声音叠加播放'
+                                : '独占音频：听书时其它 App 自动暂停',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              color: palette.muted,
+                            ),
+                          ),
+                          trailing: Switch(
+                            key: const ValueKey('audio-mix-with-others'),
+                            value: mixEnabled,
+                            onChanged: (enabled) {
+                              unawaited(
+                                AudioPreferences.instance.setMixWithOthers(
+                                  enabled,
+                                  // 正在出声时才让 iOS 立刻重新激活会话：
+                                  // 暂停时重新激活会白白打断别的 App。
+                                  reactivate: _session != null && c._wantPlay,
+                                ),
+                              );
+                            },
+                          ),
+                          onTap: () {
+                            final next = !mixEnabled;
+                            unawaited(
+                              AudioPreferences.instance.setMixWithOthers(
+                                next,
+                                reactivate: _session != null && c._wantPlay,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                      Divider(
+                        height: 1,
+                        indent: 68,
+                        color: palette.line.withValues(alpha: 0.5),
+                      ),
+                      ValueListenableBuilder<NotificationPermissionState>(
+                        valueListenable: NotificationPermission.instance.state,
+                        builder: (context, permState, _) {
+                          // unknown = 这个平台没有通知权限这回事（iOS / 桌面）。
+                          if (permState == NotificationPermissionState.unknown) {
+                            return const SizedBox.shrink();
+                          }
+                          final blocked =
+                              permState == NotificationPermissionState.denied;
+                          return ListTile(
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 2,
+                            ),
+                            leading: Container(
+                              width: 38,
+                              height: 38,
+                              decoration: BoxDecoration(
+                                color: const Color(
+                                  0xFFF59E0B,
+                                ).withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: const Icon(
+                                LucideIcons.bell,
+                                size: 20,
+                                color: Color(0xFFF59E0B),
+                              ),
+                            ),
+                            title: Text(
+                              '通知权限',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w600,
+                                fontSize: 15,
+                                color: palette.ink,
+                              ),
+                            ),
+                            subtitle: Text(
+                              blocked
+                                  ? '未开启：后台听书容易被系统冻结，点了去开启'
+                                  : '已开启：后台听书有常驻控制卡片',
+                              style: TextStyle(
+                                fontSize: 12.5,
+                                color: palette.muted,
+                              ),
+                            ),
+                            trailing: Icon(
+                              blocked
+                                  ? LucideIcons.chevron_right
+                                  : LucideIcons.check,
+                              size: 18,
+                              color: palette.muted,
+                            ),
+                            onTap: () {
+                              if (!blocked) return;
+                              unawaited(_ensureNotificationPermission());
+                            },
+                          );
+                        },
                       ),
                     ],
                   ),
