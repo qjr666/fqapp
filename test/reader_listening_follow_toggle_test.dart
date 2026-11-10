@@ -20,6 +20,9 @@ import 'support/reader_settings_nav.dart';
 /// - 关掉 → 跟随不许再被任何路径打开（原先 15 秒闩锁到期会把跟随接回来）；
 /// - 打开 → 跟随必须**真的启动**（原先只会改一个字段，会话闩锁还是 false，
 ///   页面照旧不跟随，看着就是开关无效）。
+///
+/// 正文上挂着双击识别器：单击要等双击超时（约 300ms）才生效，所以每次点按
+/// 之后都得显式推进 400ms，`pumpAndSettle` 不会替我们推进这段时间。
 void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
@@ -27,6 +30,10 @@ void main() {
     TestWidgetsFlutterBinding.instance.handleAppLifecycleStateChanged(
       AppLifecycleState.resumed,
     );
+  });
+
+  tearDown(() {
+    ListeningSession.instance.clear();
   });
 
   testWidgets('the follow switch arms and disarms the listening follow', (
@@ -38,6 +45,7 @@ void main() {
     // 起播即跟随。
     expect(ListeningSession.instance.followArmed, isTrue);
 
+    await _openListeningSettings(tester);
     await _setFollowSwitch(tester, on: false);
     expect(
       ListeningSession.instance.followArmed,
@@ -61,9 +69,9 @@ void main() {
     await tester.pumpAndSettle();
 
     // 用户手动翻页 → 接管跟随：会话闩锁被清掉。
-    final surface = find.byKey(const ValueKey('reader-page-surface'));
-    final rect = tester.getRect(surface);
-    await tester.tapAt(Offset(rect.right - 16, rect.center.dy));
+    final rect = tester.getRect(_surface);
+    await tester.tapAt(Offset(rect.left + rect.width * .9, rect.center.dy));
+    await tester.pump(const Duration(milliseconds: 400));
     await tester.pumpAndSettle();
     expect(
       ListeningSession.instance.followArmed,
@@ -73,6 +81,7 @@ void main() {
 
     // 这正是「开关无效」的现场：会话闩锁是 false，只放开偏好并不会让跟随
     // 回来。开关必须把它重新 arm 起来。
+    await _openListeningSettings(tester);
     await _setFollowSwitch(tester, on: true);
     expect(
       ListeningSession.instance.followArmed,
@@ -85,6 +94,7 @@ void main() {
     tester,
   ) async {
     await _mountReader(tester);
+    await _openListeningSettings(tester);
     await _setFollowSwitch(tester, on: false);
     await closeReaderSettingsSheet(tester);
     await tester.pumpAndSettle();
@@ -92,6 +102,8 @@ void main() {
     expect(stored.listeningFollow, isFalse);
   });
 }
+
+final _surface = find.byKey(const ValueKey('reader-page-surface'));
 
 /// 多页正文：右侧点按才真的换页而不是换章。
 final String _multiPageChapter = List.generate(
@@ -112,25 +124,52 @@ void _startSession() {
   );
 }
 
-/// 打开阅读设置 → 听书分类 → 拨动「跟随翻页」开关。
-Future<void> _setFollowSwitch(WidgetTester tester, {required bool on}) async {
-  // 打开阅读菜单（点正文中心）。
-  await tester.tapAt(
-    tester.getRect(find.byKey(const ValueKey('reader-page-surface'))).center,
-  );
-  await tester.pumpAndSettle();
-  await tester.tap(find.byKey(const ValueKey('reader-settings')));
+/// 打开阅读菜单 → 设置面板 → 「听书」分类。
+///
+/// 菜单入口可能已经开着（正文中心点按是**切换**），所以先看它能不能被点到，
+/// 点不到才去点正文中心。开一次就够：面板开着的时候再点正文会打在遮罩上。
+Future<void> _openListeningSettings(WidgetTester tester) async {
+  final entry = find.byKey(const ValueKey('reader-settings'));
+  for (var attempt = 0; attempt < 3; attempt++) {
+    if (entry.hitTestable().evaluate().isNotEmpty) break;
+    await tester.tapAt(tester.getRect(_surface).center);
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pumpAndSettle();
+  }
+  expect(entry.hitTestable(), findsOneWidget, reason: '阅读菜单里应有设置入口');
+  await tester.ensureVisible(entry.hitTestable());
+  await tester.tap(entry.hitTestable());
   await tester.pumpAndSettle();
   await openReaderSettingsCategory(tester, 'listening');
+}
 
-  final row = find
+/// 「跟随翻页」那一行里的开关。
+///
+/// 不能直接取「包含『跟随翻页』的第一个 Row」：面板里外层还有若干 Row，
+/// 先取第一个会拿到整个面板的外壳，里面的开关就变成多个了。这里从最里面
+/// 往外找第一个带开关的行。
+Finder _followSwitch() {
+  final rows = find
       .ancestor(of: find.text('跟随翻页'), matching: find.byType(Row))
-      .first;
-  final toggle = find.descendant(
-    of: row,
-    matching: find.byType(AppGlassSwitch),
-  );
+      .evaluate()
+      .toList()
+      .reversed;
+  for (final element in rows) {
+    final candidates = find.descendant(
+      of: find.byWidget(element.widget),
+      matching: find.byType(AppGlassSwitch),
+    );
+    if (candidates.evaluate().isNotEmpty) return candidates.first;
+  }
+  return find.byType(AppGlassSwitch);
+}
+
+/// 拨动「跟随翻页」开关（前提：「听书」分类已经打开）。
+Future<void> _setFollowSwitch(WidgetTester tester, {required bool on}) async {
+  final toggle = _followSwitch();
+  expect(toggle, findsOneWidget, reason: '「听书」分类里应有跟随翻页开关');
   await tester.ensureVisible(toggle);
+  await tester.pumpAndSettle();
   final current = tester.widget<AppGlassSwitch>(toggle).value;
   if (current != on) {
     await tester.tap(toggle);
@@ -146,10 +185,8 @@ Future<void> _setFollowSwitch(WidgetTester tester, {required bool on}) async {
 }
 
 Future<void> _mountReader(WidgetTester tester) async {
-  tester.view.physicalSize = const Size(390, 844);
-  tester.view.devicePixelRatio = 1;
-  addTearDown(tester.view.resetPhysicalSize);
-  addTearDown(tester.view.resetDevicePixelRatio);
+  await tester.binding.setSurfaceSize(const Size(320, 480));
+  addTearDown(() => tester.binding.setSurfaceSize(null));
   await tester.pumpWidget(
     MaterialApp(
       home: ReaderPage(
@@ -196,4 +233,11 @@ class _Device extends ReaderDevice {
     required bool followSystem,
     required double brightness,
   }) async => true;
+
+  // 平台通道在测试里没有实现，基类的 close/suspend 会去调通道。
+  @override
+  Future<void> suspend() async {}
+
+  @override
+  Future<void> close() async {}
 }
