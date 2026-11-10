@@ -411,6 +411,10 @@ void main() {
             'classic_bookshelf_layout': layout.index,
             'reader_page_mode': 'scroll',
           });
+          // 「书架点书先看详情页」默认开着，这条用例验的是「点一次就复用已
+          // 缓存的续读路由」，所以要先把那条关掉，否则点书会停在详情页。
+          BookOpenPreferences.instance.resetForTest();
+          await BookOpenPreferences.instance.setOpenDetailFirst(false);
           final saved = <String, dynamic>{
             'id': '123',
             'kind': 'book',

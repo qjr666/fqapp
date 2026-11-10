@@ -243,6 +243,9 @@ void main() {
     testWidgets('书架点击封面会把后台新目录交给阅读器', (tester) async {
       addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
       BookOpenPreferences.instance.resetForTest();
+      // 这条用例验的是「点封面直接进阅读器，阅读器再拿到后台新目录」，
+      // 所以要先把「书架点书先看详情页」关掉，否则点书会停在详情页。
+      await BookOpenPreferences.instance.setOpenDetailFirst(false);
       await _seedShelf(tester);
       final cache = MemoryChapterCache();
       await cache.saveBook(

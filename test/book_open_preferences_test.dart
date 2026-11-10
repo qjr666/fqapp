@@ -87,6 +87,9 @@ void main() {
   test('the legacy switch set to on keeps both entries on', () async {
     SharedPreferences.setMockInitialValues({
       BookOpenPreferences.legacyKey: true,
+      // 「点书先看详情页」默认开着，会盖掉书架那条的直达行为。这条用例验的
+      // 是 legacy 开关本身的迁移，所以显式把它关掉。
+      BookOpenPreferences.detailFirstKey: false,
     });
     await prefs.load();
     expect(prefs.directReaderFor(BookOpenEntry.shelf), isTrue);
@@ -97,6 +100,7 @@ void main() {
     SharedPreferences.setMockInitialValues({
       BookOpenPreferences.legacyKey: false,
       BookOpenPreferences.discoverKey: true,
+      BookOpenPreferences.detailFirstKey: false,
     });
     await prefs.load();
     // 书架那条没显式写过，沿用旧值；发现入口那条显式写过，以它为准。

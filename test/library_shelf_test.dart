@@ -1299,4 +1299,11 @@ class _ScanCache extends ChapterCacheStore {
 
   @override
   Future<List<CachedBookSummary>> books() => scan();
+
+  /// 更新检测（`_checkUpdates`）问的是「这本书存了几个章节」，走的是另一条
+  /// 接口。没覆写它就会落到真身上：真身要打开加密的 Hive box，于是测试会
+  /// 去摸 secure storage —— CI 的 Linux runner 上没有可用的后端，那条路要
+  /// 等到超时才结束，整组用例因此挂住十分钟。
+  @override
+  Future<CachedBook?> savedCatalogue(String bookId) async => null;
 }
