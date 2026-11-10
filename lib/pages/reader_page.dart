@@ -240,9 +240,15 @@ class _ReaderPageState extends State<ReaderPage>
   }
 
   /// 10Hz 跟随轮询，只在有本书的听书会话且前台时运行。见 [_followPollTick]。
+  ///
+  /// 「跟随翻页」总闸关掉时不跑：省掉每 100ms 一次的无效寻址，也让
+  /// [_resumeListenFollowIfTakenOver] 不会在用户关掉跟随后偷偷接回。
   late final ReaderFollowPoll _followPoll = ReaderFollowPoll(
     _followPollTick,
-    () => _appActive && ListeningSession.instance.matchesBook(widget.bookId),
+    () =>
+        _appActive &&
+        _preferences.listeningFollow &&
+        ListeningSession.instance.matchesBook(widget.bookId),
   );
 
   /// 字幕与正文之间的噪声字符：各类标点和空白。两边在全/半角、省略号写法
@@ -296,7 +302,10 @@ class _ReaderPageState extends State<ReaderPage>
       // 于是永远不 arm —— 恢复播放后跟随依然是死的。
       if (_listenFollowTakeover) {
         _listenFollowTakeover = false;
-        ListeningSession.instance.setFollowArmed(true);
+        // 「跟随翻页」是总闸：用户关着就不许恢复跟随。
+        if (_preferences.listeningFollow) {
+          ListeningSession.instance.setFollowArmed(true);
+        }
       }
     }
     _followPoll.sync();
@@ -474,7 +483,7 @@ class _ReaderPageState extends State<ReaderPage>
         // 这里清掉并把跟随重新打开，回到本页后轮询会自己寻址到正在读的那句。
         _listenFollowPausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
         _listenFollowTakeover = false;
-        ListeningSession.instance.setFollowArmed(true);
+        _rearmListenFollow();
         _addressToPlayback(quiet: true);
       },
     );
@@ -488,8 +497,9 @@ class _ReaderPageState extends State<ReaderPage>
     // 也要把跟随重新打开：用户按了「跳到播放位置」显然是想继续跟着听，
     // 但这里原来只清了 15 秒闩锁，`followArmed` 仍是 false —— 页面跳过去了，
     // 跟随却还是关着的。
+    // 「跟随翻页」总闸关着时只跳位置，不重新打开跟随。
     _listenFollowTakeover = false;
-    ListeningSession.instance.setFollowArmed(true);
+    _rearmListenFollow();
     _addressToPlayback();
   }
 

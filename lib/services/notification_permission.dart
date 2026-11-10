@@ -10,6 +10,12 @@ enum NotificationPermissionState {
   /// 被拒绝，或从未申请过。
   denied,
 
+  /// 系统**还没问过**用户（iOS 的 UNUserNotificationCenter.notDetermined）。
+  ///
+  /// 与 [denied] 分开是因为两者的下一步不同：没问过还能弹系统授权框，
+  /// 问过且被拒就只能引导去系统设置。
+  notDetermined,
+
   /// 拿不到状态（平台不支持、通道不可用）。
   unknown,
 }
@@ -49,6 +55,17 @@ class NotificationPermission {
     return next;
   }
 
+  /// 只在「系统还没问过用户」时弹系统授权框。
+  ///
+  /// 用户拒绝过一次之后系统不会再弹（iOS 的 UNUserNotificationCenter、
+  /// Android 13+ 的 POST_NOTIFICATIONS 都如此），这时只能引导去系统设置。
+  /// 所以先读状态，只在 [NotificationPermissionState.notDetermined] 时才申请。
+  Future<NotificationPermissionState> requestIfUndetermined() async {
+    final current = await refresh();
+    if (current != NotificationPermissionState.notDetermined) return current;
+    return request();
+  }
+
   /// 跳到系统的「通知」设置页：权限被拒后唯一还能开的入口。
   Future<bool> openSettings() async {
     try {
@@ -77,6 +94,8 @@ class NotificationPermission {
         return NotificationPermissionState.granted;
       case 'denied':
         return NotificationPermissionState.denied;
+      case 'notDetermined':
+        return NotificationPermissionState.notDetermined;
       default:
         return NotificationPermissionState.unknown;
     }

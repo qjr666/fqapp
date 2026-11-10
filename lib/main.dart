@@ -40,6 +40,7 @@ import 'services/drama_download_store.dart';
 import 'services/drama_downloader.dart';
 import 'services/fair_memory.dart';
 import 'services/connectivity_status.dart';
+import 'services/notification_permission.dart';
 import 'services/home_feed_cache.dart';
 import 'services/library_store.dart';
 import 'services/rank_cache.dart';
@@ -84,6 +85,15 @@ Future<void> _prepareRuntime() async {
   // 否则 native_player 与 system_tts 会去找不存在的 Swift 插件并抛
   // MissingPluginException。装配失败由 main() 的 try/catch 兜住，不挡界面。
   if (isIOSPlatform) await IosPlatform.instance.initialize();
+  // iOS 的通知（通知栏）权限必须由应用**主动**申请：UNUserNotificationCenter
+  // 不会自己弹框，从不询问的话通知栏里永远不会有本应用的通知。冷启动申请
+  // 一次（系统只在「还没问过用户」时才给弹框），问过就不打扰。
+  //
+  // Android 不在这里申请：POST_NOTIFICATIONS 是在起播时顺带弹的
+  // （见 NativePlayerPlugin），启动时就弹权限框太打扰。
+  if (isIOSPlatform) {
+    unawaited(NotificationPermission.instance.requestIfUndetermined());
+  }
   // 应用内日志：接管 debugPrint 与 FlutterError.onError，未处理异步异常由
   // [main] 的 runZonedGuarded 捕获；文件持久化异步开启，失败只退回内存模式。
   AppLog.instance.install();

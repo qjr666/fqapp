@@ -331,6 +331,11 @@ extension _ReaderPagePreferences on _ReaderPageState {
         preferences.einkRefreshInterval != _preferences.einkRefreshInterval;
     final joinChanged =
         preferences.scrollChapterMode != _preferences.scrollChapterMode;
+    // 「跟随翻页」总闸变了：要真的把跟随打开/关掉，不能只改一个字段 ——
+    // 会话级的 followArmed 闩锁与 15 秒闩锁都得一起收，否则开关看着变了，
+    // 页面照旧不跟随（或者明明关了却又被接回）。
+    final followChanged =
+        preferences.listeningFollow != _preferences.listeningFollow;
     _setState(() {
       if (joinChanged) _chapterLayout = null;
       _preferences = preferences.normalized();
@@ -340,6 +345,9 @@ extension _ReaderPagePreferences on _ReaderPageState {
       // 刷新间隔改变时清零计数，避免沿用旧阈值导致久不刷新或立刻刷新。
       if (intervalChanged) _einkPageCounter = 0;
     });
+    if (followChanged) {
+      _applyListeningFollowToggle(_preferences.listeningFollow);
+    }
     _syncSystemBars();
     _syncVolumeKeyEnabled();
     // 「允许横屏」改了要立刻生效，不用等退出设置页。

@@ -1,6 +1,7 @@
 import Flutter
 import UIKit
 import UniformTypeIdentifiers
+import UserNotifications
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
@@ -15,6 +16,7 @@ import UniformTypeIdentifiers
   private let shareChannel = ShareChannel()
   private let libraryBackupChannel = LibraryBackupChannel()
   private let readerDeviceChannel = ReaderDeviceChannel()
+  private let notificationPermissionChannel = NotificationPermissionChannel()
 
   override func application(
     _ application: UIApplication,
@@ -39,6 +41,7 @@ import UniformTypeIdentifiers
     shareChannel.register(messenger: messenger)
     libraryBackupChannel.register(messenger: messenger)
     readerDeviceChannel.register(messenger: messenger)
+    notificationPermissionChannel.register(messenger: messenger)
   }
 }
 
@@ -644,5 +647,102 @@ final class ReaderDeviceChannel: NSObject, UIDocumentPickerDelegate {
     let result = pendingResult
     pendingResult = nil
     result?(value)
+  }
+}
+
+/// `fqapp/ios_notification`：通知（通知栏）权限。
+///
+/// Android 的 POST_NOTIFICATIONS 是运行时权限，iOS 这边对应
+/// `UNUserNotificationCenter`：应用必须**主动**调
+/// `requestAuthorization` 才会弹系统授权框，从不询问的话用户永远看不到通知，
+/// 而且通知栏里也不会出现任何本应用的通知。
+///
+/// 三个方法与 Android 端 `NativePlayerPlugin` 的同名方法一一对应，Dart 侧的
+/// `NotificationPermission` 服务因此在两个平台上走同一套契约：
+/// - `status`：granted / denied / notDetermined / unknown
+/// - `request`：只在系统**还没问过**（notDetermined）时才弹框；已经问过
+///   （用户点过允许或拒绝）就直接回当前状态 —— 系统对这两种情况都不会再弹框，
+///   反复调用只会白等一次回调。
+/// - `openSettings`：跳到本应用的系统设置页，用户在那里可以打开通知。
+final class NotificationPermissionChannel {
+  private var channel: FlutterMethodChannel?
+
+  func register(messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(
+      name: "fqapp/ios_notification",
+      binaryMessenger: messenger
+    )
+    self.channel = channel
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self else {
+        result(FlutterError(code: "no_channel", message: "通道已释放", details: nil))
+        return
+      }
+      self.handle(call, result)
+    }
+  }
+
+  /// 授权状态 → Dart 侧认识的字符串。
+  ///
+  /// `.provisional`（静默 provisional 授权）与 `.ephemeral`（App Clip）都能收到
+  /// 通知，按已授权处理。
+  private func statusString(_ status: UNAuthorizationStatus) -> String {
+    switch status {
+    case .authorized, .provisional, .ephemeral:
+      return "granted"
+    case .denied:
+      return "denied"
+    case .notDetermined:
+      return "notDetermined"
+    @unknown default:
+      return "unknown"
+    }
+  }
+
+  private func currentStatus(_ completion: @escaping (String) -> Void) {
+    UNUserNotificationCenter.current().getNotificationSettings { settings in
+      completion(self.statusString(settings.authorizationStatus))
+    }
+  }
+
+  private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+    switch call.method {
+    case "status":
+      currentStatus { status in
+        DispatchQueue.main.async { result(status) }
+      }
+    case "request":
+      currentStatus { status in
+        guard status == "notDetermined" else {
+          // 已经问过：系统不会再弹框，直接回当前状态。
+          DispatchQueue.main.async { result(status) }
+          return
+        }
+        UNUserNotificationCenter.current().requestAuthorization(
+          options: [.alert, .sound, .badge]
+        ) { _, error in
+          if let error = error {
+            NSLog("[fqapp] notification authorization failed: \(error)")
+          }
+          self.currentStatus { next in
+            DispatchQueue.main.async { result(next) }
+          }
+        }
+      }
+    case "openSettings":
+      // iOS 没有「通知」设置的深链，只能进本应用的设置页（里面第一项就是
+      // 「通知」）。系统设置页打不开时回 false，让界面给出手动引导。
+      guard let url = URL(string: UIApplication.openSettingsURLString) else {
+        result(false)
+        return
+      }
+      DispatchQueue.main.async {
+        UIApplication.shared.open(url, options: [:]) { opened in
+          result(opened)
+        }
+      }
+    default:
+      result(FlutterMethodNotImplemented)
+    }
   }
 }

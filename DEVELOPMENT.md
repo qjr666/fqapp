@@ -13,6 +13,7 @@
 - [注释与公开依据](#注释与公开依据)
 - [构建环境](#构建环境)
 - [构建 APK](#构建-apk)
+- [安卓 release 签名](#安卓-release-签名)
 - [测试](#测试)
 - [Android 原生核心集成](#android-原生核心集成)
 - [API 对接说明](#api-对接说明)
@@ -313,6 +314,74 @@ maven { url = uri("https://maven.aliyun.com/repository/public") }
 | `Flutter requires Android SDK 36` | `sdkmanager "platforms;android-36"` |
 | maven.google.com 超时 | 已配置阿里云镜像 |
 | `flutter doctor --android-licenses` 卡住 | `sdkmanager --licenses` 手动接受 |
+
+---
+
+## 安卓 release 签名
+
+CI 产出的 release APK 必须**自带签名**：安卓不允许安装未签名的包，签了名的包也必须与已安装的版本使用同一把密钥，否则只能卸载重装（书架与阅读进度都会丢）。
+
+### 密钥从哪来
+
+签名材料不进仓库，只以 **GitHub Actions Secrets** 的形式存在：
+
+| Secret | 内容 |
+| --- | --- |
+| `RELEASE_KEYSTORE_BASE64` | keystore 文件的 base64（`.keystore` / `.jks`） |
+| `RELEASE_STORE_PASSWORD` | 密钥库口令 |
+| `RELEASE_KEY_ALIAS` | 密钥别名 |
+| `RELEASE_KEY_PASSWORD` | 密钥口令 |
+
+工作流在编译前把它们还原成 `RELEASE_KEYSTORE_FILE` / `RELEASE_STORE_PASSWORD` / `RELEASE_KEY_ALIAS` / `RELEASE_KEY_PASSWORD` 四个环境变量，`android/app/build.gradle.kts` 据此配置 `signingConfigs.release`。还原出来的证书指纹必须与工作流里固定的 `RELEASE_SIGNER_SHA256` 一致，否则构建直接失败 —— 拿错钥匙的包不可能流出去。
+
+### 指纹从哪来
+
+`RELEASE_SIGNER_SHA256` 是**这张证书**的 SHA-256（不是 keystore 文件的哈希）：
+
+```bash
+keytool -exportcert -keystore <keystore> -storepass <口令> -alias <别名> | sha256sum
+```
+
+换密钥库时，三件事必须一起改：
+
+1. 重新生成上面的指纹，填进 `.github/workflows/android-apk.yml` 的 `RELEASE_SIGNER_SHA256`；
+2. 换掉仓库里的四个 Secrets；
+3. 记下新密钥库并**备份**：以后每个版本都要用同一把密钥签名。
+
+### 缺密钥时会怎样
+
+- **push / tag / 同仓库 PR**：签名是**硬要求**。Secrets 缺失或证书对不上，构建直接失败 —— 不会产出未签名的包。
+- **fork 的 PR**：GitHub 根本不把仓库 Secrets 给 fork，此时降级为未签名包，并在构建产物说明里写明「仅供检查、无法覆盖安装」。
+
+### 产物怎么验
+
+构建里的 `scripts/verify_android_apk.py` 会用 `apksigner` 校验签名：
+
+- 有签名：证书指纹必须等于 `RELEASE_SIGNER_SHA256`，否则失败；
+- 未签名：只有 fork PR 那种降级情况才允许（`--allow-unsigned`）。
+
+本地产物自查：
+
+```bash
+python scripts/verify_android_apk.py \
+  --apk app-arm64-v8a-release.apk \
+  --abi arm64-v8a \
+  --build-tools "$ANDROID_HOME/build-tools/36.0.0" \
+  --expected-signer-sha256 <RELEASE_SIGNER_SHA256>
+```
+
+### 本地构建
+
+本地也能出签名包，但**不要把 keystore.properties 提交进仓库**（它在 `.gitignore` 里）。把 `android/keystore.properties` 写成：
+
+```properties
+storeFile=/绝对路径/fqapp-release.keystore
+storePassword=<密钥库口令>
+keyAlias=<别名>
+keyPassword=<密钥口令>
+```
+
+`build.gradle.kts` 优先读这个文件，其次读同名环境变量。
 
 ---
 

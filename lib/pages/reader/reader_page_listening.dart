@@ -65,6 +65,9 @@ extension _ReaderPageListening on _ReaderPageState {
   /// 没有出口。
   void _resumeListenFollowIfTakenOver() {
     if (!_listenFollowTakeover) return;
+    // 「跟随翻页」是总闸：用户把它关掉了，就不许再自动接回 —— 否则开关看着
+    // 是关的，15 秒后页面又被拽回朗读处，开关等于没用。
+    if (!_preferences.listeningFollow) return;
     if (DateTime.now().isBefore(_listenFollowPausedUntil)) return;
     final session = ListeningSession.instance;
     if (!session.playing || !session.matchesBook(widget.bookId)) return;
@@ -285,10 +288,10 @@ extension _ReaderPageListening on _ReaderPageState {
     // [followArmed] 闸门**之前**：接管时 followArmed 被清成了 false，
     // 而 15 秒闩锁过期救不回来（那个检查排在后面，永远先卡在 followArmed）。
     _resumeListenFollowIfTakenOver();
-    // 跟随开关由迷你栏那个按钮管：关着就是自由翻页，什么都不做。
-    if (!ListeningSession.instance.followArmed) return;
-    // 设置里的「跟随翻页」是总闸，关掉就永不跟。
+    // 设置里的「跟随翻页」是总闸，关掉就永不跟。它必须排在 [followArmed]
+    // 前面：会话级闩锁由用户的手动操作控制，跟随总闸才是用户此刻的意图。
     if (!_preferences.listeningFollow) return;
+    if (!ListeningSession.instance.followArmed) return;
     // 工具条展开时不翻页（用户正在操作页面），自动翻页进行时也不抢。
     if (_controlsVisible || _autoTurnTimer != null) return;
     if (!session.playing) return;
@@ -383,10 +386,51 @@ extension _ReaderPageListening on _ReaderPageState {
   /// 同步胶囊「原进度」：回到朗读处并重新跟随。
   ///
   /// 官方 `AudioSyncReaderController.K()`（:768）：手动翻页后点它，重启同步
-  /// 服务并回到正在播的进度。手动翻页在这里已经关掉跟随，所以先开回来。
+  /// 服务并回到正在播的进度。手动翻页在这里已经关掉跟随，所以先开回来 ——
+  /// 但**总闸优先**：用户把「跟随翻页」关掉后，点「原进度」只把页面拉回
+  /// 朗读处，不该顺手把跟随也打开。
   void _returnToOriginalProgress() {
-    ListeningSession.instance.setFollowArmed(true);
     _jumpToPlaybackPosition();
+  }
+
+  /// 重新打开跟随（受「跟随翻页」总闸约束）。
+  ///
+  /// 所有「把跟随打开」的动作都要走这里：会话级的 [ListeningSession.followArmed]
+  /// 是被用户手动操作清掉的一次性闩锁，而偏好才是用户此刻的意图 —— 偏好关着
+  /// 的时候，任何路径都不许把它打开。
+  void _rearmListenFollow() {
+    if (!_preferences.listeningFollow) return;
+    ListeningSession.instance.setFollowArmed(true);
+  }
+
+  /// 「跟随翻页」总闸被切换时的收口。
+  ///
+  /// 打开时必须把跟随**真正启动**起来：只放开偏好没用 ——
+  /// [ListeningSession.followArmed] 这道会话闩锁可能早就被用户手动翻页清成了
+  /// false（那正是「开关打开但页面不跟随」的由来，看着就是开关无效）。
+  /// 所以这里同时清掉 15 秒闩锁、重新 arm 跟随，并把页面立刻拉到正在读的那
+  /// 一句。
+  ///
+  /// 关闭时反向做：把会话闩锁也清掉，否则 15 秒后
+  /// [_resumeListenFollowIfTakenOver] 会把跟随接回来 —— 用户明明关了跟随，
+  /// 页面却又被拽走。
+  void _applyListeningFollowToggle(bool enabled) {
+    final session = ListeningSession.instance;
+    if (!enabled) {
+      session.setFollowArmed(false);
+      _listenFollowTakeover = false;
+      _followPoll.sync();
+      return;
+    }
+    _listenFollowPausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    _listenFollowTakeover = false;
+    if (session.playing && session.matchesBook(widget.bookId)) {
+      session.setFollowArmed(true);
+      // 立刻归位到正在读的那一句：否则页面还停在用户拖走的地方，要等下一次
+      // 轮询（最多 100ms）才跳过去，看着像开关没生效。
+      _addressToPlayback(quiet: true);
+    }
+    _followPoll.sync();
   }
 
   /// 双击正文：跳到**点中段落**的段首（官方行为），可以跨章。

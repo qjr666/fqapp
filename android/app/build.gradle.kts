@@ -16,7 +16,7 @@ plugins {
 //
 // Local builds read android/keystore.properties, which is git-ignored and kept
 // outside version control. CI supplies the same four values as environment
-// variables. See docs/release-signing.md.
+// variables. See the "安卓 release 签名" section of DEVELOPMENT.md.
 val keystoreProperties = Properties().apply {
     val file = rootProject.file("keystore.properties")
     if (file.isFile) file.inputStream().use { load(it) }

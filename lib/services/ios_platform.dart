@@ -192,6 +192,20 @@ class IosPlatform {
     return MethodChannel(channel).invokeMethod<dynamic>(method, arguments);
   }
 
+  /// 转发到 Swift 的通知权限通道（`fqapp/ios_notification`）。
+  ///
+  /// 走真实的 MethodChannel —— 不能走 [invoke] 本身，那会递归回自己。
+  Future<dynamic> _notificationPermission(String method) async {
+    try {
+      return await const MethodChannel(
+        'fqapp/ios_notification',
+      ).invokeMethod<dynamic>(method);
+    } catch (error) {
+      debugPrint('[ios-notification] $method failed: $error');
+      return method == 'openSettings' ? false : 'unknown';
+    }
+  }
+
   Future<dynamic> _player(String method, Map args) async {
     switch (method) {
       case 'create':
@@ -215,13 +229,16 @@ class IosPlatform {
         final host = _players.remove(id);
         await host?.dispose();
         return null;
-      // 通知权限是 Android 的概念：iOS 的后台听书靠音频会话（Info.plist 的
-      // UIBackgroundModes: audio），不需要通知授权，直接算已授权。
+      // 通知（通知栏）权限：iOS 上对应 UNUserNotificationCenter。应用必须
+      // **主动**调 requestAuthorization 才会弹系统授权框 —— 从前这里直接回
+      // 'granted'，于是 iOS 版从来没有申请过通知权限，通知栏里也不会出现
+      // 任何本应用的通知。真正的实现走 Swift 通道 `fqapp/ios_notification`。
       case 'notificationPermissionStatus':
+        return _notificationPermission('status');
       case 'requestNotificationPermission':
-        return 'granted';
+        return _notificationPermission('request');
       case 'openNotificationSettings':
-        return false;
+        return _notificationPermission('openSettings');
       // iOS 没有悬浮窗 / SMTC / 常亮原生实现。这些调用都带 catch 或是可选
       // 增强，返回中性值即可，不伪装成「成功开启」。
       case 'setKeepScreenOn':

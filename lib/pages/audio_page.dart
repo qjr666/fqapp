@@ -311,7 +311,9 @@ class _AudioPageState extends State<AudioPage> {
     _syncCoverTheme();
     if (!_notificationPermissionChecked) {
       _notificationPermissionChecked = true;
-      unawaited(NotificationPermission.instance.refresh());
+      // 进入听书功能就按系统规范申请一次通知权限：系统只在「还没问过用户」
+      // 时才给弹框，问过（允许或拒绝）都不再弹。
+      unawaited(NotificationPermission.instance.requestIfUndetermined());
     }
   }
 
@@ -1457,10 +1459,18 @@ class _AudioPageState extends State<AudioPage> {
   /// 先弹系统授权框；已经被拒过一次（系统不会再弹）就带去系统的「通知」设置页。
   /// 后台保活靠的是前台服务的常驻通知卡片，没有它厂商系统更容易冻结进程。
   Future<void> _ensureNotificationPermission() async {
+    // 申请之前的状态：用来区分「刚被用户拒绝」与「早就是拒绝状态」。
+    final before = NotificationPermission.instance.state.value;
     final state = await NotificationPermission.instance.request();
     if (!mounted) return;
     if (state == NotificationPermissionState.granted) {
       _toast('通知已开启，后台听书会有常驻控制卡片');
+      return;
+    }
+    if (before == NotificationPermissionState.notDetermined) {
+      // 刚弹完系统框就被拒：这时把人直接弹到系统设置里既突兀又没意义 ——
+      // 他可能还没看完提示。给一句说明，入口留在设置页那一行。
+      _toast('已拒绝通知权限，可在系统设置 → 通知里重新开启');
       return;
     }
     final opened = await NotificationPermission.instance.openSettings();
@@ -1884,12 +1894,17 @@ class _AudioPageState extends State<AudioPage> {
                       ValueListenableBuilder<NotificationPermissionState>(
                         valueListenable: NotificationPermission.instance.state,
                         builder: (context, permState, _) {
-                          // unknown = 这个平台没有通知权限这回事（iOS / 桌面）。
+                          // unknown = 这个平台没有通知权限这回事（桌面）。
                           if (permState == NotificationPermissionState.unknown) {
                             return const SizedBox.shrink();
                           }
-                          final blocked =
+                          // notDetermined = 还没问过用户，还能弹系统授权框；
+                          // denied = 问过且被拒，只能引导去系统设置。
+                          final denied =
                               permState == NotificationPermissionState.denied;
+                          final pending =
+                              permState ==
+                              NotificationPermissionState.notDetermined;
                           return ListTile(
                             contentPadding: const EdgeInsets.symmetric(
                               horizontal: 16,
@@ -1919,8 +1934,10 @@ class _AudioPageState extends State<AudioPage> {
                               ),
                             ),
                             subtitle: Text(
-                              blocked
+                              denied
                                   ? '未开启：后台听书容易被系统冻结，点了去开启'
+                                  : pending
+                                  ? '未申请：点此申请通知权限'
                                   : '已开启：后台听书有常驻控制卡片',
                               style: TextStyle(
                                 fontSize: 12.5,
@@ -1928,14 +1945,14 @@ class _AudioPageState extends State<AudioPage> {
                               ),
                             ),
                             trailing: Icon(
-                              blocked
+                              denied || pending
                                   ? LucideIcons.chevron_right
                                   : LucideIcons.check,
                               size: 18,
                               color: palette.muted,
                             ),
                             onTap: () {
-                              if (!blocked) return;
+                              if (!denied && !pending) return;
                               unawaited(_ensureNotificationPermission());
                             },
                           );

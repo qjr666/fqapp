@@ -26,10 +26,15 @@ class ReaderFollowPoll {
 
   Timer? _timer;
   int _ticks = 0;
+  bool _disposed = false;
 
   /// Starts or stops the timer to match [needed]. Cheap enough to call on every
   /// structural change.
   void sync() {
+    // 页面已经销毁就不再起定时器：dispose 之后若还有一次 sync（例如迟到的
+    // 会话通知），定时器会被重新拉起来，而这一次的 dispose 已经过去了 ——
+    // 10Hz 的空转定时器永远停不下来。
+    if (_disposed) return;
     final wanted = needed();
     if (wanted == (_timer != null)) return;
     if (wanted) {
@@ -48,6 +53,7 @@ class ReaderFollowPoll {
   }
 
   void dispose() {
+    _disposed = true;
     _timer?.cancel();
     _timer = null;
   }

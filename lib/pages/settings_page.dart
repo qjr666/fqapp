@@ -630,7 +630,10 @@ class SettingsPage extends StatelessWidget {
       valueListenable: NotificationPermission.instance.state,
       builder: (context, value, _) {
         final unknown = value == NotificationPermissionState.unknown;
+        // notDetermined = 还没问过用户，还能弹系统授权框；denied = 问过且
+        // 被拒，只能引导去系统设置。
         final denied = value == NotificationPermissionState.denied;
+        final pending = value == NotificationPermissionState.notDetermined;
         return SettingsLinkRow(
           icon: CupertinoIcons.bell,
           title: '通知权限',
@@ -638,8 +641,10 @@ class SettingsPage extends StatelessWidget {
               ? '当前平台不需要通知授权'
               : denied
               ? '未开启：后台听书容易被系统冻结，点了去开启'
+              : pending
+              ? '未申请：点此申请通知权限'
               : '已开启：后台听书有常驻控制卡片',
-          trailing: denied
+          trailing: denied || pending
               ? const Icon(CupertinoIcons.chevron_right, size: 16)
               : null,
           onTap: unknown
@@ -654,8 +659,19 @@ class SettingsPage extends StatelessWidget {
 
   /// 申请通知权限；已经被拒过（系统不会再弹）就直接带去系统设置页。
   Future<void> _openNotificationSettings() async {
+    // 申请之前的状态：用来区分「刚被用户拒绝」与「早就是拒绝状态」。
+    final before = NotificationPermission.instance.state.value;
     final state = await NotificationPermission.instance.request();
     if (state == NotificationPermissionState.granted) return;
+    if (before == NotificationPermissionState.notDetermined) {
+      // 刚弹完系统框就被拒：这时把人直接弹到系统设置里既突兀又没意义。
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('已拒绝通知权限，可在系统设置 → 通知里重新开启')),
+        );
+      }
+      return;
+    }
     await NotificationPermission.instance.openSettings();
   }
 
