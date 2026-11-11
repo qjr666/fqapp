@@ -387,7 +387,10 @@ class _AudioPlaybackController extends ChangeNotifier
 
   void _syncForeground() {
     if (_closed || _index < 0 || _index >= _chapters.length) return;
-    if (!AudioPreferences.instance.backgroundPlayback.value) {
+    // iOS 的 Now Playing 会话必须随播放一直存在，不受 Android 前台服务
+    // 开关影响。
+    if (!isIOSPlatform &&
+        !AudioPreferences.instance.backgroundPlayback.value) {
       unawaited(NativePlayer.stopListenForeground());
       return;
     }
@@ -463,7 +466,9 @@ class _AudioPlaybackController extends ChangeNotifier
 
   void _preferencesChanged() {
     if (_closed) return;
-    if (!_appActive && !AudioPreferences.instance.backgroundPlayback.value) {
+    if (!isIOSPlatform &&
+        !_appActive &&
+        !AudioPreferences.instance.backgroundPlayback.value) {
       unawaited(_pauseForOtherMedia());
     }
     _syncForeground();
@@ -477,7 +482,9 @@ class _AudioPlaybackController extends ChangeNotifier
       // 切换到后台或锁屏时立即持久化当前进度，防止后续被系统杀后台导致进度丢失。
       unawaited(_persistProgress());
       // 若后台听书开关关闭，切后台自动暂停播放并移除前台通知。
-      if (!AudioPreferences.instance.backgroundPlayback.value) {
+      // iOS 由系统 Now Playing 会话接管，切后台不停、不撤卡片。
+      if (!isIOSPlatform &&
+          !AudioPreferences.instance.backgroundPlayback.value) {
         unawaited(_pauseForOtherMedia());
         unawaited(NativePlayer.stopListenForeground());
       }
@@ -520,7 +527,9 @@ class _AudioPlaybackController extends ChangeNotifier
       _timeTrackReady = false;
       _wantPlay =
           autoplay &&
-          (_appActive || AudioPreferences.instance.backgroundPlayback.value);
+          (isIOSPlatform ||
+              _appActive ||
+              AudioPreferences.instance.backgroundPlayback.value);
     });
     _publishReadAlong();
     _publishMoreState();
@@ -1128,7 +1137,9 @@ class _AudioPlaybackController extends ChangeNotifier
 
   Future<void> _play(NativePlayer player, int generation) async {
     if (!_current(generation, player) || !_wantPlay) return;
-    if (!_appActive && !AudioPreferences.instance.backgroundPlayback.value) {
+    if (!isIOSPlatform &&
+        !_appActive &&
+        !AudioPreferences.instance.backgroundPlayback.value) {
       await _pauseForOtherMedia();
       return;
     }

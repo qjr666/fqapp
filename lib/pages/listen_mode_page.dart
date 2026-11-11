@@ -9,6 +9,7 @@ import '../services/app_theme.dart';
 import '../services/audio_floating_routes.dart';
 import '../services/audio_preferences.dart';
 import '../services/episode_source_cache.dart';
+import '../services/ios_platform.dart';
 import '../services/native_player.dart';
 import '../services/player_preferences.dart';
 import '../widgets/home/home_design.dart';
@@ -130,7 +131,9 @@ class _ListenModePageState extends State<ListenModePage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // iOS 由系统 Now Playing 会话接管后台，不在切后台时自撤卡片。
     if (state != AppLifecycleState.resumed &&
+        !isIOSPlatform &&
         !AudioPreferences.instance.backgroundPlayback.value) {
       unawaited(_player?.pause());
       unawaited(_stopForeground());
@@ -254,7 +257,8 @@ class _ListenModePageState extends State<ListenModePage>
   }
 
   Future<void> _startForeground() {
-    if (!AudioPreferences.instance.backgroundPlayback.value) {
+    if (!isIOSPlatform &&
+        !AudioPreferences.instance.backgroundPlayback.value) {
       return _stopForeground();
     }
     final player = _player;

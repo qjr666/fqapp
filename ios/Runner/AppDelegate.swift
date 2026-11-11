@@ -25,6 +25,10 @@ import UserNotifications
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    // Apple 要求 UNUserNotificationCenter.delegate 在
+    // didFinishLaunchingWithOptions 返回之前挂好：冷启动时点通知进 App，
+    // 系统在这个方法结束就开始找处理者，晚一步通知点击就没人接。
+    nowPlayingChannel.installNotificationDelegate()
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
@@ -46,6 +50,8 @@ import UserNotifications
     readerDeviceChannel.register(messenger: messenger)
     notificationPermissionChannel.register(messenger: messenger)
     nowPlayingChannel.register(messenger: messenger)
+    // 插件注册阶段可能有别的插件抢过通知 delegate，这里再挂回来。
+    nowPlayingChannel.installNotificationDelegate()
   }
 }
 
@@ -794,30 +800,34 @@ final class NotificationPermissionChannel {
   }
 }
 
-/// `fqapp/ios_now_playing`：把当前在读/在听的内容发布成系统媒体元数据，
-/// 并把锁屏、控制中心、灵动岛上的播放控制回抛给 Dart。
+/// `fqapp/ios_now_playing`：iOS 标准 Now Playing 媒体会话。
 ///
-/// iOS 没有 Android 那套「通知栏媒体卡片」，但有等价的系统能力：
-/// `MPNowPlayingInfoCenter` 负责锁屏 / 控制中心 / 灵动岛上的播放器卡片，
-/// `MPRemoteCommandCenter` 负责播放、暂停、切章、停止。两边都要求音频会话
-/// 处于 `playback` 类别且 App 正在发声，否则系统一个卡片都不显示。
+/// 按 Apple 媒体播放 App 的规范，这一层集中持有四件事，Dart 只推状态、
+/// 只消费动作，不再自己拼 Android 式的前台通知：
+/// - `AVAudioSession`：playback 类别激活，声明后台音频身份；
+/// - `MPNowPlayingInfoCenter`：锁屏 / 控制中心 / 灵动岛的播放器卡片；
+/// - `MPRemoteCommandCenter`：播放、暂停、上一章、下一章、停止；
+/// - `UNUserNotificationCenter`：通知栏里可点击回到 App 的常驻条目。
 ///
-/// 元数据字段与 Android 的媒体会话对齐（`ListenKeepAliveService`）：
-/// title = 书名，artist = 章节名，封面图 = 书籍封面。
-final class NowPlayingChannel {
+/// 远控命令只在 register 时安装一次。反复 `removeTarget(nil)` 会把别的
+/// 组件刚挂上的 target 一并摘掉，也会在系统派发按键时留下空窗期；按钮
+/// 可用性一律用 `isEnabled` 控制。
+final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
+  private static let notificationID = "fqapp.nowplaying"
+
   private var channel: FlutterMethodChannel?
   private var artworkTask: URLSessionDataTask?
   private var artworkURL: String?
   private var artwork: MPMediaItemArtwork?
-  /// 最近一次下发的元数据：封面下载完成后要拿它整体重发一次。
   private var info: [String: Any] = [:]
-  /// 音乐播放器式的常驻后台音频。
-  ///
-  /// AVSpeechSynthesizer / media_kit 在念完一句、一章播完、切章取流的间隙
-  /// 会完全静下来，iOS 立刻把 App 挂起：Dart 侧的连播倒计时、下一章取流、
-  /// 新播放器创建全部冻结，锁屏卡片也随时会消失，点它更不会把 App 唤回。
-  /// 循环播放一段零音量 PCM 让系统始终把本 App 当作「正在播放」的一方。
   private var silentPlayer: AVAudioPlayer?
+  private var cachedSilenceURL: URL?
+  private var commandsInstalled = false
+  private var sessionPublished = false
+  private var hasPrev = true
+  private var hasNext = true
+  private var lastNotificationTitle = ""
+  private var lastNotificationEpisode = ""
 
   func register(messenger: FlutterBinaryMessenger) {
     let channel = FlutterMethodChannel(
@@ -832,70 +842,107 @@ final class NowPlayingChannel {
       }
       self.handle(call, result)
     }
-    configureRemoteCommands()
-    // 不声明接收远控事件时，系统不把本 App 认作「正在播放」的一方：
-    // 锁屏 / 控制中心 / 灵动岛卡片上的按钮按下去不会有事件送到这里。
+    installRemoteCommands()
     UIApplication.shared.beginReceivingRemoteControlEvents()
-    // 点击锁屏 / 通知中心的媒体卡片把 App 唤回前台时，其它媒体组件可能
-    // 已经把远控 target 摘掉；回到前台就重装一次，按键立刻可用。
-    NotificationCenter.default.addObserver(
-      forName: UIApplication.didBecomeActiveNotification,
-      object: nil,
-      queue: .main
-    ) { [weak self] _ in
-      self?.reinstallRemoteTargets()
-      self?.ensurePlaybackSession()
-    }
-    // 来电、Siri、其它 App 抢占音频后系统会去激活会话；中断结束时必须
-    // 重新把播放身份和常驻音轨立起来，否则后台连播与卡片一起失效。
-    NotificationCenter.default.addObserver(
-      forName: AVAudioSession.interruptionNotification,
-      object: AVAudioSession.sharedInstance(),
-      queue: .main
-    ) { [weak self] note in
-      guard
-        let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-        let type = AVAudioSession.InterruptionType(rawValue: raw),
-        type == .ended
-      else { return }
-      self?.ensurePlaybackSession()
-      self?.startSilentLoop()
-      self?.reinstallRemoteTargets()
-    }
-    ensurePlaybackSession()
+    observeSystemEvents()
+    // 不在这里激活音频会话：冷启动就抢 playback 会打断用户正在听的音乐，
+    // 会话等到第一次真正的起播（apply）再激活。
   }
 
-  private func reinstallRemoteTargets() {
-    installRemoteTargets()
-    UIApplication.shared.beginReceivingRemoteControlEvents()
+  /// 通知 delegate 必须在 didFinishLaunchingWithOptions 返回之前挂好。
+  func installNotificationDelegate() {
+    UNUserNotificationCenter.current().delegate = self
   }
 
-  /// 只有音频会话处于 playback 且 active，系统才把本 App 认作当前播放器：
-  /// 卡片才会出现在锁屏 / 控制中心 / 灵动岛，点卡片才能直接进 App。
-  /// Dart 侧已经设过类别与混播选项，这里只在类别不对时兜底，不覆盖
-  /// mixWithOthers，避免把用户的「允许同时播放」设置冲掉。
-  private func ensurePlaybackSession() {
+  // MARK: - UNUserNotificationCenterDelegate
+
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    // 前台时播放器就在界面里，不再弹一条横幅打扰。
+    completionHandler([])
+  }
+
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    didReceive response: UNNotificationResponse,
+    withCompletionHandler completionHandler: @escaping () -> Void
+  ) {
+    // 系统会把 App 带回前台；顺手把可能被中断过的媒体会话重新立起来。
+    guard sessionPublished else {
+      completionHandler()
+      return
+    }
+    activateSession()
+    startSilentPlayback()
+    applyCommandAvailability()
+    completionHandler()
+  }
+
+  // MARK: - AVAudioSession
+
+  /// 只有 playback 且 active 的会话才会被系统登记成「正在播放」的 App，
+  /// 锁屏 / 控制中心 / 灵动岛卡片与点击进 App 都以此为前提。
+  /// 类别由 Dart 的混播策略设置，这里只在类别不对时兜底，不覆盖
+  /// mixWithOthers。
+  private func activateSession() {
     let session = AVAudioSession.sharedInstance()
     do {
       if session.category != .playback {
         try session.setCategory(
           .playback,
-          mode: .spokenAudio,
+          mode: .default,
           options: [.allowBluetoothA2DP]
         )
       }
-      try session.setActive(true)
+      try session.setActive(true, options: [])
     } catch {
-      // 会话被系统临时占用（来电、Siri）时下次 update 会再试，不阻断播放。
+      NSLog("[fqapp] audio session activate failed: \(error)")
     }
   }
 
-  /// 零音量循环音轨：章末换章、下一集取流期间保住后台执行窗口。
-  private func startSilentLoop() {
+  /// 章末换章、下一集取流的间隙 TTS / 播放器会完全静下来，iOS 立刻挂起
+  /// App：Dart 的连播逻辑与取流全部冻结。循环一段静音 PCM 让音频渲染
+  /// 管线保持运行，这是后台音频 App 的标准做法。
+  private func startSilentPlayback() {
+    guard sessionPublished else { return }
     if silentPlayer?.isPlaying == true { return }
     silentPlayer?.stop()
     silentPlayer = nil
-    let frames = 4000  // 8kHz 单声道 16bit，0.5 秒
+    do {
+      let url = try silenceFileURL()
+      let player = try AVAudioPlayer(contentsOf: url)
+      // 采样点全为 0，但 volume 必须是 1：置 0 时 CoreAudio 会把输出
+      // 优化掉，系统就不认为本 App 在播放。
+      player.volume = 1.0
+      player.numberOfLoops = -1
+      player.prepareToPlay()
+      silentPlayer = player
+      if !player.play() {
+        NSLog("[fqapp] silent playback did not start")
+      }
+    } catch {
+      NSLog("[fqapp] silent playback unavailable: \(error)")
+    }
+  }
+
+  private func stopSilentPlayback() {
+    silentPlayer?.stop()
+    silentPlayer = nil
+  }
+
+  /// 用临时文件 + `AVAudioPlayer(contentsOf:)`，避免内存 data 的 UTI
+  /// 猜测失败（旧实现在 catch 里静默吞掉，整条保活链路其实没跑起来）。
+  private func silenceFileURL() throws -> URL {
+    if let cached = cachedSilenceURL,
+       FileManager.default.fileExists(atPath: cached.path) {
+      return cached
+    }
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("fqapp-silence.wav")
+    let frames = 8000  // 8kHz 单声道 16bit，1 秒
     var wav = Data()
     func bytes(_ values: [UInt8]) { wav.append(contentsOf: values) }
     func text(_ value: String) { wav.append(contentsOf: value.utf8) }
@@ -915,63 +962,61 @@ final class NowPlayingChannel {
     int32(8000); int32(16000); int16(2); int16(16)
     text("data"); int32(Int32(frames * 2))
     wav.append(Data(count: frames * 2))
-    do {
-      let player = try AVAudioPlayer(data: wav, fileTypeHint: AVFileType.wav.rawValue)
-      player.volume = 0
-      player.numberOfLoops = -1
-      player.prepareToPlay()
-      silentPlayer = player
-      player.play()
-    } catch {
-      silentPlayer = nil
+    try wav.write(to: url, options: .atomic)
+    cachedSilenceURL = url
+    return url
+  }
+
+  private func observeSystemEvents() {
+    NotificationCenter.default.addObserver(
+      forName: UIApplication.didBecomeActiveNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self, self.sessionPublished else { return }
+      self.activateSession()
+      self.startSilentPlayback()
+      self.applyCommandAvailability()
+    }
+    NotificationCenter.default.addObserver(
+      forName: AVAudioSession.interruptionNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] note in
+      guard let self, self.sessionPublished else { return }
+      guard
+        let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+        let type = AVAudioSession.InterruptionType(rawValue: raw),
+        type == .ended
+      else { return }
+      self.activateSession()
+      self.startSilentPlayback()
+      self.applyCommandAvailability()
     }
   }
 
-  private func stopSilentLoop() {
-    silentPlayer?.stop()
-    silentPlayer = nil
-  }
+  // MARK: - MPRemoteCommandCenter
 
-  /// 远控按钮。系统控制中心与锁屏上的「播放 / 暂停」是**两个**命令，
-  /// 这里分别回传 `play` / `pause` —— 不能都当成切换：正在播放时点「播放」
-  /// 应该是继续，而不是暂停。Android 那边只有一枚 playPause 按钮，
-  /// Dart 侧按同一套动作名处理两个平台。
-  private func configureRemoteCommands() {
+  /// 一次性安装。注册了 skip / seek 命令会让控制中心把「上一章 / 下一章」
+  /// 换成 15 秒快退 / 快进，所以这些能力一律禁用且不挂 target。
+  private func installRemoteCommands() {
+    guard !commandsInstalled else { return }
+    commandsInstalled = true
     let center = MPRemoteCommandCenter.shared()
-    // 注册了 skip 命令的 App，控制中心会把「上一章 / 下一章」换成
-    // 「快退 15 秒 / 快进 15 秒」两枚按钮，图标与语义都不对。切章只走
-    // nextTrack / previousTrack，skip 两枚保持禁用、不挂 target。
-    center.skipForwardCommand.isEnabled = false
-    center.skipBackwardCommand.isEnabled = false
-    // 命令默认未必是启用态：只挂 target 不启用，按钮看得见却按不动。
-    // 首次 update 之前也要能切章，apply() 会按 hasPrev / hasNext 再收紧。
-    center.playCommand.isEnabled = true
-    center.pauseCommand.isEnabled = true
-    center.togglePlayPauseCommand.isEnabled = true
-    center.stopCommand.isEnabled = true
-    center.nextTrackCommand.isEnabled = true
-    center.previousTrackCommand.isEnabled = true
-    installRemoteTargets()
-  }
-
-  /// 重装远控 target。
-  ///
-  /// 视频播放器 / 其它 AVPlayer 接管远控时会调 `removeTarget(nil)`，把本 App
-  /// 之前挂上的 target 一起摘掉，于是锁屏、灵动岛、控制中心上的上一章 /
-  /// 下一章变成按了没反应的空按钮。每次刷新媒体元数据都重装一次即可恢复；
-  /// 先全部摘掉再挂，避免重复注册导致一次按键触发多次切章。
-  private func installRemoteTargets() {
-    let center = MPRemoteCommandCenter.shared()
-    center.playCommand.removeTarget(nil)
-    center.pauseCommand.removeTarget(nil)
-    center.togglePlayPauseCommand.removeTarget(nil)
-    center.nextTrackCommand.removeTarget(nil)
-    center.previousTrackCommand.removeTarget(nil)
-    center.stopCommand.removeTarget(nil)
-    center.skipForwardCommand.removeTarget(nil)
-    center.skipBackwardCommand.removeTarget(nil)
-    center.skipForwardCommand.isEnabled = false
-    center.skipBackwardCommand.isEnabled = false
+    let unavailable: [MPRemoteCommand] = [
+      center.skipForwardCommand,
+      center.skipBackwardCommand,
+      center.seekForwardCommand,
+      center.seekBackwardCommand,
+      center.changePlaybackPositionCommand,
+      center.likeCommand,
+      center.dislikeCommand,
+      center.bookmarkCommand,
+      center.ratingCommand,
+      center.enableLanguageOptionCommand,
+      center.disableLanguageOptionCommand,
+    ]
+    for command in unavailable { command.isEnabled = false }
 
     center.playCommand.addTarget { [weak self] _ in
       self?.sendRemoteAction("play")
@@ -997,28 +1042,39 @@ final class NowPlayingChannel {
       self?.sendRemoteAction("stop")
       return .success
     }
+    applyCommandAvailability()
+  }
+
+  private func applyCommandAvailability() {
+    let center = MPRemoteCommandCenter.shared()
+    center.playCommand.isEnabled = true
+    center.pauseCommand.isEnabled = true
+    center.togglePlayPauseCommand.isEnabled = true
+    center.stopCommand.isEnabled = true
+    center.previousTrackCommand.isEnabled = hasPrev
+    center.nextTrackCommand.isEnabled = hasNext
+    // 每次刷新都压住 skip：否则控制中心用 15 秒快进图标顶掉「下一章」。
+    center.skipBackwardCommand.isEnabled = false
+    center.skipForwardCommand.isEnabled = false
   }
 
   private func sendRemoteAction(_ action: String) {
-    // MPRemoteCommandCenter 的回调不保证在主线程，而 FlutterMethodChannel
-    // 只能在主线程发消息。后台收到远控时走错线程，动作会石沉大海。
+    // 远控回调不保证在主线程，FlutterMethodChannel 只能在主线程发消息。
     if Thread.isMainThread {
       channel?.invokeMethod("onRemoteAction", arguments: ["action": action])
     } else {
       DispatchQueue.main.async { [weak self] in
-        self?.channel?.invokeMethod(
-          "onRemoteAction",
-          arguments: ["action": action]
-        )
+        self?.channel?.invokeMethod("onRemoteAction", arguments: ["action": action])
       }
     }
   }
 
+  // MARK: - Channel
+
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
     switch call.method {
     case "update":
-      let args = call.arguments as? [String: Any] ?? [:]
-      apply(args)
+      apply(call.arguments as? [String: Any] ?? [:])
       result(nil)
     case "clear":
       artworkTask?.cancel()
@@ -1026,7 +1082,9 @@ final class NowPlayingChannel {
       artworkURL = nil
       artwork = nil
       info = [:]
-      stopSilentLoop()
+      sessionPublished = false
+      removeNotification()
+      stopSilentPlayback()
       MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
       MPNowPlayingInfoCenter.default().playbackState = .stopped
       result(nil)
@@ -1035,64 +1093,86 @@ final class NowPlayingChannel {
     }
   }
 
-  /// 把一次播放状态写成系统媒体元数据。
-  ///
-  /// `positionMs` 与 `durationMs` 必须一起给：系统按这两个值外推进度条，
-  /// 只给一个会让卡片两侧的时间对不上。
   private func apply(_ args: [String: Any]) {
-    // 每次刷新都重新声明一次播放身份：会话可能被系统打断后去激活，
-    // 而常驻音轨必须一直跑到 clear() 为止，后台换章才不会被挂起。
-    ensurePlaybackSession()
-    startSilentLoop()
-    UIApplication.shared.beginReceivingRemoteControlEvents()
+    sessionPublished = true
+    activateSession()
+    startSilentPlayback()
+
     let title = args["title"] as? String ?? ""
     let episode = args["episode"] as? String ?? ""
     let playing = args["playing"] as? Bool ?? false
-    let hasPrev = args["hasPrev"] as? Bool ?? true
-    let hasNext = args["hasNext"] as? Bool ?? true
+    hasPrev = args["hasPrev"] as? Bool ?? true
+    hasNext = args["hasNext"] as? Bool ?? true
     let positionMs = args["positionMs"] as? Double ?? 0
     let durationMs = args["durationMs"] as? Double ?? 0
     let speed = args["speed"] as? Double ?? 1
     let coverUrl = args["coverUrl"] as? String ?? ""
 
-    var next: [String: Any] = [:]
-    if !title.isEmpty { next[MPMediaItemPropertyTitle] = title }
-    if !episode.isEmpty {
-      next[MPMediaItemPropertyArtist] = episode
-      next[MPMediaItemPropertyAlbumTitle] = episode
+    var next: [String: Any] = [
+      MPNowPlayingInfoPropertyPlaybackRate: playing ? speed : 0,
+      MPNowPlayingInfoPropertyDefaultPlaybackRate: speed,
+    ]
+    if !title.isEmpty {
+      next[MPMediaItemPropertyTitle] = title
+      next[MPMediaItemPropertyAlbumTitle] = title
     }
-    // 音乐播放器卡片的两个时间轴字段必须始终成对存在：缺一个，系统就
-    // 把它当成「不支持进度的音频」，卡片退化成只有一行标题的样式。
-    next[MPMediaItemPropertyPlaybackDuration] = durationMs / 1000
-    next[MPNowPlayingInfoPropertyElapsedPlaybackTime] = positionMs / 1000
-    next[MPNowPlayingInfoPropertyPlaybackRate] = playing ? speed : 0
-    next[MPNowPlayingInfoPropertyDefaultPlaybackRate] = speed
+    if !episode.isEmpty { next[MPMediaItemPropertyArtist] = episode }
+    // 系统朗读没有真实时长：硬填 0 会让控制中心把会话判成「无进度的
+    // 无效媒体」，卡片与灵动岛直接不出现。只有拿到真实时长才下发时间轴。
+    if durationMs > 0 {
+      next[MPMediaItemPropertyPlaybackDuration] = durationMs / 1000
+      next[MPNowPlayingInfoPropertyElapsedPlaybackTime] = min(positionMs, durationMs) / 1000
+    }
     if let artwork = artwork { next[MPMediaItemPropertyArtwork] = artwork }
 
     info = next
     MPNowPlayingInfoCenter.default().nowPlayingInfo = next
     MPNowPlayingInfoCenter.default().playbackState = playing ? .playing : .paused
-
-    // 每次刷新都重装一次：别的媒体组件可能刚把 target 摘掉，控制中心上的
-    // 上一章 / 下一章会因此变成死按钮。
-    installRemoteTargets()
-    let center = MPRemoteCommandCenter.shared()
-    center.previousTrackCommand.isEnabled = hasPrev
-    center.nextTrackCommand.isEnabled = hasNext
-    // 每次刷新元数据都压住 skip：否则控制中心用 15 秒快进图标顶掉「下一章」。
-    center.skipBackwardCommand.isEnabled = false
-    center.skipForwardCommand.isEnabled = false
-    center.playCommand.isEnabled = true
-    center.pauseCommand.isEnabled = true
-    center.togglePlayPauseCommand.isEnabled = true
-    center.stopCommand.isEnabled = true
-
+    applyCommandAvailability()
+    updateNotification(title: title, episode: episode)
     loadArtwork(coverUrl)
   }
 
-  /// 封面图：锁屏卡片没有图就只剩一行字，观感差很多。
-  ///
-  /// 下载是异步的，拿到图后要把整份元数据重发一次；同一个 URL 不重复下载。
+  // MARK: - 通知栏
+
+  /// 固定 identifier 的本地通知：重复 add 会替换同一条，不会在通知中心
+  /// 堆积。点击由系统带回 App，delegate 里恢复媒体会话。
+  private func updateNotification(title: String, episode: String) {
+    guard !title.isEmpty else { return }
+    if title == lastNotificationTitle && episode == lastNotificationEpisode { return }
+    lastNotificationTitle = title
+    lastNotificationEpisode = episode
+    UNUserNotificationCenter.current().getNotificationSettings { settings in
+      let status = settings.authorizationStatus
+      guard status == .authorized || status == .provisional || status == .ephemeral else { return }
+      let content = UNMutableNotificationContent()
+      content.title = title
+      content.body = episode.isEmpty ? "正在播放" : episode
+      content.threadIdentifier = NowPlayingChannel.notificationID
+      let request = UNNotificationRequest(
+        identifier: NowPlayingChannel.notificationID,
+        content: content,
+        trigger: nil
+      )
+      DispatchQueue.main.async {
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+      }
+    }
+  }
+
+  private func removeNotification() {
+    lastNotificationTitle = ""
+    lastNotificationEpisode = ""
+    UNUserNotificationCenter.current().removeDeliveredNotifications(
+      withIdentifiers: [NowPlayingChannel.notificationID]
+    )
+    UNUserNotificationCenter.current().removePendingNotificationRequests(
+      withIdentifiers: [NowPlayingChannel.notificationID]
+    )
+  }
+
+  // MARK: - 封面
+
   private func loadArtwork(_ urlString: String) {
     guard !urlString.isEmpty else { return }
     if urlString == artworkURL { return }
@@ -1103,7 +1183,6 @@ final class NowPlayingChannel {
       guard let self, let data, let image = UIImage(data: data) else { return }
       let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
       DispatchQueue.main.async {
-        // 下载期间可能已经切到别的内容了：只认最后一次请求的 URL。
         guard self.artworkURL == urlString else { return }
         self.artworkTask = nil
         self.artwork = artwork

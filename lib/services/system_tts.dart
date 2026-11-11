@@ -272,8 +272,12 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
   Chapter get chapter => book.chapters[index];
   double get progress =>
       _text.isEmpty ? 0 : (_offset / _text.length).clamp(0, 1);
+  // iOS 走系统 Now Playing 会话：只要在播就允许后台继续，不因开关或
+  // 生命周期把章末换章的取流打断（原生侧常驻音频保证 App 不被挂起）。
   bool get _allowed =>
-      _appActive || AudioPreferences.instance.backgroundPlayback.value;
+      isIOSPlatform ||
+      _appActive ||
+      AudioPreferences.instance.backgroundPlayback.value;
 
   void start() {
     if (_started || closed) return;
@@ -707,7 +711,10 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
     if (notification) {
       _notificationQueue = _notificationQueue.then((_) async {
         if (closed) return;
-        if (!AudioPreferences.instance.backgroundPlayback.value) {
+        // iOS 的媒体会话由原生侧持有：只要在播就持续发布卡片，不受
+        // Android 前台服务开关影响，否则锁屏 / 灵动岛会整个消失。
+        if (!isIOSPlatform &&
+            !AudioPreferences.instance.backgroundPlayback.value) {
           await NativePlayer.stopListenForeground();
         } else {
           await NativePlayer.startListenForeground(
