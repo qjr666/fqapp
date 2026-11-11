@@ -838,7 +838,6 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   private var info: [String: Any] = [:]
   private var silentPlayer: AVAudioPlayer?
   private var cachedSilenceURL: URL?
-  private var commandsInstalled = false
   private var sessionPublished = false
   private var hasPrev = true
   private var hasNext = true
@@ -866,7 +865,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     for action in queued {
       channel.invokeMethod("onRemoteAction", arguments: ["action": action])
     }
-    installRemoteCommands()
+    installRemoteTargets()
     UIApplication.shared.beginReceivingRemoteControlEvents()
     observeSystemEvents()
     // 不在这里激活音频会话：冷启动就抢 playback 会打断用户正在听的音乐，
@@ -942,20 +941,22 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     }
     activateSession()
     startSilentPlayback()
-    applyCommandAvailability()
+    installRemoteTargets()
     completionHandler()
   }
 
   // MARK: - AVAudioSession
 
   /// 只有 playback 且 active 的会话才会被系统登记成「正在播放」的 App，
-  /// 锁屏 / 控制中心 / 灵动岛卡片与点击进 App 都以此为前提。
-  /// 类别由 Dart 的混播策略设置，这里只在类别不对时兜底，不覆盖
-  /// mixWithOthers。
+  /// 锁屏 / 通知栏播放器卡片与点击进 App 都以此为前提。带 mixWithOthers
+  /// 的会话不会被登记成 Now Playing App：卡片主体点下去没有可唤起的
+  /// 目标，⏮ / ⏭ 也会被派给上一个播放方。这里按音乐类 App 的标准
+  /// 固定独占 playback，Dart 的混播偏好不参与媒体会话的类别。
   private func activateSession() {
     let session = AVAudioSession.sharedInstance()
     do {
-      if session.category != .playback {
+      if session.category != .playback ||
+         session.categoryOptions.contains(.mixWithOthers) {
         try session.setCategory(
           .playback,
           mode: .default,
@@ -1033,6 +1034,18 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   }
 
   private func observeSystemEvents() {
+    // 进入后台时第三方媒体组件常会重建自己的远控 target 并顺手清掉别人的；
+    // 此刻把会话与 ⏮ / ⏭ 重新立起来，后台整段时间的卡片才一直有处理者。
+    NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self, self.sessionPublished else { return }
+      self.activateSession()
+      self.startSilentPlayback()
+      self.installRemoteTargets()
+    }
     NotificationCenter.default.addObserver(
       forName: UIApplication.didBecomeActiveNotification,
       object: nil,
@@ -1041,7 +1054,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       guard let self, self.sessionPublished else { return }
       self.activateSession()
       self.startSilentPlayback()
-      self.applyCommandAvailability()
+      self.installRemoteTargets()
     }
     NotificationCenter.default.addObserver(
       forName: AVAudioSession.interruptionNotification,
@@ -1056,17 +1069,19 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       else { return }
       self.activateSession()
       self.startSilentPlayback()
-      self.applyCommandAvailability()
+      self.installRemoteTargets()
     }
   }
 
   // MARK: - MPRemoteCommandCenter
 
-  /// 一次性安装。注册了 skip / seek 命令会让控制中心把「上一章 / 下一章」
-  /// 换成 15 秒快退 / 快进，所以这些能力一律禁用且不挂 target。
-  private func installRemoteCommands() {
-    guard !commandsInstalled else { return }
-    commandsInstalled = true
+  /// 媒体插件起播时常会 `removeTarget(nil)`，把本 App 先前挂的闭包 target
+  /// 一并清空；之后卡片上的 ⏮ / ⏭ 虽仍是 enabled，系统却找不到处理者，
+  /// 按下去毫无反应。用 self 作为 target 才能精确移除 / 重装，且每次元数据
+  /// 刷新都重装一次：既不叠加，也不会动到别的组件挂的 target。
+  /// 注册了 skip / seek 命令会让控制中心把「上一章 / 下一章」换成 15 秒
+  /// 快退 / 快进，所以这些能力一律禁用且不挂 target。
+  private func installRemoteTargets() {
     let center = MPRemoteCommandCenter.shared()
     let unavailable: [MPRemoteCommand] = [
       center.skipForwardCommand,
@@ -1083,31 +1098,49 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     ]
     for command in unavailable { command.isEnabled = false }
 
-    center.playCommand.addTarget { [weak self] _ in
-      self?.sendRemoteAction("play")
-      return .success
-    }
-    center.pauseCommand.addTarget { [weak self] _ in
-      self?.sendRemoteAction("pause")
-      return .success
-    }
-    center.togglePlayPauseCommand.addTarget { [weak self] _ in
-      self?.sendRemoteAction("playPause")
-      return .success
-    }
-    center.nextTrackCommand.addTarget { [weak self] _ in
-      self?.sendRemoteAction("next")
-      return .success
-    }
-    center.previousTrackCommand.addTarget { [weak self] _ in
-      self?.sendRemoteAction("prev")
-      return .success
-    }
-    center.stopCommand.addTarget { [weak self] _ in
-      self?.sendRemoteAction("stop")
-      return .success
+    let targets: [(MPRemoteCommand, Selector)] = [
+      (center.playCommand, #selector(onPlayCommand(_:))),
+      (center.pauseCommand, #selector(onPauseCommand(_:))),
+      (center.togglePlayPauseCommand, #selector(onTogglePlayPauseCommand(_:))),
+      (center.nextTrackCommand, #selector(onNextTrackCommand(_:))),
+      (center.previousTrackCommand, #selector(onPreviousTrackCommand(_:))),
+      (center.stopCommand, #selector(onStopCommand(_:))),
+    ]
+    for (command, selector) in targets {
+      command.removeTarget(self)
+      command.addTarget(self, action: selector)
     }
     applyCommandAvailability()
+  }
+
+  @objc private func onPlayCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    sendRemoteAction("play")
+    return .success
+  }
+
+  @objc private func onPauseCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    sendRemoteAction("pause")
+    return .success
+  }
+
+  @objc private func onTogglePlayPauseCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    sendRemoteAction("playPause")
+    return .success
+  }
+
+  @objc private func onNextTrackCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    sendRemoteAction("next")
+    return .success
+  }
+
+  @objc private func onPreviousTrackCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    sendRemoteAction("prev")
+    return .success
+  }
+
+  @objc private func onStopCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    sendRemoteAction("stop")
+    return .success
   }
 
   private func applyCommandAvailability() {
@@ -1145,7 +1178,9 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       }
       channel.invokeMethod("onRemoteAction", arguments: ["action": action])
       if task != .invalid {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+        // 留给 Dart 切章、取流到新音频起播的完整窗口；新音频一起播，
+        // audio 后台模式就接手，不再依赖这段临时执行时间。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
           UIApplication.shared.endBackgroundTask(task)
         }
       }
@@ -1233,7 +1268,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     info = next
     MPNowPlayingInfoCenter.default().nowPlayingInfo = next
     MPNowPlayingInfoCenter.default().playbackState = playing ? .playing : .paused
-    applyCommandAvailability()
+    installRemoteTargets()
     updateNotification(title: title, episode: episode)
     loadArtwork(coverUrl)
   }
