@@ -103,6 +103,13 @@ class _ListenModePageState extends State<ListenModePage>
     switch (action) {
       case 'playPause':
         unawaited(_togglePlay());
+      // iOS 控制中心的播放与暂停是两枚独立按钮，不能都当切换处理。
+      case 'play':
+        unawaited(_player?.play());
+        unawaited(_startForeground());
+      case 'pause':
+        unawaited(_player?.pause());
+        unawaited(_startForeground());
       case 'prev':
         if (_index > 0) unawaited(_step(-1));
       case 'next':

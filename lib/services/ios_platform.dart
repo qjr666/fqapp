@@ -53,6 +53,31 @@ class IosPlatform {
   /// 「当前正在念的那句」的 range，报成别的 id 会被整条丢掉，高亮与跟翻
   /// 从此不推进，章末也走不到换章。
   final _utteranceQueue = <String>[];
+
+  /// 系统媒体卡片（音乐播放器）的远控动作直连表。
+  ///
+  /// `NativePlayer` 只有一个静态 handler：听书页、阅读页系统朗读、短剧页
+  /// 会在 initState / dispose 时互相覆盖或清掉对方的注册，卡片上的上一章 /
+  /// 下一章于是经常没有任何消费方。这里改成「最后声明的活跃会话优先，
+  /// 谁接下动作就停」的栈，注册方自己判断当前是否还在播。
+  static final List<bool Function(String)> _mediaHandlers = [];
+
+  static void registerMediaHandler(bool Function(String) handler) {
+    _mediaHandlers.remove(handler);
+    _mediaHandlers.add(handler);
+  }
+
+  static void unregisterMediaHandler(bool Function(String) handler) {
+    _mediaHandlers.remove(handler);
+  }
+
+  static bool dispatchMediaAction(String action) {
+    for (final handler in _mediaHandlers.reversed) {
+      if (handler(action)) return true;
+    }
+    return false;
+  }
+
   int _nextId = 1000000;
   bool _initialized = false;
   bool _mediaKitReady = false;
@@ -244,6 +269,9 @@ class IosPlatform {
         ? raw
         : null;
     if (action == null || action.isEmpty) return null;
+    // 先交给当前活跃的听书会话，绕开 NativePlayer 那份会被别的页面清掉的
+    // 静态 handler；短剧等未注册会话仍走旧的 Android 通知契约。
+    if (IosPlatform.dispatchMediaAction(action)) return null;
     await PlatformChannels.notify(
       'fqapp/native_player',
       'onNotificationAction',

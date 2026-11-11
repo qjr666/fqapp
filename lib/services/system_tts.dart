@@ -13,6 +13,7 @@ import 'api_client.dart';
 import 'audio_preferences.dart';
 import 'backend_transport.dart';
 import 'chapter_cache_store.dart';
+import 'ios_platform.dart';
 import 'chapter_text_formatter.dart';
 import 'listening_session.dart';
 import 'narration_sentence.dart';
@@ -299,7 +300,18 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
       },
     );
     NativePlayer.setRemoteCommandHandler(onAction: _remoteAction);
+    if (isIOSPlatform) IosPlatform.registerMediaHandler(_iosRemote);
     unawaited(openChapter(index, offset: book.startOffset));
+  }
+
+  /// 同一个 tear-off 对象用于注册和注销，避免函数字面量比对不稳。
+  late final bool Function(String) _iosRemote = _handleIosRemote;
+
+  /// 锁屏 / 控制中心 / 灵动岛按下的动作直达本次朗读会话。
+  bool _handleIosRemote(String action) {
+    if (closed) return false;
+    _remoteAction(action);
+    return true;
   }
 
   void _remoteAction(String action) {
@@ -762,6 +774,9 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
       _preferencesChanged,
     );
     NativePlayer.clearRemoteCommandHandler(_remoteAction);
+    if (isIOSPlatform) {
+      IosPlatform.unregisterMediaHandler(_iosRemote);
+    }
     ListeningSession.instance.clear();
     notifyListeners();
     // Do not await the EventChannel cancel: awaiting a platform-stream

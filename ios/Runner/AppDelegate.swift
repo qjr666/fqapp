@@ -1,3 +1,4 @@
+import AVFoundation
 import Flutter
 import MediaPlayer
 import UIKit
@@ -810,6 +811,13 @@ final class NowPlayingChannel {
   private var artwork: MPMediaItemArtwork?
   /// 最近一次下发的元数据：封面下载完成后要拿它整体重发一次。
   private var info: [String: Any] = [:]
+  /// 音乐播放器式的常驻后台音频。
+  ///
+  /// AVSpeechSynthesizer / media_kit 在念完一句、一章播完、切章取流的间隙
+  /// 会完全静下来，iOS 立刻把 App 挂起：Dart 侧的连播倒计时、下一章取流、
+  /// 新播放器创建全部冻结，锁屏卡片也随时会消失，点它更不会把 App 唤回。
+  /// 循环播放一段零音量 PCM 让系统始终把本 App 当作「正在播放」的一方。
+  private var silentPlayer: AVAudioPlayer?
 
   func register(messenger: FlutterBinaryMessenger) {
     let channel = FlutterMethodChannel(
@@ -828,6 +836,100 @@ final class NowPlayingChannel {
     // 不声明接收远控事件时，系统不把本 App 认作「正在播放」的一方：
     // 锁屏 / 控制中心 / 灵动岛卡片上的按钮按下去不会有事件送到这里。
     UIApplication.shared.beginReceivingRemoteControlEvents()
+    // 点击锁屏 / 通知中心的媒体卡片把 App 唤回前台时，其它媒体组件可能
+    // 已经把远控 target 摘掉；回到前台就重装一次，按键立刻可用。
+    NotificationCenter.default.addObserver(
+      forName: UIApplication.didBecomeActiveNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.reinstallRemoteTargets()
+      self?.ensurePlaybackSession()
+    }
+    // 来电、Siri、其它 App 抢占音频后系统会去激活会话；中断结束时必须
+    // 重新把播放身份和常驻音轨立起来，否则后台连播与卡片一起失效。
+    NotificationCenter.default.addObserver(
+      forName: AVAudioSession.interruptionNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] note in
+      guard
+        let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+        let type = AVAudioSession.InterruptionType(rawValue: raw),
+        type == .ended
+      else { return }
+      self?.ensurePlaybackSession()
+      self?.startSilentLoop()
+      self?.reinstallRemoteTargets()
+    }
+    ensurePlaybackSession()
+  }
+
+  private func reinstallRemoteTargets() {
+    installRemoteTargets()
+    UIApplication.shared.beginReceivingRemoteControlEvents()
+  }
+
+  /// 只有音频会话处于 playback 且 active，系统才把本 App 认作当前播放器：
+  /// 卡片才会出现在锁屏 / 控制中心 / 灵动岛，点卡片才能直接进 App。
+  /// Dart 侧已经设过类别与混播选项，这里只在类别不对时兜底，不覆盖
+  /// mixWithOthers，避免把用户的「允许同时播放」设置冲掉。
+  private func ensurePlaybackSession() {
+    let session = AVAudioSession.sharedInstance()
+    do {
+      if session.category != .playback {
+        try session.setCategory(
+          .playback,
+          mode: .spokenAudio,
+          options: [.allowBluetoothA2DP]
+        )
+      }
+      try session.setActive(true)
+    } catch {
+      // 会话被系统临时占用（来电、Siri）时下次 update 会再试，不阻断播放。
+    }
+  }
+
+  /// 零音量循环音轨：章末换章、下一集取流期间保住后台执行窗口。
+  private func startSilentLoop() {
+    if silentPlayer?.isPlaying == true { return }
+    silentPlayer?.stop()
+    silentPlayer = nil
+    let frames = 4000  // 8kHz 单声道 16bit，0.5 秒
+    var wav = Data()
+    func bytes(_ values: [UInt8]) { wav.append(contentsOf: values) }
+    func text(_ value: String) { wav.append(contentsOf: value.utf8) }
+    func int32(_ value: Int32) {
+      let bits = UInt32(bitPattern: value).littleEndian
+      bytes([
+        UInt8(bits & 0xff), UInt8((bits >> 8) & 0xff),
+        UInt8((bits >> 16) & 0xff), UInt8((bits >> 24) & 0xff),
+      ])
+    }
+    func int16(_ value: Int16) {
+      let bits = UInt16(bitPattern: value).littleEndian
+      bytes([UInt8(bits & 0xff), UInt8((bits >> 8) & 0xff)])
+    }
+    text("RIFF"); int32(Int32(36 + frames * 2)); text("WAVE")
+    text("fmt "); int32(16); int16(1); int16(1)
+    int32(8000); int32(16000); int16(2); int16(16)
+    text("data"); int32(Int32(frames * 2))
+    wav.append(Data(count: frames * 2))
+    do {
+      let player = try AVAudioPlayer(data: wav, fileTypeHint: AVFileType.wav.rawValue)
+      player.volume = 0
+      player.numberOfLoops = -1
+      player.prepareToPlay()
+      silentPlayer = player
+      player.play()
+    } catch {
+      silentPlayer = nil
+    }
+  }
+
+  private func stopSilentLoop() {
+    silentPlayer?.stop()
+    silentPlayer = nil
   }
 
   /// 远控按钮。系统控制中心与锁屏上的「播放 / 暂停」是**两个**命令，
@@ -924,6 +1026,7 @@ final class NowPlayingChannel {
       artworkURL = nil
       artwork = nil
       info = [:]
+      stopSilentLoop()
       MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
       MPNowPlayingInfoCenter.default().playbackState = .stopped
       result(nil)
@@ -937,6 +1040,11 @@ final class NowPlayingChannel {
   /// `positionMs` 与 `durationMs` 必须一起给：系统按这两个值外推进度条，
   /// 只给一个会让卡片两侧的时间对不上。
   private func apply(_ args: [String: Any]) {
+    // 每次刷新都重新声明一次播放身份：会话可能被系统打断后去激活，
+    // 而常驻音轨必须一直跑到 clear() 为止，后台换章才不会被挂起。
+    ensurePlaybackSession()
+    startSilentLoop()
+    UIApplication.shared.beginReceivingRemoteControlEvents()
     let title = args["title"] as? String ?? ""
     let episode = args["episode"] as? String ?? ""
     let playing = args["playing"] as? Bool ?? false
@@ -953,8 +1061,10 @@ final class NowPlayingChannel {
       next[MPMediaItemPropertyArtist] = episode
       next[MPMediaItemPropertyAlbumTitle] = episode
     }
-    if durationMs > 0 { next[MPMediaItemPropertyPlaybackDuration] = durationMs / 1000 }
-    if positionMs > 0 { next[MPNowPlayingInfoPropertyElapsedPlaybackTime] = positionMs / 1000 }
+    // 音乐播放器卡片的两个时间轴字段必须始终成对存在：缺一个，系统就
+    // 把它当成「不支持进度的音频」，卡片退化成只有一行标题的样式。
+    next[MPMediaItemPropertyPlaybackDuration] = durationMs / 1000
+    next[MPNowPlayingInfoPropertyElapsedPlaybackTime] = positionMs / 1000
     next[MPNowPlayingInfoPropertyPlaybackRate] = playing ? speed : 0
     next[MPNowPlayingInfoPropertyDefaultPlaybackRate] = speed
     if let artwork = artwork { next[MPMediaItemPropertyArtwork] = artwork }

@@ -205,6 +205,7 @@ class _AudioPlaybackController extends ChangeNotifier
       onAction: _handleRemoteAction,
       onBecomingNoisy: _handleBecomingNoisy,
     );
+    if (isIOSPlatform) IosPlatform.registerMediaHandler(_iosRemote);
     unawaited(AudioPreferences.instance.load());
     AudioPreferences.instance.backgroundPlayback.addListener(
       _preferencesChanged,
@@ -408,6 +409,17 @@ class _AudioPlaybackController extends ChangeNotifier
         speed: _rate,
       ),
     );
+  }
+
+  /// 同一个 tear-off 对象用于注册和注销，避免函数字面量比对不稳。
+  late final bool Function(String) _iosRemote = _handleIosRemote;
+
+  /// 锁屏 / 控制中心 / 灵动岛按下的播放、暂停、上一章、下一章直达本会话。
+  /// 后台时 App 无法重建界面，这条路径不能依赖任何页面是否 mounted。
+  bool _handleIosRemote(String action) {
+    if (_closed || _chapters.isEmpty) return false;
+    _handleRemoteAction(action);
+    return true;
   }
 
   void _handleRemoteAction(String action) {
@@ -1501,6 +1513,7 @@ class _AudioPlaybackController extends ChangeNotifier
       _preferencesChanged,
     );
     NativePlayer.clearRemoteCommandHandler(_handleRemoteAction);
+    if (isIOSPlatform) IosPlatform.unregisterMediaHandler(_iosRemote);
     ListeningSession.instance.clear();
     final saved = _persistProgress().catchError((Object _) {});
     final released = _releasePlayer();
