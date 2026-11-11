@@ -47,6 +47,10 @@ class IosPlatform {
   /// 内容没变就别再走一次 IPC。
   Map<String, dynamic>? _nowPlayingPayload;
 
+  /// 上次真正下发到原生侧的时刻。元数据不变也要周期性重发，否则原生侧
+  /// 不会重新 apply，被别的音频组件摘掉的远控 target 一直恢复不了。
+  DateTime? _lastNowPlayingSent;
+
   /// `SystemTtsPlayback` 一次预排两句，AVSpeechSynthesizer 严格按 FIFO 念。
   /// 引擎的回调都不带 utterance id，这里按入队顺序自己对齐：队首就是此刻
   /// 正在念的那句，done 取走队首。range 必须报队首的 id —— Dart 侧只认
@@ -153,6 +157,13 @@ class IosPlatform {
       debugPrint('[ios-player] MediaKit init failed: $error');
     }
     _initialized = true;
+    // 原生侧缓存了冷启动期间的远控动作，必须等 setMethodCallHandler 挂好
+    // 之后才让它补发，否则那些上一章 / 下一章没有接收者。
+    try {
+      await _nowPlayingChannel.invokeMethod<void>('ready');
+    } catch (error) {
+      debugPrint('[ios-now-playing] ready failed: $error');
+    }
   }
 
   /// 应用当前的混播策略到 iOS 音频会话。
@@ -290,15 +301,26 @@ class IosPlatform {
       'episode': args['episode'] as String? ?? '',
       'coverUrl': args['coverUrl'] as String? ?? '',
       'playing': args['playing'] == true,
-      'hasPrev': args['hasPrev'] == true,
-      'hasNext': args['hasNext'] == true,
+      // 部分刷新路径不带章节边界；缺省按「两端都有」处理，否则原生侧把
+      // 上一章 / 下一章判成不可用，按钮按下去没有任何动作。
+      'hasPrev': args['hasPrev'] != false,
+      'hasNext': args['hasNext'] != false,
       'positionMs': (args['positionMs'] as num?)?.toInt() ?? 0,
       'durationMs': (args['durationMs'] as num?)?.toInt() ?? 0,
       'speed': (args['speed'] as num?)?.toDouble() ?? 1,
     };
     final previous = _nowPlayingPayload;
-    if (previous != null && _sameNowPlaying(previous, payload)) return;
+    final now = DateTime.now();
+    // MPRemoteCommandCenter 是进程级单例，别的音频组件起播会摘掉 target；
+    // 只有原生侧重新 apply 才恢复，因此元数据不变也要周期性重发。
+    final stale =
+        _lastNowPlayingSent == null ||
+        now.difference(_lastNowPlayingSent!).inSeconds >= 15;
+    if (previous != null && !stale && _sameNowPlaying(previous, payload)) {
+      return;
+    }
     _nowPlayingPayload = payload;
+    _lastNowPlayingSent = now;
     try {
       await _nowPlayingChannel.invokeMethod<void>('update', payload);
     } catch (error) {
@@ -311,6 +333,7 @@ class IosPlatform {
   Future<void> _clearNowPlaying() async {
     if (_nowPlayingPayload == null) return;
     _nowPlayingPayload = null;
+    _lastNowPlayingSent = null;
     try {
       await _nowPlayingChannel.invokeMethod<void>('clear');
     } catch (error) {

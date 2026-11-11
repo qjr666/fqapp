@@ -850,6 +850,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   private var hasNext = true
   private var lastNotificationTitle = ""
   private var lastNotificationEpisode = ""
+  private var lastNotificationKey = ""
   private var notificationNeedsRefresh = true
   /// 后台通知动作可能早于 Flutter 隐式引擎桥接完成，先缓存再补发。
   private var pendingRemoteActions: [String] = []
@@ -869,11 +870,8 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       }
       self.handle(call, result)
     }
-    let queued = pendingRemoteActions
-    pendingRemoteActions.removeAll()
-    for action in queued {
-      channel.invokeMethod("onRemoteAction", arguments: ["action": action])
-    }
+    // 缓存的动作等 Dart 挂好 setMethodCallHandler 后由 ready 补发：引擎刚
+    // 创建通道时 Dart 侧还没有接收者，这里立刻补发会永久丢失。
     installRemoteTargets()
     UIApplication.shared.beginReceivingRemoteControlEvents()
     observeSystemEvents()
@@ -1112,6 +1110,9 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     ]
     for (command, selector) in targets {
       command.removeTarget(self)
+      // 第三方音频组件起播常把 next / previous 置为不可用或摘掉 target；
+      // 播放 / 暂停是系统默认命令仍能显示，两端按钮却会整排消失。
+      command.isEnabled = true
       command.addTarget(self, action: selector)
     }
     applyCommandAvailability()
@@ -1133,11 +1134,14 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   }
 
   @objc private func onNextTrackCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    // 章末按下时给系统一个明确的「无可切换项」，而不是静默吞掉。
+    guard sessionPublished, hasNext else { return .noActionableNowPlayingItem }
     sendRemoteAction("next")
     return .success
   }
 
   @objc private func onPreviousTrackCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    guard sessionPublished, hasPrev else { return .noActionableNowPlayingItem }
     sendRemoteAction("prev")
     return .success
   }
@@ -1153,8 +1157,11 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     center.pauseCommand.isEnabled = true
     center.togglePlayPauseCommand.isEnabled = true
     center.stopCommand.isEnabled = true
-    center.previousTrackCommand.isEnabled = hasPrev
-    center.nextTrackCommand.isEnabled = hasNext
+    // 有会话就声明两条轨道切换命令。用 isEnabled 按章节边界隐藏按钮时，
+    // 首 / 末章或 hasPrev / hasNext 未透传都会让整排按钮消失，系统只剩
+    // 播放 / 暂停；边界改由 onPreviousTrackCommand / onNextTrackCommand 拒绝。
+    center.previousTrackCommand.isEnabled = sessionPublished
+    center.nextTrackCommand.isEnabled = sessionPublished
     center.skipBackwardCommand.isEnabled = false
     center.skipForwardCommand.isEnabled = false
   }
@@ -1175,7 +1182,13 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
         if task != .invalid { UIApplication.shared.endBackgroundTask(task) }
         return
       }
-      channel.invokeMethod("onRemoteAction", arguments: ["action": action])
+      // 带回执：Dart 的 method handler 还没挂（冷启动 / 引擎重建）时，
+      // 把动作放回缓存，等 ready 或下一次 update 再补发，不再静默丢。
+      channel.invokeMethod("onRemoteAction", arguments: ["action": action]) {
+        [weak self] result in
+        guard let self, result is FlutterError else { return }
+        self.pendingRemoteActions.append(action)
+      }
       if task != .invalid {
         // 覆盖 Dart 切章、取流到新音频起播的窗口；新音频一起播，
         // audio 后台模式接手，不再依赖这段临时执行时间。
@@ -1191,12 +1204,26 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     }
   }
 
+  /// 冷启动 / 引擎重建期间缓存的远控动作，只在 Dart 接收者就绪后补发。
+  private func drainPendingRemoteActions() {
+    guard let channel, !pendingRemoteActions.isEmpty else { return }
+    let queued = pendingRemoteActions
+    pendingRemoteActions.removeAll()
+    for action in queued {
+      channel.invokeMethod("onRemoteAction", arguments: ["action": action])
+    }
+  }
+
   // MARK: - Channel
 
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
     switch call.method {
     case "update":
       apply(call.arguments as? [String: Any] ?? [:])
+      result(nil)
+    case "ready":
+      // Dart 已挂好 onRemoteAction 接收者，此时补发才有人接。
+      drainPendingRemoteActions()
       result(nil)
     case "clear":
       artworkTask?.cancel()
@@ -1263,21 +1290,28 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     MPNowPlayingInfoCenter.default().nowPlayingInfo = next
     MPNowPlayingInfoCenter.default().playbackState = playing ? .playing : .paused
     applyCommandAvailability()
-    updateNotification(title: title, episode: episode)
+    updateNotification(title: title, episode: episode, playing: playing)
     loadArtwork(coverUrl)
+    drainPendingRemoteActions()
   }
 
   // MARK: - 通知栏
 
   /// 固定 identifier 的本地通知：重复 add 会替换同一条，不会堆积；点主体
   /// 由系统带回 App，delegate 里恢复媒体会话。
-  private func updateNotification(title: String, episode: String) {
+  private func updateNotification(
+    title: String,
+    episode: String,
+    playing: Bool
+  ) {
     guard !title.isEmpty else { return }
-    if !notificationNeedsRefresh &&
-       title == lastNotificationTitle &&
-       episode == lastNotificationEpisode { return }
+    // 章节边界 / 播放状态变了也要重投：category 在投递时就固定，旧条目
+    // 不会补上新的 actions；只比标题会让切章后的通知仍是旧按钮集。
+    let key = "\(title)|\(episode)|\(hasPrev)|\(hasNext)|\(playing)"
+    if !notificationNeedsRefresh && key == lastNotificationKey { return }
     lastNotificationTitle = title
     lastNotificationEpisode = episode
+    lastNotificationKey = key
     notificationNeedsRefresh = false
     UNUserNotificationCenter.current().getNotificationSettings { settings in
       let status = settings.authorizationStatus
@@ -1290,7 +1324,9 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       // 一条纯文本，按哪里都切不了章。
       content.categoryIdentifier = NowPlayingChannel.categoryID
       content.userInfo = ["nowPlaying": true]
-      content.interruptionLevel = .passive
+      // passive 条目在锁屏 / 通知中心被折叠，展开后的上一首 / 下一首用户
+      // 看不到；active 才作为可交互条目出现在通知栏。
+      content.interruptionLevel = .active
       let request = UNNotificationRequest(
         identifier: NowPlayingChannel.notificationID,
         content: content,
@@ -1305,6 +1341,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   private func removeNotification() {
     lastNotificationTitle = ""
     lastNotificationEpisode = ""
+    lastNotificationKey = ""
     UNUserNotificationCenter.current().removeDeliveredNotifications(
       withIdentifiers: [NowPlayingChannel.notificationID]
     )

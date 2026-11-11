@@ -141,7 +141,7 @@ class NativePlayer {
   static void clearRemoteCommandHandler([
     void Function(String action)? owner,
   ]) {
-    if (owner != null && !identical(_onRemoteAction, owner)) return;
+    if (owner != null && _onRemoteAction != owner) return;
     _onRemoteAction = null;
     _onBecomingNoisy = null;
   }

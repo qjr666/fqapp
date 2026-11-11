@@ -90,6 +90,9 @@ class _ListenModePageState extends State<ListenModePage>
       onAction: _handleRemoteAction,
       onBecomingNoisy: _handleBecomingNoisy,
     );
+    // iOS 的远控动作先按活跃会话栈分发；本页不注册就只落到静态槽，别的
+    // 听书会话残留时上一章 / 下一章会被它吞掉或无人接收。
+    if (isIOSPlatform) IosPlatform.registerMediaHandler(_iosRemote);
     unawaited(_load(_index, autoplay: true));
     PlayerPreferences.loadPlaybackRate().then((rate) {
       if (!mounted) return;
@@ -97,6 +100,16 @@ class _ListenModePageState extends State<ListenModePage>
       unawaited(_player?.setRate(_rate));
       if (mounted) setState(() {});
     });
+  }
+
+  /// 同一个 tear-off 对象用于注册和注销。
+  late final bool Function(String) _iosRemote = _handleIosRemote;
+
+  /// 页面已回收时返回 false，让动作继续向下转发而不是被空壳吞掉。
+  bool _handleIosRemote(String action) {
+    if (!mounted) return false;
+    _handleRemoteAction(action);
+    return true;
   }
 
   void _handleRemoteAction(String action) {
@@ -146,6 +159,7 @@ class _ListenModePageState extends State<ListenModePage>
     _popped = true;
     WidgetsBinding.instance.removeObserver(this);
     NativePlayer.clearRemoteCommandHandler(_handleRemoteAction);
+    if (isIOSPlatform) IosPlatform.unregisterMediaHandler(_iosRemote);
     _completedSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
