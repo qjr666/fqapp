@@ -61,6 +61,9 @@ class IosPlatform {
   /// 都被丢弃，高亮与跟翻再也不推进。
   final _utteranceQueue = <String>[];
   final _utteranceTexts = <String, String>{};
+  /// 引擎此刻正在念的那一句。两句文本相同时，光靠文本匹配会把 range
+  /// 归到刚念完的上一句，高亮与跟翻就会整整滞后一句。
+  String? _currentId;
   int _nextId = 1000000;
   bool _initialized = false;
   bool _mediaKitReady = false;
@@ -71,21 +74,17 @@ class IosPlatform {
   void _emit(String name, dynamic event) => _events[name]?.add(event);
 
   void _ttsEvent(String type, {int? rangeStart, String? text}) {
-    if (type == 'cancelled') {
-      // 引擎把队列清空了：AVSpeechSynthesizer 停止时，队列里剩下的 utterance
-      // 既不读完也不取消，它们的回调永远不来。Dart 侧必须知道这件事，
-      // 否则朗读状态机与高亮就此脱节。
-      _utteranceQueue.clear();
-      _utteranceTexts.clear();
-      _emit('fqapp/system_tts_events', <String, dynamic>{'type': 'cancelled'});
-      return;
-    }
     if (_utteranceQueue.isEmpty) return;
     final id = type == 'done'
         ? _utteranceQueue.removeAt(0)
         : _idForEvent(text);
     if (id == null) return;
-    if (type == 'done') _utteranceTexts.remove(id);
+    if (type == 'done') {
+      _utteranceTexts.remove(id);
+      if (_currentId == id) _currentId = null;
+    } else if (type == 'start') {
+      _currentId = id;
+    }
     _emit('fqapp/system_tts_events', <String, dynamic>{
       'type': type,
       'id': id,
@@ -94,8 +93,15 @@ class IosPlatform {
   }
 
   /// range 事件按句子文本精确对回它的 id；对不上（正文替换改写过文本等）
-  /// 才退回队首。
+  /// 才退回队首。优先认当前正在念的那一句。
   String? _idForEvent(String? text) {
+    final current = _currentId;
+    if (text != null &&
+        text.isNotEmpty &&
+        current != null &&
+        _utteranceTexts[current] == text) {
+      return current;
+    }
     if (text != null && text.isNotEmpty) {
       for (final id in _utteranceQueue) {
         if (_utteranceTexts[id] == text) return id;
@@ -138,9 +144,11 @@ class IosPlatform {
     _tts.setProgressHandler((String text, int start, int _, String _) {
       _ttsEvent('range', rangeStart: start, text: text);
     });
-    // 引擎队列被清空（停止朗读）：剩下的句子永远不会再有回调，通知 Dart
-    // 侧把状态机重建一遍。
-    _tts.setCancelHandler(() => _ttsEvent('cancelled'));
+    // 这里**不能**注册 setCancelHandler 去广播「引擎已清空」：
+    // SystemTtsPlayback 每排一句才调一次 speak，flush 那句会先 stop 再念，
+    // 而 stop 的 didCancel 回调会把 Dart 侧刚入队的句子连同 _speakingId
+    // 一起清掉 —— 之后 start / range / done 全被当成过期事件丢弃，跟翻停摆、
+    // 章末也不会接下一章。停朗读的路径本身已经会 _resetQueue。
     _tts.setErrorHandler((dynamic _) {
       if (_utteranceQueue.isEmpty) return;
       final id = _utteranceQueue.removeAt(0);
@@ -423,6 +431,7 @@ class IosPlatform {
         // 上一句的 done 误发给新一句。
         _utteranceQueue.clear();
         _utteranceTexts.clear();
+        _currentId = null;
         await _tts.stop();
         final engine = args['engine'];
         if (engine is String && engine.startsWith('{')) {
@@ -449,6 +458,7 @@ class IosPlatform {
         // 自身入队」来模拟。忽略 queue 会让两句的 done 全部记到后一句上。
         if (args['queue'] != true) {
           _utteranceQueue.clear();
+          _currentId = null;
           await _tts.stop();
         }
         final id = args['id'] as String;
@@ -470,6 +480,7 @@ class IosPlatform {
         // 不动 session，SystemTtsPlayback.resume() 会重新起播同一句。
         _utteranceQueue.clear();
         _utteranceTexts.clear();
+        _currentId = null;
         await _tts.stop();
         return null;
       case 'settings':

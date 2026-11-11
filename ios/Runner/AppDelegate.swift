@@ -840,6 +840,8 @@ final class NowPlayingChannel {
     center.nextTrackCommand.removeTarget(nil)
     center.previousTrackCommand.removeTarget(nil)
     center.stopCommand.removeTarget(nil)
+    center.skipForwardCommand.removeTarget(nil)
+    center.skipBackwardCommand.removeTarget(nil)
 
     center.playCommand.addTarget { [weak self] _ in
       self?.sendRemoteAction("play")
@@ -865,10 +867,32 @@ final class NowPlayingChannel {
       self?.sendRemoteAction("stop")
       return .success
     }
+    // 锁屏 / 控制中心 / 灵动岛展开卡片对有声书类内容给的是「快进 / 快退」
+    // 两枚按钮（skipForward / skipBackward），不是 nextTrack / previousTrack。
+    // 只注册后者时用户按到的那一枚什么也不发，看起来就是「切不了下一章」。
+    center.skipForwardCommand.addTarget { [weak self] _ in
+      self?.sendRemoteAction("next")
+      return .success
+    }
+    center.skipBackwardCommand.addTarget { [weak self] _ in
+      self?.sendRemoteAction("prev")
+      return .success
+    }
   }
 
   private func sendRemoteAction(_ action: String) {
-    channel?.invokeMethod("onRemoteAction", arguments: ["action": action])
+    // MPRemoteCommandCenter 的回调不保证在主线程，而 FlutterMethodChannel
+    // 只能在主线程发消息。后台收到远控时走错线程，动作会石沉大海。
+    if Thread.isMainThread {
+      channel?.invokeMethod("onRemoteAction", arguments: ["action": action])
+    } else {
+      DispatchQueue.main.async { [weak self] in
+        self?.channel?.invokeMethod(
+          "onRemoteAction",
+          arguments: ["action": action]
+        )
+      }
+    }
   }
 
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
@@ -925,6 +949,8 @@ final class NowPlayingChannel {
     let center = MPRemoteCommandCenter.shared()
     center.previousTrackCommand.isEnabled = hasPrev
     center.nextTrackCommand.isEnabled = hasNext
+    center.skipBackwardCommand.isEnabled = hasPrev
+    center.skipForwardCommand.isEnabled = hasNext
 
     loadArtwork(coverUrl)
   }
