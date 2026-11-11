@@ -47,23 +47,12 @@ class IosPlatform {
   /// 内容没变就别再走一次 IPC。
   Map<String, dynamic>? _nowPlayingPayload;
 
-  /// `SystemTtsPlayback` 一次预排两句，而 AVSpeechSynthesizer 会把 utterance
-  /// 入队。done / start / range 必须按先进先出还给正确的 id。
-  ///
-  /// AVSpeechSynthesizer 的回调**不带 utterance id**，只有 range 回调带上
-  /// 了这一句的文本（flutter_tts 的 iOS 实现把 `utterance.speechString` 放在
-  /// 第一个参数里）。所以这里同时记下每句的文本：range 事件按文本精确对回
-  /// 它所属的句子，对不上才退回「队首」这种猜测。
-  ///
-  /// 只靠「队首」猜会踩一个坑：句切换的那一瞬间，引擎已经开始念下一句，
-  /// 而上一句的「读完」回调还没到 Dart —— 队首这时仍指上一句，猜错就会让
-  /// 系统朗读侧把 range 当成「不是当前正在读的那句」丢掉，从此每一个 range
-  /// 都被丢弃，高亮与跟翻再也不推进。
+  /// `SystemTtsPlayback` 一次预排两句，AVSpeechSynthesizer 严格按 FIFO 念。
+  /// 引擎的回调都不带 utterance id，这里按入队顺序自己对齐：队首就是此刻
+  /// 正在念的那句，done 取走队首。range 必须报队首的 id —— Dart 侧只认
+  /// 「当前正在念的那句」的 range，报成别的 id 会被整条丢掉，高亮与跟翻
+  /// 从此不推进，章末也走不到换章。
   final _utteranceQueue = <String>[];
-  final _utteranceTexts = <String, String>{};
-  /// 引擎此刻正在念的那一句。两句文本相同时，光靠文本匹配会把 range
-  /// 归到刚念完的上一句，高亮与跟翻就会整整滞后一句。
-  String? _currentId;
   int _nextId = 1000000;
   bool _initialized = false;
   bool _mediaKitReady = false;
@@ -73,41 +62,16 @@ class IosPlatform {
 
   void _emit(String name, dynamic event) => _events[name]?.add(event);
 
-  void _ttsEvent(String type, {int? rangeStart, String? text}) {
+  void _ttsEvent(String type, {int? rangeStart}) {
     if (_utteranceQueue.isEmpty) return;
     final id = type == 'done'
         ? _utteranceQueue.removeAt(0)
-        : _idForEvent(text);
-    if (id == null) return;
-    if (type == 'done') {
-      _utteranceTexts.remove(id);
-      if (_currentId == id) _currentId = null;
-    } else if (type == 'start') {
-      _currentId = id;
-    }
+        : _utteranceQueue.first;
     _emit('fqapp/system_tts_events', <String, dynamic>{
       'type': type,
       'id': id,
       'start': ?rangeStart,
     });
-  }
-
-  /// range 事件按句子文本精确对回它的 id；对不上（正文替换改写过文本等）
-  /// 才退回队首。优先认当前正在念的那一句。
-  String? _idForEvent(String? text) {
-    final current = _currentId;
-    if (text != null &&
-        text.isNotEmpty &&
-        current != null &&
-        _utteranceTexts[current] == text) {
-      return current;
-    }
-    if (text != null && text.isNotEmpty) {
-      for (final id in _utteranceQueue) {
-        if (_utteranceTexts[id] == text) return id;
-      }
-    }
-    return _utteranceQueue.first;
   }
 
   Future<void> initialize() async {
@@ -135,14 +99,14 @@ class IosPlatform {
       debugPrint('[ios-tts] audio session setup failed: $error');
     }
 
-    _tts.setStartHandler(() => _ttsEvent('start'));
+    // 不注册 setStartHandler：didStart 不带 id，只能靠猜；而 Dart 侧的
+    // _speakingId 已经由 _pump（首句）和 done（下一句）维护好了。猜错会把
+    // _speakingId 指到还在排队的下一句，之后整章 range 全被当过期事件丢掉。
     _tts.setCompletionHandler(() => _ttsEvent('done'));
-    // willSpeakRangeOfSpeechString：恢复精确到字的高亮（可选增强，缺了
-    // SystemTtsPlayback 会退化为整句高亮）。第一个参数是这一句的**文本**
-    // —— AVSpeechSynthesizer 不回传 utterance id，靠它把 range 精确对回
-    // 正确的句子。
-    _tts.setProgressHandler((String text, int start, int _, String _) {
-      _ttsEvent('range', rangeStart: start, text: text);
+    // willSpeakRangeOfSpeechString：精确到字的高亮与跟翻锚点。引擎的回调
+    // 不带 utterance id，这里按 FIFO 队列把 range 归给队首那句。
+    _tts.setProgressHandler((String text, int start, int end, String word) {
+      _ttsEvent('range', rangeStart: start);
     });
     // 这里**不能**注册 setCancelHandler 去广播「引擎已清空」：
     // SystemTtsPlayback 每排一句才调一次 speak，flush 那句会先 stop 再念，
@@ -152,7 +116,6 @@ class IosPlatform {
     _tts.setErrorHandler((dynamic _) {
       if (_utteranceQueue.isEmpty) return;
       final id = _utteranceQueue.removeAt(0);
-      _utteranceTexts.remove(id);
       _emit('fqapp/system_tts_events', {'type': 'error', 'id': id});
     });
 
@@ -430,8 +393,6 @@ class IosPlatform {
         // 先清队列再 stop：stop 有可能触发 completion 回调，顺序反了会把
         // 上一句的 done 误发给新一句。
         _utteranceQueue.clear();
-        _utteranceTexts.clear();
-        _currentId = null;
         await _tts.stop();
         final engine = args['engine'];
         if (engine is String && engine.startsWith('{')) {
@@ -458,12 +419,10 @@ class IosPlatform {
         // 自身入队」来模拟。忽略 queue 会让两句的 done 全部记到后一句上。
         if (args['queue'] != true) {
           _utteranceQueue.clear();
-          _currentId = null;
           await _tts.stop();
         }
         final id = args['id'] as String;
         _utteranceQueue.add(id);
-        _utteranceTexts[id] = args['text'] as String;
         final result = await _tts.speak(args['text'] as String);
         if (result == 0) {
           _utteranceQueue.remove(id);
@@ -479,8 +438,6 @@ class IosPlatform {
         // iOS 没有 Android 那套音频焦点机制，pause 与 stop 等价：停引擎但
         // 不动 session，SystemTtsPlayback.resume() 会重新起播同一句。
         _utteranceQueue.clear();
-        _utteranceTexts.clear();
-        _currentId = null;
         await _tts.stop();
         return null;
       case 'settings':

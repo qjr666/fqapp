@@ -825,6 +825,9 @@ final class NowPlayingChannel {
       self.handle(call, result)
     }
     configureRemoteCommands()
+    // 不声明接收远控事件时，系统不把本 App 认作「正在播放」的一方：
+    // 锁屏 / 控制中心 / 灵动岛卡片上的按钮按下去不会有事件送到这里。
+    UIApplication.shared.beginReceivingRemoteControlEvents()
   }
 
   /// 远控按钮。系统控制中心与锁屏上的「播放 / 暂停」是**两个**命令，
@@ -842,6 +845,16 @@ final class NowPlayingChannel {
     center.stopCommand.removeTarget(nil)
     center.skipForwardCommand.removeTarget(nil)
     center.skipBackwardCommand.removeTarget(nil)
+    // 注册了 skip 命令的 App，控制中心会把「上一章 / 下一章」换成
+    // 「快退 15 秒 / 快进 15 秒」两枚按钮，图标与语义都不对。切章只走
+    // nextTrack / previousTrack，skip 两枚保持禁用、不挂 target。
+    center.skipForwardCommand.isEnabled = false
+    center.skipBackwardCommand.isEnabled = false
+    // 命令默认未必是启用态：只挂 target 不启用，按钮看得见却按不动。
+    center.playCommand.isEnabled = true
+    center.pauseCommand.isEnabled = true
+    center.togglePlayPauseCommand.isEnabled = true
+    center.stopCommand.isEnabled = true
 
     center.playCommand.addTarget { [weak self] _ in
       self?.sendRemoteAction("play")
@@ -865,17 +878,6 @@ final class NowPlayingChannel {
     }
     center.stopCommand.addTarget { [weak self] _ in
       self?.sendRemoteAction("stop")
-      return .success
-    }
-    // 锁屏 / 控制中心 / 灵动岛展开卡片对有声书类内容给的是「快进 / 快退」
-    // 两枚按钮（skipForward / skipBackward），不是 nextTrack / previousTrack。
-    // 只注册后者时用户按到的那一枚什么也不发，看起来就是「切不了下一章」。
-    center.skipForwardCommand.addTarget { [weak self] _ in
-      self?.sendRemoteAction("next")
-      return .success
-    }
-    center.skipBackwardCommand.addTarget { [weak self] _ in
-      self?.sendRemoteAction("prev")
       return .success
     }
   }
@@ -949,8 +951,13 @@ final class NowPlayingChannel {
     let center = MPRemoteCommandCenter.shared()
     center.previousTrackCommand.isEnabled = hasPrev
     center.nextTrackCommand.isEnabled = hasNext
-    center.skipBackwardCommand.isEnabled = hasPrev
-    center.skipForwardCommand.isEnabled = hasNext
+    // 每次刷新元数据都压住 skip：否则控制中心用 15 秒快进图标顶掉「下一章」。
+    center.skipBackwardCommand.isEnabled = false
+    center.skipForwardCommand.isEnabled = false
+    center.playCommand.isEnabled = true
+    center.pauseCommand.isEnabled = true
+    center.togglePlayPauseCommand.isEnabled = true
+    center.stopCommand.isEnabled = true
 
     loadArtwork(coverUrl)
   }
