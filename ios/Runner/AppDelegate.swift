@@ -830,7 +830,6 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   private static let actionPlayPause = "fqapp.action.playPause"
   private static let actionNext = "fqapp.action.next"
   private static let actionOpen = "fqapp.action.open"
-  private static let appURL = "fqapp://nowplaying"
 
   private var channel: FlutterMethodChannel?
   private var artworkTask: URLSessionDataTask?
@@ -929,10 +928,11 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       // .foreground action：系统已经负责把 App 拉回前台。
       break
     case UNNotificationDefaultActionIdentifier:
-      // 点通知主体。后台音频会话让进程常驻时，系统可能只把 response
-      // 交给 delegate 而不 resume UI；用本 App 的 URL scheme 显式激活，
-      // 冷启动与后台恢复两条路径都能回到界面。
-      openApp()
+      // 点通知主体（播放器主体）。按 Apple 的通知交互约定，default action
+      // 由系统负责把 App 从后台拉回前台；delegate 只管尽快结束 response。
+      // 之前在这里 open() 自己的 URL scheme，后台态 open 常失败并抢在
+      // 系统激活之前，反而挡掉了这次拉起。
+      break
     default:
       break
     }
@@ -944,19 +944,6 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     startSilentPlayback()
     applyCommandAvailability()
     completionHandler()
-  }
-
-  /// 通知条目被点时显式把 App 带回前台。scheme 在 Info.plist 声明，
-  /// AppDelegate 的 `application(_:open:options:)` 负责消费这个 URL。
-  private func openApp() {
-    guard let url = URL(string: NowPlayingChannel.appURL) else { return }
-    if Thread.isMainThread {
-      UIApplication.shared.open(url, options: [:], completionHandler: nil)
-    } else {
-      DispatchQueue.main.async {
-        UIApplication.shared.open(url, options: [:], completionHandler: nil)
-      }
-    }
   }
 
   // MARK: - AVAudioSession
@@ -1142,11 +1129,26 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     // register() 里补发，否则这一次切章被静默丢掉。
     let send: () -> Void = { [weak self] in
       guard let self else { return }
+      // 后台态收到 ⏮ / ⏭ 时先重建音频会话与静音渲染：Apple 只把「正在
+      // 播放内容」的 App 记为 Now Playing App，也只给它派发远控事件和后台
+      // 执行时间。不重建的话 Dart isolate 已被冻结，下一章取流不会启动。
+      self.activateSession()
+      self.startSilentPlayback()
+      // 显式申请一次后台任务，覆盖 Dart 切章到新音频起播之间的窗口。
+      let task = UIApplication.shared.beginBackgroundTask(
+        withName: "fqapp.remote.\(action)"
+      ) {}
       guard let channel = self.channel else {
         self.pendingRemoteActions.append(action)
+        if task != .invalid { UIApplication.shared.endBackgroundTask(task) }
         return
       }
       channel.invokeMethod("onRemoteAction", arguments: ["action": action])
+      if task != .invalid {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+          UIApplication.shared.endBackgroundTask(task)
+        }
+      }
     }
     if Thread.isMainThread {
       send()
@@ -1173,7 +1175,10 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       stopSilentPlayback()
       MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
       MPNowPlayingInfoCenter.default().playbackState = .stopped
-      UIApplication.shared.endReceivingRemoteControlEvents()
+      // 不调 endReceivingRemoteControlEvents()：一旦退出远控响应链，系统
+      // 就不再把本 App 记为候选的 Now Playing App，停在后台时锁屏 / 通知栏
+      // 播放器主体点下去没有可唤起的目标，⏮ / ⏭ 也会被派给上一个播放方。
+      // 远控注册只在 register() 里做一次，全程保留。
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
@@ -1215,10 +1220,14 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     if !episode.isEmpty { next[MPMediaItemPropertyArtist] = episode }
     // 系统朗读没有真实时长：硬填 0 会让控制中心把会话判成「无进度的
     // 无效媒体」，卡片与灵动岛直接不出现。只有拿到真实时长才下发时间轴。
-    if durationMs > 0 {
-      next[MPMediaItemPropertyPlaybackDuration] = durationMs / 1000
-      next[MPNowPlayingInfoPropertyElapsedPlaybackTime] = min(positionMs, durationMs) / 1000
-    }
+    // Now Playing item 只有在同时给出 duration 与 elapsed 时才是系统认可的
+    // 有效媒体条目；缺任一项，卡片可能显示却不把本 App 登记成 Now Playing
+    // App，主体点击与 ⏮ / ⏭ 都会落空。系统朗读拿不到真实时长，按直播流
+    // 给一个有限的正时长占位，elapsed 仍按实际上报位置。
+    let duration = durationMs > 0 ? durationMs : 3_600_000.0
+    next[MPMediaItemPropertyPlaybackDuration] = duration / 1000
+    next[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
+      min(max(positionMs, 0), duration) / 1000
     if let artwork = artwork { next[MPMediaItemPropertyArtwork] = artwork }
 
     info = next
