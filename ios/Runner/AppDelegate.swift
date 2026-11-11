@@ -32,6 +32,17 @@ import UserNotifications
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
+  /// 通知条目点进来时用的自有 URL scheme（Info.plist 里声明 `fqapp`）。
+  /// 自己消费掉，别再交给插件链去猜一个不存在的深链。
+  override func application(
+    _ app: UIApplication,
+    open url: URL,
+    options: [UIApplication.OpenURLOptionsKey: Any]
+  ) -> Bool {
+    if url.scheme == "fqapp" { return true }
+    return super.application(app, open: url, options: options)
+  }
+
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     // iOS 没有共享的 Downloads 目录，日志导出与分享走系统能力：文件落到
@@ -814,6 +825,12 @@ final class NotificationPermissionChannel {
 /// 可用性一律用 `isEnabled` 控制。
 final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   private static let notificationID = "fqapp.nowplaying"
+  private static let categoryID = "fqapp.playback"
+  private static let actionPrev = "fqapp.action.prev"
+  private static let actionPlayPause = "fqapp.action.playPause"
+  private static let actionNext = "fqapp.action.next"
+  private static let actionOpen = "fqapp.action.open"
+  private static let appURL = "fqapp://nowplaying"
 
   private var channel: FlutterMethodChannel?
   private var artworkTask: URLSessionDataTask?
@@ -828,6 +845,9 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   private var hasNext = true
   private var lastNotificationTitle = ""
   private var lastNotificationEpisode = ""
+  private var notificationNeedsRefresh = true
+  /// 后台通知动作可能早于 Flutter 隐式引擎桥接完成，先缓存，register 后补发。
+  private var pendingRemoteActions: [String] = []
 
   func register(messenger: FlutterBinaryMessenger) {
     let channel = FlutterMethodChannel(
@@ -842,6 +862,11 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       }
       self.handle(call, result)
     }
+    let queued = pendingRemoteActions
+    pendingRemoteActions.removeAll()
+    for action in queued {
+      channel.invokeMethod("onRemoteAction", arguments: ["action": action])
+    }
     installRemoteCommands()
     UIApplication.shared.beginReceivingRemoteControlEvents()
     observeSystemEvents()
@@ -849,9 +874,30 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     // 会话等到第一次真正的起播（apply）再激活。
   }
 
-  /// 通知 delegate 必须在 didFinishLaunchingWithOptions 返回之前挂好。
+  /// 通知 delegate 与 category 必须在 didFinishLaunchingWithOptions 返回之前
+  /// 挂好：冷启动时点通知进 App，系统在这个方法结束就开始找处理者。
+  ///
+  /// category 决定通知展开后有哪些按钮，且以**投递时**的内容为准；事后
+  /// setNotificationCategories 不会给已经躺在通知中心的旧条目补按钮。
   func installNotificationDelegate() {
-    UNUserNotificationCenter.current().delegate = self
+    let center = UNUserNotificationCenter.current()
+    center.delegate = self
+    let actions = [
+      UNNotificationAction(identifier: NowPlayingChannel.actionPrev, title: "上一章", options: []),
+      UNNotificationAction(identifier: NowPlayingChannel.actionPlayPause, title: "播放 / 暂停", options: []),
+      UNNotificationAction(identifier: NowPlayingChannel.actionNext, title: "下一章", options: []),
+      // .foreground：系统负责把 App 拉回前台，delegate 不用自己找入口。
+      UNNotificationAction(identifier: NowPlayingChannel.actionOpen, title: "打开应用", options: [.foreground]),
+    ]
+    center.setNotificationCategories([
+      UNNotificationCategory(
+        identifier: NowPlayingChannel.categoryID,
+        actions: actions,
+        intentIdentifiers: [],
+        options: []
+      )
+    ])
+    notificationNeedsRefresh = true
   }
 
   // MARK: - UNUserNotificationCenterDelegate
@@ -861,8 +907,10 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     willPresent notification: UNNotification,
     withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
   ) {
-    // 前台时播放器就在界面里，不再弹一条横幅打扰。
-    completionHandler([])
+    // 只进通知中心、不弹横幅不响铃：前台时界面里已经有播放器，但后台
+    // 下拉通知栏必须能看到这一条、且它得带着切章按钮。回空数组的话
+    // 系统连通知中心都不写，通知栏里根本没有可点的条目。
+    completionHandler([.list])
   }
 
   func userNotificationCenter(
@@ -870,7 +918,24 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     didReceive response: UNNotificationResponse,
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
-    // 系统会把 App 带回前台；顺手把可能被中断过的媒体会话重新立起来。
+    switch response.actionIdentifier {
+    case NowPlayingChannel.actionPrev:
+      sendRemoteAction("prev")
+    case NowPlayingChannel.actionPlayPause:
+      sendRemoteAction("playPause")
+    case NowPlayingChannel.actionNext:
+      sendRemoteAction("next")
+    case NowPlayingChannel.actionOpen:
+      // .foreground action：系统已经负责把 App 拉回前台。
+      break
+    case UNNotificationDefaultActionIdentifier:
+      // 点通知主体。后台音频会话让进程常驻时，系统可能只把 response
+      // 交给 delegate 而不 resume UI；用本 App 的 URL scheme 显式激活，
+      // 冷启动与后台恢复两条路径都能回到界面。
+      openApp()
+    default:
+      break
+    }
     guard sessionPublished else {
       completionHandler()
       return
@@ -879,6 +944,19 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     startSilentPlayback()
     applyCommandAvailability()
     completionHandler()
+  }
+
+  /// 通知条目被点时显式把 App 带回前台。scheme 在 Info.plist 声明，
+  /// AppDelegate 的 `application(_:open:options:)` 负责消费这个 URL。
+  private func openApp() {
+    guard let url = URL(string: NowPlayingChannel.appURL) else { return }
+    if Thread.isMainThread {
+      UIApplication.shared.open(url, options: [:], completionHandler: nil)
+    } else {
+      DispatchQueue.main.async {
+        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+      }
+    }
   }
 
   // MARK: - AVAudioSession
@@ -1060,12 +1138,20 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
 
   private func sendRemoteAction(_ action: String) {
     // 远控回调不保证在主线程，FlutterMethodChannel 只能在主线程发消息。
-    if Thread.isMainThread {
-      channel?.invokeMethod("onRemoteAction", arguments: ["action": action])
-    } else {
-      DispatchQueue.main.async { [weak self] in
-        self?.channel?.invokeMethod("onRemoteAction", arguments: ["action": action])
+    // 后台通知动作还可能早于隐式引擎桥接：channel 未就绪时先缓存，
+    // register() 里补发，否则这一次切章被静默丢掉。
+    let send: () -> Void = { [weak self] in
+      guard let self else { return }
+      guard let channel = self.channel else {
+        self.pendingRemoteActions.append(action)
+        return
       }
+      channel.invokeMethod("onRemoteAction", arguments: ["action": action])
+    }
+    if Thread.isMainThread {
+      send()
+    } else {
+      DispatchQueue.main.async { send() }
     }
   }
 
@@ -1087,6 +1173,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       stopSilentPlayback()
       MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
       MPNowPlayingInfoCenter.default().playbackState = .stopped
+      UIApplication.shared.endReceivingRemoteControlEvents()
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
@@ -1097,6 +1184,9 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     sessionPublished = true
     activateSession()
     startSilentPlayback()
+    // 音频会话激活之后重新声明接收远控：这决定系统把「正在播放」的
+    // 身份记在本 App 名下，锁屏 / 通知栏播放器卡片点下去才会唤起 App。
+    UIApplication.shared.beginReceivingRemoteControlEvents()
 
     let title = args["title"] as? String ?? ""
     let episode = args["episode"] as? String ?? ""
@@ -1109,6 +1199,12 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     let coverUrl = args["coverUrl"] as? String ?? ""
 
     var next: [String: Any] = [
+      // 系统靠 mediaType 把会话归类成音频播放器；缺了它锁屏 / 控制中心
+      // 的卡片不会把本 App 认成「正在播放」的一方，点卡片也不唤起 App。
+      MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
+      // 系统朗读没有真实时长，按直播流声明，避免无进度轴的会话被判成
+      // 无效媒体；有真实时长的听书音频仍走下面的进度轴。
+      MPNowPlayingInfoPropertyIsLiveStream: durationMs <= 0,
       MPNowPlayingInfoPropertyPlaybackRate: playing ? speed : 0,
       MPNowPlayingInfoPropertyDefaultPlaybackRate: speed,
     ]
@@ -1139,9 +1235,12 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   /// 堆积。点击由系统带回 App，delegate 里恢复媒体会话。
   private func updateNotification(title: String, episode: String) {
     guard !title.isEmpty else { return }
-    if title == lastNotificationTitle && episode == lastNotificationEpisode { return }
+    if !notificationNeedsRefresh &&
+       title == lastNotificationTitle &&
+       episode == lastNotificationEpisode { return }
     lastNotificationTitle = title
     lastNotificationEpisode = episode
+    notificationNeedsRefresh = false
     UNUserNotificationCenter.current().getNotificationSettings { settings in
       let status = settings.authorizationStatus
       guard status == .authorized || status == .provisional || status == .ephemeral else { return }
@@ -1149,6 +1248,11 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       content.title = title
       content.body = episode.isEmpty ? "正在播放" : episode
       content.threadIdentifier = NowPlayingChannel.notificationID
+      // category 决定长按 / 展开后出现的上一章、下一章按钮；不设的话
+      // 通知栏里只有一个纯文本条目，按哪里都切不了章。
+      content.categoryIdentifier = NowPlayingChannel.categoryID
+      content.userInfo = ["nowPlaying": true]
+      content.interruptionLevel = .passive
       let request = UNNotificationRequest(
         identifier: NowPlayingChannel.notificationID,
         content: content,
