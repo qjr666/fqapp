@@ -135,7 +135,7 @@ class _ListenModePageState extends State<ListenModePage>
   void dispose() {
     _popped = true;
     WidgetsBinding.instance.removeObserver(this);
-    NativePlayer.clearRemoteCommandHandler();
+    NativePlayer.clearRemoteCommandHandler(_handleRemoteAction);
     _completedSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();

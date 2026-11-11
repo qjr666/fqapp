@@ -133,7 +133,15 @@ class NativePlayer {
     _channel.setMethodCallHandler(_handleMethodCall);
   }
 
-  static void clearRemoteCommandHandler() {
+  /// 只注销 [owner] 自己注册的那一个处理器。
+  ///
+  /// 系统朗读、听书页、音频控制器共用一个静态 handler。任意一页 dispose 都
+  /// 无条件清空，会把「正在听书的那一路」也一起清掉 —— 之后控制中心 /
+  /// 灵动岛发来的上一章 / 下一章没有任何消费方，按钮按下去毫无反应。
+  static void clearRemoteCommandHandler([
+    void Function(String action)? owner,
+  ]) {
+    if (owner != null && !identical(_onRemoteAction, owner)) return;
     _onRemoteAction = null;
     _onBecomingNoisy = null;
   }

@@ -836,7 +836,30 @@ final class NowPlayingChannel {
   /// Dart 侧按同一套动作名处理两个平台。
   private func configureRemoteCommands() {
     let center = MPRemoteCommandCenter.shared()
-    // 引擎可能重建、register 被调用多次：先摘掉本 App 之前的 target。
+    // 注册了 skip 命令的 App，控制中心会把「上一章 / 下一章」换成
+    // 「快退 15 秒 / 快进 15 秒」两枚按钮，图标与语义都不对。切章只走
+    // nextTrack / previousTrack，skip 两枚保持禁用、不挂 target。
+    center.skipForwardCommand.isEnabled = false
+    center.skipBackwardCommand.isEnabled = false
+    // 命令默认未必是启用态：只挂 target 不启用，按钮看得见却按不动。
+    // 首次 update 之前也要能切章，apply() 会按 hasPrev / hasNext 再收紧。
+    center.playCommand.isEnabled = true
+    center.pauseCommand.isEnabled = true
+    center.togglePlayPauseCommand.isEnabled = true
+    center.stopCommand.isEnabled = true
+    center.nextTrackCommand.isEnabled = true
+    center.previousTrackCommand.isEnabled = true
+    installRemoteTargets()
+  }
+
+  /// 重装远控 target。
+  ///
+  /// 视频播放器 / 其它 AVPlayer 接管远控时会调 `removeTarget(nil)`，把本 App
+  /// 之前挂上的 target 一起摘掉，于是锁屏、灵动岛、控制中心上的上一章 /
+  /// 下一章变成按了没反应的空按钮。每次刷新媒体元数据都重装一次即可恢复；
+  /// 先全部摘掉再挂，避免重复注册导致一次按键触发多次切章。
+  private func installRemoteTargets() {
+    let center = MPRemoteCommandCenter.shared()
     center.playCommand.removeTarget(nil)
     center.pauseCommand.removeTarget(nil)
     center.togglePlayPauseCommand.removeTarget(nil)
@@ -845,16 +868,8 @@ final class NowPlayingChannel {
     center.stopCommand.removeTarget(nil)
     center.skipForwardCommand.removeTarget(nil)
     center.skipBackwardCommand.removeTarget(nil)
-    // 注册了 skip 命令的 App，控制中心会把「上一章 / 下一章」换成
-    // 「快退 15 秒 / 快进 15 秒」两枚按钮，图标与语义都不对。切章只走
-    // nextTrack / previousTrack，skip 两枚保持禁用、不挂 target。
     center.skipForwardCommand.isEnabled = false
     center.skipBackwardCommand.isEnabled = false
-    // 命令默认未必是启用态：只挂 target 不启用，按钮看得见却按不动。
-    center.playCommand.isEnabled = true
-    center.pauseCommand.isEnabled = true
-    center.togglePlayPauseCommand.isEnabled = true
-    center.stopCommand.isEnabled = true
 
     center.playCommand.addTarget { [weak self] _ in
       self?.sendRemoteAction("play")
@@ -948,6 +963,9 @@ final class NowPlayingChannel {
     MPNowPlayingInfoCenter.default().nowPlayingInfo = next
     MPNowPlayingInfoCenter.default().playbackState = playing ? .playing : .paused
 
+    // 每次刷新都重装一次：别的媒体组件可能刚把 target 摘掉，控制中心上的
+    // 上一章 / 下一章会因此变成死按钮。
+    installRemoteTargets()
     let center = MPRemoteCommandCenter.shared()
     center.previousTrackCommand.isEnabled = hasPrev
     center.nextTrackCommand.isEnabled = hasNext

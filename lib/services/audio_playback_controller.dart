@@ -1500,7 +1500,7 @@ class _AudioPlaybackController extends ChangeNotifier
     AudioPreferences.instance.backgroundPlayback.removeListener(
       _preferencesChanged,
     );
-    NativePlayer.clearRemoteCommandHandler();
+    NativePlayer.clearRemoteCommandHandler(_handleRemoteAction);
     ListeningSession.instance.clear();
     final saved = _persistProgress().catchError((Object _) {});
     final released = _releasePlayer();

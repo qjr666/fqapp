@@ -298,27 +298,27 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
         if (!closed) unawaited(_fail(e));
       },
     );
-    NativePlayer.setRemoteCommandHandler(
-      onAction: (action) {
-        if (closed) return;
-        switch (action) {
-          case 'playPause':
-            unawaited(toggle());
-          // iOS 的控制中心把「播放」和「暂停」分成两枚按钮，语义不是切换。
-          case 'play':
-            unawaited(resume());
-          case 'pause':
-            unawaited(pause());
-          case 'prev':
-            unawaited(openChapter(index - 1));
-          case 'next':
-            unawaited(openChapter(index + 1));
-          case 'stop':
-            onStop();
-        }
-      },
-    );
+    NativePlayer.setRemoteCommandHandler(onAction: _remoteAction);
     unawaited(openChapter(index, offset: book.startOffset));
+  }
+
+  void _remoteAction(String action) {
+    if (closed) return;
+    switch (action) {
+      case 'playPause':
+        unawaited(toggle());
+      // iOS 的控制中心把「播放」和「暂停」分成两枚按钮，语义不是切换。
+      case 'play':
+        unawaited(resume());
+      case 'pause':
+        unawaited(pause());
+      case 'prev':
+        unawaited(openChapter(index - 1));
+      case 'next':
+        unawaited(openChapter(index + 1));
+      case 'stop':
+        onStop();
+    }
   }
 
   Future<void> openChapter(int next, {int offset = 0}) async {
@@ -761,7 +761,7 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
     AudioPreferences.instance.backgroundPlayback.removeListener(
       _preferencesChanged,
     );
-    NativePlayer.clearRemoteCommandHandler();
+    NativePlayer.clearRemoteCommandHandler(_remoteAction);
     ListeningSession.instance.clear();
     notifyListeners();
     // Do not await the EventChannel cancel: awaiting a platform-stream

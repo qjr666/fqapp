@@ -146,7 +146,11 @@ extension _ReaderPageListening on _ReaderPageState {
     // Keep highlighting on the same sentence as _addressToPlayback. Upstream
     // paragraph coordinates are a fallback when no current cue can be mapped.
     _ensureCueIndex(layout);
-    if (_cueIndex.isNotEmpty) {
+    // 系统朗读没有音频时间轴：会话 position 恒为 0，阅读页为真人讲书预取
+    // 到的字幕表在这里查不到任何句子，索引非空却给不出锚点，句高亮与跟随
+    // 导航会一起变 null。系统朗读只认 sentenceRange 那条路。
+    final systemTts = session.textProgress != null && session.subtitles == null;
+    if (!systemTts && _cueIndex.isNotEmpty) {
       final span = _cueIndex.spanAtPositionMs(
         session.position.inMilliseconds + readAheadMs,
         crossCueHoldMs: crossCueHoldMs,
@@ -352,11 +356,15 @@ extension _ReaderPageListening on _ReaderPageState {
     }
     _ensureCueIndex(layout);
     final positionMs = session.position.inMilliseconds + readAheadMs;
-    final span = _cueIndex.spanAtPositionMs(
-      positionMs,
-      crossCueHoldMs: crossCueHoldMs,
-      currentRange: _narrationRange,
-    );
+    // 同上：系统朗读的 position 是 0，不能拿真人讲书的时间轴去查句子。
+    final systemTts = session.textProgress != null && session.subtitles == null;
+    final span = systemTts
+        ? null
+        : _cueIndex.spanAtPositionMs(
+            positionMs,
+            crossCueHoldMs: crossCueHoldMs,
+            currentRange: _narrationRange,
+          );
     // [_narrationRange] 是**显示**状态：某一拍没匹配上时故意留着不清，好让
     // 高亮晚半拍而不是整页变黑。它绝不能当导航锚点 —— 字幕第一句从 3 秒才
     // 开始（`[3025, 0]`）时，位置 0 查不到句，用它寻址会把页面停到本章最后
@@ -365,7 +373,7 @@ extension _ReaderPageListening on _ReaderPageState {
     // 不会连带让跟随失去锚点。
     final offset =
         span?.spokenOffset(positionMs) ??
-        (_cueIndex.isEmpty ? _followAnchor?.$1 : null);
+        (systemTts || _cueIndex.isEmpty ? _followAnchor?.$1 : null);
     if (offset == null) {
       if (!quiet) _showMessage('找不到当前朗读句');
       return false;
