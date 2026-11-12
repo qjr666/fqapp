@@ -198,7 +198,18 @@ class _ListenModePageState extends State<ListenModePage>
       // 继续指向已释放的句柄，播放按钮可点却静默无响应。
       final previous = _player;
       _player = null;
-      await previous?.dispose();
+      // 后台换集时旧播放器 dispose 偶发超时（日志里有 TimeoutException）；
+      // 直接 await 会把整条换集链吞进 catch，新播放器根本没建起来，于是
+      // 静音卡住、回到前台才继续。释放照常发起，但不再阻塞新集起播。
+      if (previous != null) {
+        unawaited(Future<void>(() async {
+          try {
+            await previous.dispose().timeout(const Duration(seconds: 3));
+          } catch (_) {
+            // 旧实例释放失败不能阻断本集接管音频会话。
+          }
+        }));
+      }
       NativePlayer? created;
       try {
         final player =

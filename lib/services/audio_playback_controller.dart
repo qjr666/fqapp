@@ -55,6 +55,9 @@ class _AudioPlaybackController extends ChangeNotifier
   bool _appActive = true;
   bool _loading = true;
   bool _wantPlay = true;
+  /// 换章取流期间系统媒体卡片要沿用上一次的播放态，不能因 loading 上报
+  /// paused —— 暂停态会话的卡片主体不唤起 App，两端按钮也不再派发。
+  bool _lastForegroundPlaying = false;
   bool _completed = false;
   bool _autoAdvance = true;
   String? _error;
@@ -395,8 +398,10 @@ class _AudioPlaybackController extends ChangeNotifier
       return;
     }
     final player = _player;
-    final isPlaying =
-        (player?.playing ?? false) && _wantPlay && !_completed && !_loading;
+    final isPlaying = isIOSPlatform && _loading && _wantPlay
+        ? _lastForegroundPlaying
+        : (player?.playing ?? false) && _wantPlay && !_completed && !_loading;
+    _lastForegroundPlaying = isPlaying;
     unawaited(
       NativePlayer.startListenForeground(
         title: _title,
@@ -512,7 +517,9 @@ class _AudioPlaybackController extends ChangeNotifier
     _saveTimer?.cancel();
     _listenTime.stop();
     if (persistCurrent) unawaited(_persistProgress());
-    final released = _releasePlayer();
+    // 后台换章先取新音源、再释放旧播放器。提前 pause / dispose 会中断音频
+    // 输出，iOS 随即挂起 App，取流与建播放器全部冻结到回前台。
+    Future<void>? released;
     _update(() {
       _index = index;
       _loading = true;
@@ -569,6 +576,8 @@ class _AudioPlaybackController extends ChangeNotifier
       final itemId = _chapters[index].itemId;
       final source = await _loadSourceWithRetry(itemId);
       if (!_current(generation)) return;
+      // 新音源到手、旧音频撑完整个取流窗口后才释放播放器。
+      released = _releasePlayer();
       final uri = Uri.tryParse(source.url);
       // 离线命中给的是 `file://<path>`：本地文件桥不经 HTTP，没有 host。
       final isLocalFile = uri != null && uri.scheme == 'file';

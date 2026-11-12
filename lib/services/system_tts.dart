@@ -359,8 +359,8 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
     _offset = offset;
     _publish();
     try {
-      await _engineCall<void>(() => SystemTts.stop());
-      if (closed || token != _generation) return;
+      // 后台换章先把新正文取到手、再停旧朗读。提前 stop 会让音频输出
+      // 中断，iOS 随即挂起 App，取流与起播全部冻结到下次回前台。
       final content = await book
           .loadDisplay(next, request: request, cancellation: cancellation)
           .timeout(
@@ -378,6 +378,8 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
           .join('\n');
       if (_text.trim().isEmpty) throw StateError('本章没有可朗读的文字');
       _offset = _safeOffset(_offset.clamp(0, _text.length));
+      await _engineCall<void>(() => SystemTts.stop());
+      if (closed || token != _generation) return;
       loading = false;
       if (wantPlay) {
         await _begin(token);
@@ -721,7 +723,9 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
             title: book.title,
             episode: '系统朗读 · ${chapter.title}',
             coverUrl: book.coverUrl,
-            playing: wantPlay && !loading && error == null,
+            // 换章取流期间旧朗读仍在出声，不能上报 paused：系统把会话判成
+            // 已暂停后，卡片主体不再唤起 App，两端按钮也不再派发。
+            playing: wantPlay && error == null,
             hasPrev: index > 0,
             hasNext: index + 1 < book.chapters.length,
           );

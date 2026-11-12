@@ -854,6 +854,11 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   private var notificationNeedsRefresh = true
   /// 后台通知动作可能早于 Flutter 隐式引擎桥接完成，先缓存再补发。
   private var pendingRemoteActions: [String] = []
+  /// 后台换章时旧播放器被 pause / dispose，常把共享 AVAudioSession 一起
+  /// deactivate：音频输出一断 iOS 立即挂起 App，Dart 侧的取流与建播放器
+  /// 冻结到下次回前台。收到切章远控后的一段窗口里持续恢复会话身份。
+  private var actionWatchdog: DispatchWorkItem?
+  private var watchdogDeadline: Date?
 
   // MARK: - 注册
 
@@ -942,7 +947,12 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       break
     }
     if sessionPublished { ensurePlaybackIdentity() }
-    completionHandler()
+    // completion 一返回系统即可挂起 App；通知 action 的切章也需要时间把
+    // 消息送进 Dart 并启动换章，留一个短窗口，后台执行时间由
+    // sendRemoteAction 的 background task 与会话守护覆盖。
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+      completionHandler()
+    }
   }
 
   // MARK: - 会话身份
@@ -971,9 +981,11 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   /// Dart 的切章与取流全部冻结。循环一段极低幅度的音轨让音频渲染管线
   /// 一直运行，这是后台音频 App 的标准做法。采样值不能全为 0 —— 全零
   /// 输出会被 CoreAudio 判成无音频活动，系统就不把本 App 记为正在播放。
-  private func startSilentPlayback() {
+  private func startSilentPlayback(force: Bool = false) {
     guard sessionPublished else { return }
-    if silentPlayer?.isPlaying == true { return }
+    // 会话被别的组件 deactivate 时 isPlaying 可能仍为 true，却没有音频输出；
+    // 看门狗用 force 重启音轨，重新向 CoreAudio 声明本 App 正在播放。
+    if !force && silentPlayer?.isPlaying == true { return }
     silentPlayer?.stop()
     silentPlayer = nil
     do {
@@ -1045,6 +1057,51 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     startSilentPlayback()
     UIApplication.shared.beginReceivingRemoteControlEvents()
     installRemoteTargets()
+  }
+
+  /// 后台按上一章 / 下一章时，Dart 会停掉旧播放器再取流重建。旧播放器
+  /// dispose 会 deactivate 共享会话，音频一断系统就挂起 App，切章于是卡在
+  /// 半路、直到回前台才继续。Apple 的后台音频规则要求这段时间里始终有
+  /// 真实音频输出且本 App 仍是 Now Playing App，所以守护窗口内周期性恢复
+  /// 会话、保活音轨、远控注册与媒体元数据。
+  private func beginActionWatchdog() {
+    actionWatchdog?.cancel()
+    let item = DispatchWorkItem { [weak self] in
+      guard let self, self.sessionPublished else { return }
+      self.activateSession()
+      if self.silentPlayer?.isPlaying != true {
+        self.startSilentPlayback(force: true)
+      }
+      UIApplication.shared.beginReceivingRemoteControlEvents()
+      self.installRemoteTargets()
+      if !self.info.isEmpty {
+        // 重新写回完整条目：系统按当前 Now Playing App 决定卡片主体点击
+        // 唤起哪个进程，元数据被别的组件清掉后卡片就没有可唤起目标。
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = self.info
+        let rate: Double
+        if let value = self.info[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber {
+          rate = value.doubleValue
+        } else {
+          rate = 0
+        }
+        MPNowPlayingInfoCenter.default().playbackState = rate > 0 ? .playing : .paused
+      }
+      guard let deadline = self.watchdogDeadline else { return }
+      if Date() < deadline {
+        self.beginActionWatchdog()
+      } else {
+        self.watchdogDeadline = nil
+        self.actionWatchdog = nil
+      }
+    }
+    actionWatchdog = item
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: item)
+  }
+
+  private func stopActionWatchdog() {
+    watchdogDeadline = nil
+    actionWatchdog?.cancel()
+    actionWatchdog = nil
   }
 
   private func observeSystemEvents() {
@@ -1134,14 +1191,15 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   }
 
   @objc private func onNextTrackCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
-    // 章末按下时给系统一个明确的「无可切换项」，而不是静默吞掉。
-    guard sessionPublished, hasNext else { return .noActionableNowPlayingItem }
+    guard sessionPublished else { return .noActionableNowPlayingItem }
+    // 不用 hasNext 在这里拦截：换章取流期间 Dart 会先上报 loading 态的
+    // 边界值，章末判断交给会话自己，按下去至少有动作被转发。
     sendRemoteAction("next")
     return .success
   }
 
   @objc private func onPreviousTrackCommand(_ event: MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
-    guard sessionPublished, hasPrev else { return .noActionableNowPlayingItem }
+    guard sessionPublished else { return .noActionableNowPlayingItem }
     sendRemoteAction("prev")
     return .success
   }
@@ -1174,9 +1232,16 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       guard let self else { return }
       self.activateSession()
       self.startSilentPlayback()
+      if action == "prev" || action == "next" {
+        self.watchdogDeadline = Date().addingTimeInterval(45)
+        self.beginActionWatchdog()
+      }
       let task = UIApplication.shared.beginBackgroundTask(
         withName: "fqapp.remote.\(action)"
-      ) {}
+      ) { [weak self] in
+        // 系统给的后台时间到期时再立一次会话，别让换章停在半路。
+        self?.ensurePlaybackIdentity()
+      }
       guard let channel = self.channel else {
         self.pendingRemoteActions.append(action)
         if task != .invalid { UIApplication.shared.endBackgroundTask(task) }
@@ -1192,7 +1257,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       if task != .invalid {
         // 覆盖 Dart 切章、取流到新音频起播的窗口；新音频一起播，
         // audio 后台模式接手，不再依赖这段临时执行时间。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
           UIApplication.shared.endBackgroundTask(task)
         }
       }
@@ -1232,6 +1297,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       artwork = nil
       info = [:]
       sessionPublished = false
+      stopActionWatchdog()
       removeNotification()
       stopSilentPlayback()
       MPNowPlayingInfoCenter.default().nowPlayingInfo = nil

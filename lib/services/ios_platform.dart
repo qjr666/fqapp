@@ -181,8 +181,12 @@ class IosPlatform {
     bool? mixWithOthers,
     bool reactivate = false,
   }) async {
+    // 媒体会话已经发布时不能再写回 mixWithOthers：带该选项的会话不会被
+    // 系统登记为 Now Playing App，卡片主体点击就没有可唤起的目标，⏮ / ⏭
+    // 也会派给上一个播放方。Swift 侧 activateSession() 同样强制独占。
     final mix =
-        mixWithOthers ?? AudioPreferences.instance.mixWithOthers.value;
+        (mixWithOthers ?? AudioPreferences.instance.mixWithOthers.value) &&
+        _nowPlayingPayload == null;
     final options = <IosTextToSpeechAudioCategoryOptions>[
       IosTextToSpeechAudioCategoryOptions.allowBluetoothA2DP,
       if (mix) IosTextToSpeechAudioCategoryOptions.mixWithOthers,
