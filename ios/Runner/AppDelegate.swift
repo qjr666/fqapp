@@ -932,30 +932,30 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     didReceive response: UNNotificationResponse,
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
-    switch response.actionIdentifier {
+    let action = response.actionIdentifier
+    NSLog("[fqapp] notification response: \(action)")
+    switch action {
+    case NowPlayingChannel.actionOpen, UNNotificationDefaultActionIdentifier:
+      // 这是 App 唯一能可靠接收的「点进 App」入口：default action 与
+      // .foreground action 由系统把 App 带回前台，delegate 只需把媒体
+      // 身份恢复到可唤起状态。系统 Now Playing 卡片的主体点击不走这里，
+      // 它能否唤起本 App 取决于当前会话是否仍是 Now Playing App。
+      if sessionPublished { ensurePlaybackIdentity() }
+      // Apple 要求 response 尽快结束；延迟 completionHandler 会推迟前台化，
+      // 后台执行时间由 sendRemoteAction 的 background task 独立覆盖。
+      completionHandler()
+      return
     case NowPlayingChannel.actionPrev:
       sendRemoteAction("prev")
     case NowPlayingChannel.actionPlayPause:
       sendRemoteAction("playPause")
     case NowPlayingChannel.actionNext:
       sendRemoteAction("next")
-    case NowPlayingChannel.actionOpen:
-      // .foreground action：系统已经负责把 App 拉回前台。
-      break
-    case UNNotificationDefaultActionIdentifier:
-      // 点通知主体。按 Apple 的通知交互约定，default action 由系统把 App
-      // 从后台带回前台；delegate 只恢复会话并尽快结束 response。
-      break
     default:
       break
     }
     if sessionPublished { ensurePlaybackIdentity() }
-    // completion 一返回系统即可挂起 App；通知 action 的切章也需要时间把
-    // 消息送进 Dart 并启动换章，留一个短窗口，后台执行时间由
-    // sendRemoteAction 的 background task 与会话守护覆盖。
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-      completionHandler()
-    }
+    completionHandler()
   }
 
   // MARK: - 会话身份
@@ -964,21 +964,39 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   /// 的必要条件；带 mixWithOthers 的会话不会被登记，卡片主体点击就没有
   /// 可唤起的目标，⏮ / ⏭ 也会派给上一个播放方。
   private func activateSession() {
-    // 播放中重设 category / options 会打断 AVPlayer 的输出：上一版会话
-    // 守护每 3 秒做一次，正是「按下切章后卡住不出声」的来源。配置一次
-    // 就够，之后只由中断 / 媒体服务重置这类真实事件触发重配。
-    guard !audioSessionConfigured else { return }
+    // 一次性布尔挡不住「插件自行 deactivate 共享会话」：flutter_tts /
+    // media_kit 在换章 dispose 时会 deactivate，却不会发系统中断通知，
+    // 布尔仍为 true，会话就永久 inactive，本 App 不再是 Now Playing App，
+    // 卡片主体点击便没有可唤起的目标。改为按会话的实际 category / options
+    // 判断：只在确实不符时才 setCategory（在已激活会话上改 options 会打断
+    // AVPlayer 输出），setActive(true) 则每次调用 —— 它对已激活会话是幂等
+    // 的，能把被插件关掉的会话重新激活。
     let session = AVAudioSession.sharedInstance()
     do {
-      try session.setCategory(
-        .playback,
-        mode: .default,
-        options: [.allowBluetoothA2DP]
-      )
+      if session.category != .playback ||
+         session.categoryOptions.contains(.mixWithOthers) {
+        try session.setCategory(
+          .playback,
+          mode: .default,
+          options: [.allowBluetoothA2DP]
+        )
+        NSLog("[fqapp] audio session category restored to playback")
+      }
       try session.setActive(true, options: [])
       audioSessionConfigured = true
     } catch {
       NSLog("[fqapp] audio session activate failed: \(error)")
+    }
+  }
+
+  /// 守护窗口内只保「会话处于 active」，不改 category / options，避免播放中
+  /// 重设类别打断输出。插件 deactivate 后靠这里在数秒内恢复。
+  private func keepSessionActive() {
+    do {
+      try AVAudioSession.sharedInstance().setActive(true, options: [])
+      audioSessionConfigured = true
+    } catch {
+      NSLog("[fqapp] audio session reactivate failed: \(error)")
     }
   }
 
@@ -1083,6 +1101,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       if self.silentPlayer?.isPlaying != true {
         self.startSilentPlayback(force: true)
       }
+      self.keepSessionActive()
       UIApplication.shared.beginReceivingRemoteControlEvents()
       if !self.info.isEmpty {
         // 重新写回完整条目：系统按当前 Now Playing App 决定卡片主体点击
@@ -1158,7 +1177,12 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       object: AVAudioSession.sharedInstance(),
       queue: .main
     ) { [weak self] _ in
-      self?.invalidateAudioSession()
+      guard let self else { return }
+      // 媒体服务重置会丢掉会话配置、远控 target 与正在播放的音轨；只置标志
+      // 不重建，本 App 就再也不会被登记为 Now Playing App。
+      self.invalidateAudioSession()
+      self.activateSession()
+      if self.sessionPublished { self.ensurePlaybackIdentity() }
     }
   }
 
@@ -1250,6 +1274,21 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     center.nextTrackCommand.isEnabled = sessionPublished
     center.skipBackwardCommand.isEnabled = false
     center.skipForwardCommand.isEnabled = false
+  }
+
+  /// 只摘自己挂的 target，配合 endReceivingRemoteControlEvents() 完整退出
+  /// 远控响应链；不能用 removeTarget(nil)，那会连带摘掉别的音频组件。
+  private func removeRemoteTargets() {
+    let center = MPRemoteCommandCenter.shared()
+    let commands: [MPRemoteCommand] = [
+      center.playCommand,
+      center.pauseCommand,
+      center.togglePlayPauseCommand,
+      center.nextTrackCommand,
+      center.previousTrackCommand,
+      center.stopCommand,
+    ]
+    for command in commands { command.removeTarget(self) }
   }
 
   private func sendRemoteAction(_ action: String) {
@@ -1344,9 +1383,13 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       stopSilentPlayback()
       MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
       MPNowPlayingInfoCenter.default().playbackState = .stopped
-      // 不调 endReceivingRemoteControlEvents()：退出远控响应链后系统不再
-      // 把本 App 记为候选的 Now Playing App，后台卡片主体点击无目标、
-      // ⏮ / ⏭ 会被派给上一个播放方。远控注册全程保留。
+      // 收敛成完整退出：过去只清元数据却保留远控注册与响应链，系统侧
+      // 残留一张「有卡片、无可唤起进程」的幽灵播放器，点主体不会进 App，
+      // ⏮ / ⏭ 也只会返回 noActionableNowPlayingItem。下一次 apply 检测到
+      // 会话从未发布，会重新 beginReceiving + 装回 target。
+      removeRemoteTargets()
+      UIApplication.shared.endReceivingRemoteControlEvents()
+      NSLog("[fqapp] now playing session cleared")
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
@@ -1354,12 +1397,22 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   }
 
   private func apply(_ args: [String: Any]) {
+    let wasPublished = sessionPublished
     sessionPublished = true
-    // 元数据刷新很频繁（切章、进度、15 秒心跳）。这里只补保活音轨和命令
-    // 可用性；重设音频会话、重装远控 target 交给真实系统事件，否则播放中
-    // 的 AVPlayer 会被反复打断、按下的 ⏮ / ⏭ 也可能恰好落在重装窗口。
+    // 元数据刷新很频繁（切章、进度、15 秒心跳）。播放中只补会话活性、
+    // 保活音轨与命令可用性；重设 category、重装远控 target 交给真实事件
+    // 与 clear 后的首次发布，否则 AVPlayer 会被反复打断。
     activateSession()
-    startSilentPlayback()
+    if wasPublished {
+      // 15 秒心跳必须能把被插件 deactivate 的会话救回来：卡片上写着
+      // playing 却没有真实音频输出时，系统不再把本 App 认作当前播放方，
+      // 卡片主体点击就没有可唤起的目标。
+      keepSessionActive()
+      if silentPlayer?.isPlaying != true { startSilentPlayback(force: true) }
+    } else {
+      // clear 已完整退出远控响应链，这里首次发布时重新登记身份。
+      ensurePlaybackIdentity()
+    }
     applyCommandAvailability()
 
     let title = args["title"] as? String ?? ""
@@ -1406,6 +1459,10 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     updateNotification(title: title, episode: episode, playing: playing)
     loadArtwork(coverUrl)
     drainPendingRemoteActions()
+    NSLog(
+      "[fqapp] now playing apply: playing=\(playing) rate=\(playing ? speed : 0)"
+        + " duration=\(duration / 1000) published=\(wasPublished)"
+    )
   }
 
   // MARK: - 通知栏

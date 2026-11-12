@@ -55,9 +55,11 @@ class _AudioPlaybackController extends ChangeNotifier
   bool _appActive = true;
   bool _loading = true;
   bool _wantPlay = true;
-  /// 换章取流期间系统媒体卡片要沿用上一次的播放态，不能因 loading 上报
-  /// paused —— 暂停态会话的卡片主体不唤起 App，两端按钮也不再派发。
-  bool _lastForegroundPlaying = false;
+  /// 换章取流期间系统媒体卡片要沿用上一次真实的播放态，不能因 loading
+  /// 上报 paused —— 暂停态会话的卡片主体不唤起 App，两端按钮也不再派发。
+  /// 用可空值区分「从未真正在播」与「确实播放过」：首播 loading 期间按
+  /// 「即将播放」上报，false 初值会把会话从第一秒起就钉在 paused。
+  bool? _lastForegroundPlaying;
   bool _completed = false;
   bool _autoAdvance = true;
   String? _error;
@@ -398,10 +400,19 @@ class _AudioPlaybackController extends ChangeNotifier
       return;
     }
     final player = _player;
-    final isPlaying = isIOSPlatform && _loading && _wantPlay
-        ? _lastForegroundPlaying
-        : (player?.playing ?? false) && _wantPlay && !_completed && !_loading;
-    _lastForegroundPlaying = isPlaying;
+    final bool isPlaying;
+    if (isIOSPlatform && _loading && _wantPlay) {
+      // 换章 / 首播的取流窗口里旧播放器已停、新播放器还没起，原生侧靠
+      // 静音桥接保持音频输出；这段时间必须维持 playing 语义，且不能用
+      // loading 期间的假值覆盖上一次真实播放态（会污染下一次换章）。
+      isPlaying = _lastForegroundPlaying ?? true;
+    } else {
+      isPlaying = (player?.playing ?? false) &&
+          _wantPlay &&
+          !_completed &&
+          !_loading;
+      _lastForegroundPlaying = isPlaying;
+    }
     unawaited(
       NativePlayer.startListenForeground(
         title: _title,
