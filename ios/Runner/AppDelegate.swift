@@ -859,6 +859,9 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   /// 冻结到下次回前台。收到切章远控后的一段窗口里持续恢复会话身份。
   private var actionWatchdog: DispatchWorkItem?
   private var watchdogDeadline: Date?
+  /// 独占 playback 会话只在首次配置或系统重置 / 中断后配置一次。播放中
+  /// 反复 setCategory / setActive 会中断 AVPlayer 的输出，后台切章就哑了。
+  private var audioSessionConfigured = false
 
   // MARK: - 注册
 
@@ -961,20 +964,26 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   /// 的必要条件；带 mixWithOthers 的会话不会被登记，卡片主体点击就没有
   /// 可唤起的目标，⏮ / ⏭ 也会派给上一个播放方。
   private func activateSession() {
+    // 播放中重设 category / options 会打断 AVPlayer 的输出：上一版会话
+    // 守护每 3 秒做一次，正是「按下切章后卡住不出声」的来源。配置一次
+    // 就够，之后只由中断 / 媒体服务重置这类真实事件触发重配。
+    guard !audioSessionConfigured else { return }
     let session = AVAudioSession.sharedInstance()
     do {
-      if session.category != .playback ||
-         session.categoryOptions.contains(.mixWithOthers) {
-        try session.setCategory(
-          .playback,
-          mode: .default,
-          options: [.allowBluetoothA2DP]
-        )
-      }
+      try session.setCategory(
+        .playback,
+        mode: .default,
+        options: [.allowBluetoothA2DP]
+      )
       try session.setActive(true, options: [])
+      audioSessionConfigured = true
     } catch {
       NSLog("[fqapp] audio session activate failed: \(error)")
     }
+  }
+
+  private func invalidateAudioSession() {
+    audioSessionConfigured = false
   }
 
   /// 章末换章、下一集取流的间隙播放器会完全静下来，iOS 随即挂起 App：
@@ -1068,12 +1077,13 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     actionWatchdog?.cancel()
     let item = DispatchWorkItem { [weak self] in
       guard let self, self.sessionPublished else { return }
-      self.activateSession()
+      // 守护只负责两件事：音频输出不断、卡片元数据不丢。会话已配置好，
+      // 播放中再改 category / 重装远控 target 会打断输出或让恰好按下的
+      // ⏮ / ⏭ 找不到 target，这两项改由系统事件驱动恢复。
       if self.silentPlayer?.isPlaying != true {
         self.startSilentPlayback(force: true)
       }
       UIApplication.shared.beginReceivingRemoteControlEvents()
-      self.installRemoteTargets()
       if !self.info.isEmpty {
         // 重新写回完整条目：系统按当前 Now Playing App 决定卡片主体点击
         // 唤起哪个进程，元数据被别的组件清掉后卡片就没有可唤起目标。
@@ -1114,9 +1124,14 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
         forName: name,
         object: nil,
         queue: .main
-      ) { [weak self] _ in
+      ) { [weak self] note in
         guard let self, self.sessionPublished else { return }
         self.ensurePlaybackIdentity()
+        if note.name == UIApplication.didBecomeActiveNotification {
+          // 后台冻结 / 冷启动期间缓存的动作，回前台立即补发，不等下一次
+          // 15 秒元数据心跳，避免「进 App 之后还要等一会才切章」。
+          self.drainPendingRemoteActions()
+        }
       }
     }
     NotificationCenter.default.addObserver(
@@ -1127,10 +1142,23 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       guard let self, self.sessionPublished else { return }
       guard
         let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-        let type = AVAudioSession.InterruptionType(rawValue: raw),
-        type == .ended
+        let type = AVAudioSession.InterruptionType(rawValue: raw)
       else { return }
+      if type == .began {
+        // 系统中断会 deactivate 会话；结束后才有资格重新配置一次。
+        self.invalidateAudioSession()
+        return
+      }
+      guard type == .ended else { return }
+      self.activateSession()
       self.ensurePlaybackIdentity()
+    }
+    NotificationCenter.default.addObserver(
+      forName: AVAudioSession.mediaServicesWereResetNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] _ in
+      self?.invalidateAudioSession()
     }
   }
 
@@ -1247,12 +1275,25 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
         if task != .invalid { UIApplication.shared.endBackgroundTask(task) }
         return
       }
-      // 带回执：Dart 的 method handler 还没挂（冷启动 / 引擎重建）时，
-      // 把动作放回缓存，等 ready 或下一次 update 再补发，不再静默丢。
+      // Dart isolate 被挂起时回执既不成功也不失败，动作会一直躺在引擎
+      // 队列里，直到回前台才被消费。给一个短超时：收不到回执就缓存，
+      // 等 ready / 回前台 / 下一次 update 补发。
+      var acknowledged = false
+      let ackTimeout = DispatchWorkItem { [weak self] in
+        guard let self, !acknowledged else { return }
+        NSLog("[fqapp] remote action ack timeout: \(action)")
+        self.pendingRemoteActions.append(action)
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: ackTimeout)
+      NSLog("[fqapp] remote action send: \(action)")
       channel.invokeMethod("onRemoteAction", arguments: ["action": action]) {
         [weak self] result in
-        guard let self, result is FlutterError else { return }
-        self.pendingRemoteActions.append(action)
+        guard let self else { return }
+        acknowledged = true
+        ackTimeout.cancel()
+        if result is FlutterError {
+          self.pendingRemoteActions.append(action)
+        }
       }
       if task != .invalid {
         // 覆盖 Dart 切章、取流到新音频起播的窗口；新音频一起播，
@@ -1298,6 +1339,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       info = [:]
       sessionPublished = false
       stopActionWatchdog()
+      invalidateAudioSession()
       removeNotification()
       stopSilentPlayback()
       MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -1313,7 +1355,12 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
 
   private func apply(_ args: [String: Any]) {
     sessionPublished = true
-    ensurePlaybackIdentity()
+    // 元数据刷新很频繁（切章、进度、15 秒心跳）。这里只补保活音轨和命令
+    // 可用性；重设音频会话、重装远控 target 交给真实系统事件，否则播放中
+    // 的 AVPlayer 会被反复打断、按下的 ⏮ / ⏭ 也可能恰好落在重装窗口。
+    activateSession()
+    startSilentPlayback()
+    applyCommandAvailability()
 
     let title = args["title"] as? String ?? ""
     let episode = args["episode"] as? String ?? ""

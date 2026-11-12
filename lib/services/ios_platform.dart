@@ -209,12 +209,12 @@ class IosPlatform {
   /// 把它当作 playerId 用（而不是真正的 Flutter texture id）。iOS 沿用同一
   /// 约定，渲染时按 id 找回对应的 VideoController。
   Widget videoSurface(int id, {Key? key}) {
-    final host = _players[id];
-    return host == null
+    final video = _players[id]?.video;
+    return video == null
         ? const SizedBox.expand()
         : Video(
             key: key,
-            controller: host.video,
+            controller: video,
             controls: NoVideoControls,
             fit: BoxFit.fill,
             pauseUponEnteringBackgroundMode: false,
@@ -284,15 +284,18 @@ class IosPlatform {
         ? raw
         : null;
     if (action == null || action.isEmpty) return null;
+    debugPrint('[ios-now-playing] remote action: $action');
+    // 回一个非空 ack：原生侧据此区分「Dart 已收到」与「isolate 被挂起」，
+    // 后者走超时缓存补发，动作不再静默等到回前台才被消费。
     // 先交给当前活跃的听书会话，绕开 NativePlayer 那份会被别的页面清掉的
     // 静态 handler；短剧等未注册会话仍走旧的 Android 通知契约。
-    if (IosPlatform.dispatchMediaAction(action)) return null;
+    if (IosPlatform.dispatchMediaAction(action)) return true;
     await PlatformChannels.notify(
       'fqapp/native_player',
       'onNotificationAction',
       {'action': action},
     );
-    return null;
+    return true;
   }
 
   /// 把当前在读/在听的内容发布成系统媒体元数据。
@@ -361,6 +364,7 @@ class IosPlatform {
         final host = _IosPlayer(
           id,
           (event) => _emit('fqapp/native_player/events', event),
+          audioOnly: args['audioOnly'] == true,
         );
         _players[id] = host;
         unawaited(
@@ -504,8 +508,13 @@ class IosPlatform {
 }
 
 class _IosPlayer {
-  _IosPlayer(this.id, this.emit) {
-    video = VideoController(player);
+  _IosPlayer(this.id, this.emit, {required this.audioOnly}) {
+    // 纯音频播放不需要 Flutter texture。后台换章时创建 VideoController
+    // 会去注册纹理、等首帧渲染，iOS 后台拿不到渲染，新播放器就建不起来，
+    // 旧播放器又已经停掉 —— 表现就是「按了切章卡住不出声」。
+    if (!audioOnly) {
+      video = VideoController(player);
+    }
     void event(String type, dynamic value) {
       if (!disposed) emit({'playerId': id, 'type': type, 'value': value});
     }
@@ -520,15 +529,18 @@ class _IosPlayer {
       player.stream.height.listen((_) => _size()),
       player.stream.error.listen((_) => event('error', _errorPayload())),
     ]);
-    unawaited(
-      video.waitUntilFirstFrameRendered.then((_) => event('firstFrame', true)),
-    );
+    if (!audioOnly) {
+      unawaited(
+        video!.waitUntilFirstFrameRendered.then((_) => event('firstFrame', true)),
+      );
+    }
   }
 
   final int id;
   final void Function(Map<String, dynamic>) emit;
+  final bool audioOnly;
   final player = Player();
-  late final VideoController video;
+  VideoController? video;
   final subscriptions = <StreamSubscription<dynamic>>[];
   final ready = Completer<void>();
   bool disposed = false;
