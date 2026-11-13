@@ -66,6 +66,9 @@ class AppLog with WidgetsBindingObserver {
   static const String logDirName = 'logs';
   static const String logFileName = 'app.log';
 
+  /// iOS 原生侧（Swift）双写落盘的日志文件，与 app.log 同目录。
+  static const String nativeLogFileName = 'native.log';
+
   final List<LogEntry> _entries = <LogEntry>[];
 
   /// 上次会话从落盘文件回读的条目：只用于查看与导出，不再写回文件（避免重复）。
@@ -605,6 +608,38 @@ class RustLogSource {
     } catch (_) {
       return null;
     }
+  }
+}
+
+/// iOS 原生日志：Swift 侧 `FqNativeLog` 在发 os_log 的同时写进
+/// `getApplicationSupportDirectory()/logs/native.log`。非 iOS 平台没有这个
+/// 文件，读取返回 null，导出时自动省略该段。
+class NativeLogSource {
+  const NativeLogSource._();
+
+  static Future<String?> read() async {
+    try {
+      final support = await getApplicationSupportDirectory();
+      final file = File(
+        '${support.path}/${AppLog.logDirName}/${AppLog.nativeLogFileName}',
+      );
+      if (!await file.exists()) return null;
+      return await file.readAsString();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 导出头用：Swift 每次新建或轮转文件都会写一行
+  /// `# fqapp native log | build <version> (<build>) | bundle <id>`。
+  static String buildInfo(String? text) {
+    if (text == null) return '未知（无原生日志）';
+    for (final line in text.split('\n').reversed) {
+      if (line.startsWith('# fqapp native log | build ')) {
+        return line.substring(2).trim();
+      }
+    }
+    return '未知（原生日志无构建信息）';
   }
 }
 

@@ -339,8 +339,12 @@ class _LogViewerPageState extends State<LogViewerPage>
       // Read the core file at export time: the page may be showing the
       // application source, so the polling cache may not be warm.
       final rustEntries = await _readRustForExport();
+      // 导出时读原生文件：进程被系统杀掉后系统日志缓冲会滚掉，落盘文件仍在。
+      final nativeText = await NativeLogSource.read();
       if (!mounted) return;
-      if (appEntries.isEmpty && (rustEntries == null || rustEntries.isEmpty)) {
+      if (appEntries.isEmpty &&
+          (rustEntries == null || rustEntries.isEmpty) &&
+          nativeText == null) {
         _message(
           rustEntries == null ? '应用暂无日志，核心日志未获取（文件不存在或读取失败）' : '暂无可导出的应用或核心日志',
         );
@@ -349,23 +353,30 @@ class _LogViewerPageState extends State<LogViewerPage>
       final coreSummary = rustEntries == null
           ? '未获取（文件不存在或读取失败）'
           : '${rustEntries.length} 条';
+      final nativeSummary = nativeText == null
+          ? '未获取（仅 iOS 且需起播后生成）'
+          : '${nativeText.split('\n').length} 行';
       final text =
-          'fqapp 应用 + 核心日志\n'
+          'fqapp 应用 + 核心 + 原生日志\n'
           '导出时间：${now.toIso8601String()}\n'
-          '范围：应用与核心全部可用日志，不受筛选影响\n'
+          '构建信息：${NativeLogSource.buildInfo(nativeText)}\n'
+          '范围：应用、核心与原生全部可用日志，不受筛选影响\n'
           '应用日志：${appEntries.length} 条\n'
-          '核心日志：$coreSummary\n\n'
+          '核心日志：$coreSummary\n'
+          '原生日志：$nativeSummary\n\n'
           '===== 应用日志 =====\n'
           '${formatLogLines(appEntries)}\n\n'
           '===== 核心日志 =====\n'
-          '${rustEntries == null ? coreSummary : formatLogLines(rustEntries)}\n';
+          '${rustEntries == null ? coreSummary : formatLogLines(rustEntries)}\n\n'
+          '===== 原生日志 =====\n'
+          '${nativeText ?? '未获取（仅 iOS 且需起播后生成）'}\n';
       final target = await widget.exportSink.saveText(
         fileName: 'fqapp-all-logs-${now.microsecondsSinceEpoch}.txt',
         text: text,
       );
       _message(
         '已导出应用 ${appEntries.length} 条 + 核心 $coreSummary'
-        '${_where(target)}',
+        ' + 原生 $nativeSummary${_where(target)}',
       );
     } on ExportWriteException catch (error) {
       _message('导出失败：${error.message}');
@@ -427,8 +438,8 @@ class _LogViewerPageState extends State<LogViewerPage>
         _actionRow(
           _LogAction.exportBoth,
           LucideIcons.files,
-          '导出应用 + 核心',
-          '应用 ${appAll.length} 条 + 核心日志 · 导出前读取最新内容',
+          '导出应用 + 核心 + 原生',
+          '应用 ${appAll.length} 条 + 核心 + 原生日志 · 导出前读取最新内容',
           // The core may have logs even if its tab has never been opened.
           enabled: !_exporting,
         ),

@@ -4,6 +4,79 @@ import MediaPlayer
 import UIKit
 import UniformTypeIdentifiers
 import UserNotifications
+import os
+
+/// 原生日志双写：os_log 供系统统一日志 / Console.app 抓取，同时立即落盘，
+/// 让 App 内的日志导出能带上原生事件。系统日志是内存环形缓冲，进程被系统
+/// 终止或缓冲滚掉后就没了；文件跨冷启动保留。
+private final class FqNativeLog {
+  static let shared = FqNativeLog()
+
+  private static let subsystem = Bundle.main.bundleIdentifier ?? "fqapp"
+  private static let osLog = OSLog(subsystem: subsystem, category: "NowPlaying")
+  private static let maxBytes: UInt64 = 512 * 1024
+
+  private let lock = NSLock()
+  private let formatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+  }()
+
+  /// 与 Dart 的 getApplicationSupportDirectory()/logs 指向同一目录。
+  private var fileURL: URL? {
+    guard let support = FileManager.default.urls(
+      for: .applicationSupportDirectory,
+      in: .userDomainMask
+    ).first else { return nil }
+    let dir = support.appendingPathComponent("logs", isDirectory: true)
+    try? FileManager.default.createDirectory(
+      at: dir,
+      withIntermediateDirectories: true
+    )
+    return dir.appendingPathComponent("native.log")
+  }
+
+  /// 导出头从这行取构建号，避免日志与 IPA 版本对不上。
+  private var buildHeader: String {
+    let info = Bundle.main.infoDictionary
+    let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+    let build = info?["CFBundleVersion"] as? String ?? "?"
+    return "# fqapp native log | build \(version) (\(build))"
+      + " | bundle \(Self.subsystem)"
+  }
+
+  static func log(_ message: String) {
+    os_log(.default, log: osLog, "%{public}@", message)
+    shared.write(message)
+  }
+
+  private func write(_ message: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let url = fileURL else { return }
+    let fm = FileManager.default
+    let header = buildHeader + "\n"
+    if !fm.fileExists(atPath: url.path) {
+      try? header.write(to: url, atomically: true, encoding: .utf8)
+    } else {
+      let attrs = try? fm.attributesOfItem(atPath: url.path)
+      let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+      if size > Self.maxBytes {
+        let backup = url.deletingPathExtension().appendingPathExtension("old.log")
+        try? fm.removeItem(at: backup)
+        try? fm.moveItem(at: url, to: backup)
+        try? header.write(to: url, atomically: true, encoding: .utf8)
+      }
+    }
+    guard let handle = try? FileHandle(forWritingTo: url) else { return }
+    defer { try? handle.close() }
+    try? handle.seekToEnd()
+    let line = "\(formatter.string(from: Date())) \(message)\n"
+    try? handle.write(contentsOf: Data(line.utf8))
+    try? handle.synchronize()
+  }
+}
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
@@ -786,7 +859,7 @@ final class NotificationPermissionChannel {
           options: [.alert, .sound, .badge]
         ) { _, error in
           if let error = error {
-            NSLog("[fqapp] notification authorization failed: \(error)")
+            FqNativeLog.log("[fqapp] notification authorization failed: \(error)")
           }
           self.currentStatus { next in
             DispatchQueue.main.async { result(next) }
@@ -933,7 +1006,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
     let action = response.actionIdentifier
-    NSLog("[fqapp] notification response: \(action)")
+    FqNativeLog.log("[fqapp] notification response: \(action)")
     switch action {
     case NowPlayingChannel.actionOpen, UNNotificationDefaultActionIdentifier:
       // 这是 App 唯一能可靠接收的「点进 App」入口：default action 与
@@ -980,12 +1053,12 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
           mode: .default,
           options: [.allowBluetoothA2DP]
         )
-        NSLog("[fqapp] audio session category restored to playback")
+        FqNativeLog.log("[fqapp] audio session category restored to playback")
       }
       try session.setActive(true, options: [])
       audioSessionConfigured = true
     } catch {
-      NSLog("[fqapp] audio session activate failed: \(error)")
+      FqNativeLog.log("[fqapp] audio session activate failed: \(error)")
     }
   }
 
@@ -996,7 +1069,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       try AVAudioSession.sharedInstance().setActive(true, options: [])
       audioSessionConfigured = true
     } catch {
-      NSLog("[fqapp] audio session reactivate failed: \(error)")
+      FqNativeLog.log("[fqapp] audio session reactivate failed: \(error)")
     }
   }
 
@@ -1024,10 +1097,10 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       player.prepareToPlay()
       silentPlayer = player
       if !player.play() {
-        NSLog("[fqapp] silent playback did not start")
+        FqNativeLog.log("[fqapp] silent playback did not start")
       }
     } catch {
-      NSLog("[fqapp] silent playback unavailable: \(error)")
+      FqNativeLog.log("[fqapp] silent playback unavailable: \(error)")
     }
   }
 
@@ -1320,11 +1393,11 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       var acknowledged = false
       let ackTimeout = DispatchWorkItem { [weak self] in
         guard let self, !acknowledged else { return }
-        NSLog("[fqapp] remote action ack timeout: \(action)")
+        FqNativeLog.log("[fqapp] remote action ack timeout: \(action)")
         self.pendingRemoteActions.append(action)
       }
       DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: ackTimeout)
-      NSLog("[fqapp] remote action send: \(action)")
+      FqNativeLog.log("[fqapp] remote action send: \(action)")
       channel.invokeMethod("onRemoteAction", arguments: ["action": action]) {
         [weak self] result in
         guard let self else { return }
@@ -1389,7 +1462,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       // 会话从未发布，会重新 beginReceiving + 装回 target。
       removeRemoteTargets()
       UIApplication.shared.endReceivingRemoteControlEvents()
-      NSLog("[fqapp] now playing session cleared")
+      FqNativeLog.log("[fqapp] now playing session cleared")
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
@@ -1459,7 +1532,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     updateNotification(title: title, episode: episode, playing: playing)
     loadArtwork(coverUrl)
     drainPendingRemoteActions()
-    NSLog(
+    FqNativeLog.log(
       "[fqapp] now playing apply: playing=\(playing) rate=\(playing ? speed : 0)"
         + " duration=\(duration / 1000) published=\(wasPublished)"
     )
