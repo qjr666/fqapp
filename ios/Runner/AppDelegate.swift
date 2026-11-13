@@ -1,5 +1,6 @@
 import ActivityKit
 import AVFoundation
+import CoreMedia
 import Dispatch
 import Flutter
 import MediaPlayer
@@ -971,6 +972,33 @@ final class NowPlayingChannel: NSObject {
   /// 反复 setCategory / setActive 会中断 AVPlayer 的输出，后台切章就哑了。
   private var audioSessionConfigured = false
 
+  /// 真实音频时间线：AVPlayer 持续渲染章节音频（本地回环服务解密后的明文流
+  /// 或本地静音轨），volume 置 0 只是不重复出声，媒体客户端与时间线仍然
+  /// 真实存在。系统据此把本 App 登记为 Now Playing App，锁屏卡片主体点击
+  /// 才有可唤起的进程。
+  private var timelinePlayer: AVPlayer?
+  private var timelineItem: AVPlayerItem?
+  private var timelineURL: String?
+  /// iOS 16+ 的显式会话登记对象。部署目标为 iOS 15，用 NSObject 持有，
+  /// 避免在存储属性上直接标注 @available。
+  private var sessionObject: NSObject?
+
+  private var infoCenter: MPNowPlayingInfoCenter {
+    if #available(iOS 16.0, *),
+       let session = sessionObject as? MPNowPlayingSession {
+      return session.nowPlayingInfoCenter
+    }
+    return MPNowPlayingInfoCenter.default()
+  }
+
+  private var commandCenter: MPRemoteCommandCenter {
+    if #available(iOS 16.0, *),
+       let session = sessionObject as? MPNowPlayingSession {
+      return session.remoteCommandCenter
+    }
+    return MPRemoteCommandCenter.shared()
+  }
+
   // MARK: - 注册
 
   func register(messenger: FlutterBinaryMessenger) {
@@ -1010,16 +1038,18 @@ final class NowPlayingChannel: NSObject {
     timer.setEventHandler { [weak self] in
       guard let self, self.sessionPublished else { return }
       self.activateSession()
-      if self.silentPlayer?.isPlaying != true {
+      if let timeline = self.timelinePlayer {
+        if timeline.rate == 0 { timeline.play() }
+      } else if self.silentPlayer?.isPlaying != true {
         self.startSilentPlayback(force: true)
       }
       guard Date().timeIntervalSince(self.lastInfoRefresh) >= 10,
             !self.info.isEmpty else { return }
-      MPNowPlayingInfoCenter.default().nowPlayingInfo = self.info
+      self.infoCenter.nowPlayingInfo = self.info
       let rate =
         (self.info[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber)?
           .doubleValue ?? 0
-      MPNowPlayingInfoCenter.default().playbackState =
+      self.infoCenter.playbackState =
         rate > 0 ? .playing : .paused
       self.lastInfoRefresh = Date()
     }
@@ -1093,6 +1123,9 @@ final class NowPlayingChannel: NSObject {
   /// 输出会被 CoreAudio 判成无音频活动，系统就不把本 App 记为正在播放。
   private func startSilentPlayback(force: Bool = false) {
     guard sessionPublished else { return }
+    // iOS 16+ 由 AVPlayer 时间线提供媒体身份，不再叠加 AVAudioPlayer，
+    // 避免两个音频客户端争抢同一会话的归属。iOS 15 保留原有静音轨。
+    if #available(iOS 16.0, *), timelinePlayer != nil { return }
     // 会话被别的组件 deactivate 时 isPlaying 可能仍为 true，却没有音频输出；
     // 看门狗用 force 重启音轨，重新向 CoreAudio 声明本 App 正在播放。
     if !force && silentPlayer?.isPlaying == true { return }
@@ -1167,6 +1200,7 @@ final class NowPlayingChannel: NSObject {
     startSilentPlayback()
     UIApplication.shared.beginReceivingRemoteControlEvents()
     installRemoteTargets()
+    ensureSessionActive()
   }
 
   /// 后台按上一章 / 下一章时，Dart 会停掉旧播放器再取流重建。旧播放器
@@ -1181,7 +1215,9 @@ final class NowPlayingChannel: NSObject {
       // 守护只负责两件事：音频输出不断、卡片元数据不丢。会话已配置好，
       // 播放中再改 category / 重装远控 target 会打断输出或让恰好按下的
       // ⏮ / ⏭ 找不到 target，这两项改由系统事件驱动恢复。
-      if self.silentPlayer?.isPlaying != true {
+      if let timeline = self.timelinePlayer {
+        if timeline.rate == 0 { timeline.play() }
+      } else if self.silentPlayer?.isPlaying != true {
         self.startSilentPlayback(force: true)
       }
       self.keepSessionActive()
@@ -1189,14 +1225,14 @@ final class NowPlayingChannel: NSObject {
       if !self.info.isEmpty {
         // 重新写回完整条目：系统按当前 Now Playing App 决定卡片主体点击
         // 唤起哪个进程，元数据被别的组件清掉后卡片就没有可唤起目标。
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = self.info
+        self.infoCenter.nowPlayingInfo = self.info
         let rate: Double
         if let value = self.info[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber {
           rate = value.doubleValue
         } else {
           rate = 0
         }
-        MPNowPlayingInfoCenter.default().playbackState = rate > 0 ? .playing : .paused
+        self.infoCenter.playbackState = rate > 0 ? .playing : .paused
       }
       guard let deadline = self.watchdogDeadline else { return }
       if Date() < deadline {
@@ -1240,11 +1276,11 @@ final class NowPlayingChannel: NSObject {
           // 系统从锁屏卡片唤起 App 时不带 URL，也不会保留被别的组件清掉的
           // 元数据：补写完整条目，让会话仍是系统认定的 Now Playing App。
           if !self.info.isEmpty {
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = self.info
+            self.infoCenter.nowPlayingInfo = self.info
             let rate =
               (self.info[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber)?
                 .doubleValue ?? 0
-            MPNowPlayingInfoCenter.default().playbackState =
+            self.infoCenter.playbackState =
               rate > 0 ? .playing : .paused
           }
           // 后台冻结 / 冷启动期间缓存的动作，回前台立即补发，不等下一次
@@ -1296,6 +1332,94 @@ final class NowPlayingChannel: NSObject {
     }
   }
 
+  // MARK: - 真实音频时间线 / Now Playing 会话登记
+
+  /// 用真实播放的 AVPlayer 取代「只写 nowPlayingInfo 字典」的伪会话。
+  /// MPNowPlayingSession 把这个播放器显式登记为系统的 Now Playing session，
+  /// SpringBoard 解析卡片主体点击时才能按 bundle id 唤起本 App。
+  private func installTimeline(urlString: String, startMs: Double) {
+    guard #available(iOS 16.0, *) else { return }
+    let resolved: URL
+    if let url = URL(string: urlString),
+       url.scheme == "http" || url.scheme == "https" || url.isFileURL {
+      resolved = url
+    } else if let silence = try? silenceFileURL() {
+      resolved = silence
+    } else {
+      return
+    }
+    let key = resolved.absoluteString
+    let start = CMTime(value: Int64(max(startMs, 0)), timescale: 1000)
+    if key == timelineURL, let player = timelinePlayer {
+      if startMs > 0 { player.seek(to: start) }
+      if player.rate == 0 { player.play() }
+      ensureSessionActive()
+      return
+    }
+    // commandCenter 会从 shared 切到 session：先把挂在 shared 上的 target
+    // 摘干净，避免一次按键被两个命令中心各派发一次。
+    removeRemoteTargets()
+    timelinePlayer?.pause()
+    let item = AVPlayerItem(url: resolved)
+    let player = AVPlayer(playerItem: item)
+    // 声音仍由 media_kit / 系统朗读负责，这条时间线只提供媒体身份。
+    player.volume = 0
+    timelineItem = item
+    timelinePlayer = player
+    timelineURL = key
+    let session = MPNowPlayingSession(players: [player])
+    // 章节名、进度与倍速由 Dart 维护；自动发布会把音轨时长写进卡片，
+    // 覆盖真实章节时长，所以这里保持手动发布。
+    session.automaticallyPublishesNowPlayingInfo = false
+    sessionObject = session
+    if startMs > 0 { player.seek(to: start) }
+    player.play()
+    installRemoteTargets()
+    ensureSessionActive()
+    if !info.isEmpty { applyStaticMetadata(info) }
+    FqNativeLog.log(
+      "[fqapp] audio timeline installed: \(resolved.isFileURL ? "silence" : "chapter")"
+    )
+  }
+
+  private func ensureSessionActive() {
+    if #available(iOS 16.0, *) {
+      guard let session = sessionObject as? MPNowPlayingSession else { return }
+      FqNativeLog.log(
+        "[fqapp] now playing session: canBecomeActive=\(session.canBecomeActive)"
+          + " isActive=\(session.isActive)"
+      )
+      session.becomeActiveIfPossible { [weak self] success in
+        FqNativeLog.log("[fqapp] now playing session become active: \(success)")
+        guard let self, success, !self.info.isEmpty else { return }
+        self.infoCenter.nowPlayingInfo = self.info
+        let rate =
+          (self.info[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber)?
+            .doubleValue ?? 0
+        self.infoCenter.playbackState = rate > 0 ? .playing : .paused
+      }
+    }
+  }
+
+  private func applyStaticMetadata(_ next: [String: Any]) {
+    guard let item = timelineItem else { return }
+    let keys = [
+      MPMediaItemPropertyTitle,
+      MPMediaItemPropertyArtist,
+      MPMediaItemPropertyAlbumTitle,
+      MPMediaItemPropertyArtwork,
+      MPMediaItemPropertyPersistentID,
+      MPNowPlayingInfoPropertyMediaType,
+      MPNowPlayingInfoPropertyPlaybackQueueIndex,
+      MPNowPlayingInfoPropertyPlaybackQueueCount,
+    ]
+    var staticInfo: [String: Any] = [:]
+    for key in keys {
+      if let value = next[key] { staticInfo[key] = value }
+    }
+    item.nowPlayingInfo = staticInfo
+  }
+
   // MARK: - MPRemoteCommandCenter
 
   /// 用 self + selector 挂 target，才能 `removeTarget(self)` 精确重装：
@@ -1303,7 +1427,7 @@ final class NowPlayingChannel: NSObject {
   /// 一律禁用且不挂 target，否则控制中心会把「上一首 / 下一首」换成
   /// 15 秒快退 / 快进。
   private func installRemoteTargets() {
-    let center = MPRemoteCommandCenter.shared()
+    let center = self.commandCenter
     let unavailable: [MPRemoteCommand] = [
       center.skipForwardCommand,
       center.skipBackwardCommand,
@@ -1372,7 +1496,7 @@ final class NowPlayingChannel: NSObject {
   }
 
   private func applyCommandAvailability() {
-    let center = MPRemoteCommandCenter.shared()
+    let center = self.commandCenter
     center.playCommand.isEnabled = true
     center.pauseCommand.isEnabled = true
     center.togglePlayPauseCommand.isEnabled = true
@@ -1389,7 +1513,7 @@ final class NowPlayingChannel: NSObject {
   /// 只摘自己挂的 target，配合 endReceivingRemoteControlEvents() 完整退出
   /// 远控响应链；不能用 removeTarget(nil)，那会连带摘掉别的音频组件。
   private func removeRemoteTargets() {
-    let center = MPRemoteCommandCenter.shared()
+    let center = self.commandCenter
     let commands: [MPRemoteCommand] = [
       center.playCommand,
       center.pauseCommand,
@@ -1480,6 +1604,13 @@ final class NowPlayingChannel: NSObject {
       // Dart 已挂好 onRemoteAction 接收者，此时补发才有人接。
       drainPendingRemoteActions()
       result(nil)
+    case "setAudioSource":
+      let source = call.arguments as? [String: Any] ?? [:]
+      installTimeline(
+        urlString: source["url"] as? String ?? "",
+        startMs: (source["startMs"] as? NSNumber)?.doubleValue ?? 0
+      )
+      result(nil)
     case "clear":
       // 保留暂停态卡片：音乐类 App 停止播放后控制中心仍留一张可重新唤起
       // 的卡片。只把速率与播放态写成 paused，元数据、远控注册、静音桥接
@@ -1489,8 +1620,8 @@ final class NowPlayingChannel: NSObject {
       var paused = info
       paused[MPNowPlayingInfoPropertyPlaybackRate] = 0
       info = paused
-      MPNowPlayingInfoCenter.default().nowPlayingInfo = paused
-      MPNowPlayingInfoCenter.default().playbackState = .paused
+      self.infoCenter.nowPlayingInfo = paused
+      self.infoCenter.playbackState = .paused
       keepSessionActive()
       startSilentPlayback()
       applyCommandAvailability()
@@ -1502,6 +1633,11 @@ final class NowPlayingChannel: NSObject {
   }
 
   private func apply(_ args: [String: Any]) {
+    // 系统朗读没有音频地址时也要有真实时间线：退回本地静音轨，
+    // 由 AVPlayer 而非 AVAudioPlayer 提供媒体客户端身份。
+    if timelinePlayer == nil {
+      installTimeline(urlString: "", startMs: 0)
+    }
     let wasPublished = sessionPublished
     sessionPublished = true
     // 元数据刷新很频繁（切章、进度、15 秒心跳）。播放中只补会话活性、
@@ -1581,9 +1717,11 @@ final class NowPlayingChannel: NSObject {
     }
 
     info = next
-    MPNowPlayingInfoCenter.default().nowPlayingInfo = next
-    MPNowPlayingInfoCenter.default().playbackState =
+    self.infoCenter.nowPlayingInfo = next
+    self.infoCenter.playbackState =
       reportedRate > 0 ? .playing : .paused
+    applyStaticMetadata(next)
+    if playing, timelinePlayer?.rate == 0 { timelinePlayer?.play() }
     applyCommandAvailability()
     loadArtwork(coverUrl)
     drainPendingRemoteActions()
@@ -1610,7 +1748,8 @@ final class NowPlayingChannel: NSObject {
         self.artworkTask = nil
         self.artwork = artwork
         self.info[MPMediaItemPropertyArtwork] = artwork
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = self.info
+        self.infoCenter.nowPlayingInfo = self.info
+        self.applyStaticMetadata(self.info)
       }
     }
     artworkTask?.resume()

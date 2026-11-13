@@ -336,6 +336,19 @@ class IosPlatform {
 
   /// 停止播放后清掉系统媒体卡片：留着上一本书的卡片，系统会一直显示
   /// 「暂停」按钮，用户按下去什么也不会发生。
+  /// 把当前章节的真实音频地址交给原生层的 AVPlayer 时间线。
+  /// 纯系统朗读（AVSpeechSynthesizer）没有音频文件，原生层会退回静音轨。
+  static Future<void> publishAudioSource(String url, int startMs) async {
+    try {
+      await _nowPlayingChannel.invokeMethod<void>('setAudioSource', {
+        'url': url,
+        'startMs': startMs,
+      });
+    } catch (error) {
+      debugPrint('[ios-now-playing] audio source failed: $error');
+    }
+  }
+
   Future<void> _clearNowPlaying() async {
     if (_nowPlayingPayload == null) return;
     _nowPlayingPayload = null;
@@ -611,6 +624,12 @@ class _IosPlayer {
           url.contains('/_session/') && url.contains('/src/');
       if (disposed) return;
       await player.open(Media(url), play: false);
+      // 把章节的真实音频地址交给原生层，由 AVPlayer 建立可寻址的媒体
+      // 时间线并显式登记 Now Playing 会话；系统朗读没有片源时原生层
+      // 会退回本地静音轨，媒体客户端身份依然存在。
+      if (isIOSPlatform) {
+        unawaited(IosPlatform.publishAudioSource(url, startMs));
+      }
       if (startMs > 0) {
         await player.seek(Duration(milliseconds: startMs));
       }
