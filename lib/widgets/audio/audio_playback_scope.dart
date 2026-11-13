@@ -117,7 +117,8 @@ class AudioPlaybackScope extends StatefulWidget {
   State<AudioPlaybackScope> createState() => _AudioPlaybackScopeState();
 }
 
-class _AudioPlaybackScopeState extends State<AudioPlaybackScope> {
+class _AudioPlaybackScopeState extends State<AudioPlaybackScope>
+    with WidgetsBindingObserver {
   _AudioPlaybackController? _session;
   SystemTtsPlayback? _tts;
   SystemTtsPlayback? _ttsPage;
@@ -146,6 +147,7 @@ class _AudioPlaybackScopeState extends State<AudioPlaybackScope> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     NativePlayer.beforePlay = _playGate;
     unawaited(_loadRecent());
   }
@@ -571,8 +573,21 @@ class _AudioPlaybackScopeState extends State<AudioPlaybackScope> {
     WidgetsBinding.instance.ensureVisualUpdate();
   }
 
+  /// 锁屏 / 控制中心点系统 Now Playing 卡片只会把本进程带回前台：系统
+  /// 不传 URL、也不告知点击来源，落地页只能由 App 按当前会话自己判断。
+  /// iOS 上回前台且仍有听书会话时把听书页带回栈顶；其它平台仍走各自的
+  /// 后台通知入口。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !isIOSPlatform) return;
+    final session = _session;
+    if (session == null || session._closed) return;
+    _openAudio(session);
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     if (identical(NativePlayer.beforePlay, _playGate)) {
       NativePlayer.beforePlay = null;
     }
