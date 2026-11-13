@@ -1402,7 +1402,7 @@ final class NowPlayingChannel: NSObject {
   }
 
   private func applyStaticMetadata(_ next: [String: Any]) {
-    guard let item = timelineItem else { return }
+    guard #available(iOS 16.0, *), let item = timelineItem else { return }
     let keys = [
       MPMediaItemPropertyTitle,
       MPMediaItemPropertyArtist,
