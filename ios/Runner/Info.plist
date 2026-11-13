@@ -59,6 +59,9 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<!-- 灵动岛卡片由 App 自己提供的 Live Activity 承载，点击走 fqapp:// 深链。 -->
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

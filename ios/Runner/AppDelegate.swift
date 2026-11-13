@@ -1,3 +1,4 @@
+import ActivityKit
 import AVFoundation
 import Flutter
 import MediaPlayer
@@ -78,6 +79,76 @@ private final class FqNativeLog {
   }
 }
 
+/// 灵动岛 / 锁屏 Live Activity 的生命周期管理。
+///
+/// 系统 Now Playing 卡片的主体点击没有 App 侧回调；只有 App 自己提供的
+/// Live Activity 能把点击绑定成 fqapp:// 深链。整段播放只维护一个 Activity，
+/// 切章只更新状态，不反复 request（每次 request 都会让灵动岛重新展开）。
+@available(iOS 16.2, *)
+private final class FqLiveActivityController {
+  static let shared = FqLiveActivityController()
+
+  private var activity: Activity<FqListeningAttributes>?
+  private var state: FqListeningAttributes.ContentState?
+
+  func publish(
+    title: String,
+    episode: String,
+    playing: Bool,
+    hasPrev: Bool,
+    hasNext: Bool,
+    positionMs: Double,
+    durationMs: Double
+  ) {
+    let next = FqListeningAttributes.ContentState(
+      title: title,
+      episode: episode,
+      playing: playing,
+      hasPrev: hasPrev,
+      hasNext: hasNext,
+      positionMs: positionMs,
+      durationMs: durationMs
+    )
+    state = next
+    let content = ActivityContent(
+      state: next,
+      staleDate: Date().addingTimeInterval(4 * 3600),
+      relevanceScore: 100
+    )
+    if let activity {
+      Task { await activity.update(content) }
+      return
+    }
+    guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+      FqNativeLog.log("[fqapp] live activities disabled")
+      return
+    }
+    do {
+      activity = try Activity.request(
+        attributes: FqListeningAttributes(bookTitle: title),
+        content: content,
+        pushType: nil
+      )
+      FqNativeLog.log("[fqapp] live activity started")
+    } catch {
+      FqNativeLog.log("[fqapp] live activity unavailable: \(error)")
+    }
+  }
+
+  /// 停止播放时保留暂停态卡片，与音乐 App 暂停后控制中心仍留卡片一致。
+  func pause() {
+    guard var next = state, let activity else { return }
+    next.playing = false
+    state = next
+    let content = ActivityContent(
+      state: next,
+      staleDate: Date().addingTimeInterval(4 * 3600),
+      relevanceScore: 50
+    )
+    Task { await activity.update(content) }
+  }
+}
+
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   /// 应用级通道实例必须被 AppDelegate **持有**。
@@ -112,7 +183,10 @@ private final class FqNativeLog {
     open url: URL,
     options: [UIApplication.OpenURLOptionsKey: Any]
   ) -> Bool {
-    if url.scheme == "fqapp" { return true }
+    if url.scheme == "fqapp" {
+      FqNativeLog.log("[fqapp] open url: \(url.absoluteString)")
+      return true
+    }
     return super.application(app, open: url, options: options)
   }
 
@@ -907,6 +981,16 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   /// 而不是直播流 —— 直播流会把 ⏮ / ⏭ 换成 15 秒快退 / 快进。
   private static let placeholderDurationMs = 3_600_000.0
 
+  /// 持久化曲目 ID 用书名的稳定哈希，跨切章保持不变；不用 String.hashValue，
+  /// 后者每次进程启动都会变，系统会把同一本书认成不同曲目。
+  private static func stableID(_ text: String) -> UInt64 {
+    var hash: UInt64 = 5_381
+    for byte in text.utf8 {
+      hash = ((hash << 5) &+ hash) &+ UInt64(byte)
+    }
+    return hash
+  }
+
   private var channel: FlutterMethodChannel?
   private var artworkTask: URLSessionDataTask?
   private var artworkURL: String?
@@ -924,7 +1008,14 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   private var lastNotificationTitle = ""
   private var lastNotificationEpisode = ""
   private var lastNotificationKey = ""
-  private var notificationNeedsRefresh = true
+  private var notificationNeedsRefresh = false
+  /// 常驻入口整段播放只投递一次：切章、暂停、5 秒同步、15 秒心跳都不重投。
+  private var notificationDelivered = false
+  /// 切章取流时 durationMs 会短暂回落成 0，沿用上一章真实时长，不让
+  /// nowPlayingInfo 在「1 小时占位 → 真实时长」之间抖动重绘。
+  private var lastKnownDurationMs = 0.0
+  private var lastEpisode = ""
+  private var queueIndex = 0
   /// 后台通知动作可能早于 Flutter 隐式引擎桥接完成，先缓存再补发。
   private var pendingRemoteActions: [String] = []
   /// 后台换章时旧播放器被 pause / dispose，常把共享 AVAudioSession 一起
@@ -985,7 +1076,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
         options: []
       )
     ])
-    notificationNeedsRefresh = true
+    // category 是启动时注册的静态集合，投递一次即可；切章重投只会多弹横幅。
   }
 
   // MARK: - UNUserNotificationCenterDelegate
@@ -997,6 +1088,9 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
   ) {
     // 只进通知中心、不弹横幅：前台界面里已有播放器，后台下拉必须看得到
     // 这一条，且它得带着切章按钮。回空数组系统连通知中心都不写。
+    FqNativeLog.log(
+      "[fqapp] notification willPresent: \(notification.request.identifier)"
+    )
     completionHandler([.list])
   }
 
@@ -1006,7 +1100,11 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
     let action = response.actionIdentifier
-    FqNativeLog.log("[fqapp] notification response: \(action)")
+    FqNativeLog.log(
+      "[fqapp] notification response: \(action)"
+        + " state=\(UIApplication.shared.applicationState.rawValue)"
+        + " category=\(response.notification.request.content.categoryIdentifier)"
+    )
     switch action {
     case NowPlayingChannel.actionOpen, UNNotificationDefaultActionIdentifier:
       // 这是 App 唯一能可靠接收的「点进 App」入口：default action 与
@@ -1218,6 +1316,7 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
         queue: .main
       ) { [weak self] note in
         guard let self, self.sessionPublished else { return }
+        FqNativeLog.log("[fqapp] lifecycle: \(note.name.rawValue)")
         self.ensurePlaybackIdentity()
         if note.name == UIApplication.didBecomeActiveNotification {
           // 后台冻结 / 冷启动期间缓存的动作，回前台立即补发，不等下一次
@@ -1237,11 +1336,13 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
         let type = AVAudioSession.InterruptionType(rawValue: raw)
       else { return }
       if type == .began {
+        FqNativeLog.log("[fqapp] audio interruption began")
         // 系统中断会 deactivate 会话；结束后才有资格重新配置一次。
         self.invalidateAudioSession()
         return
       }
       guard type == .ended else { return }
+      FqNativeLog.log("[fqapp] audio interruption ended")
       self.activateSession()
       self.ensurePlaybackIdentity()
     }
@@ -1256,6 +1357,14 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       self.invalidateAudioSession()
       self.activateSession()
       if self.sessionPublished { self.ensurePlaybackIdentity() }
+    }
+    NotificationCenter.default.addObserver(
+      forName: AVAudioSession.routeChangeNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] _ in
+      guard let self, self.sessionPublished else { return }
+      FqNativeLog.log("[fqapp] audio route changed")
     }
   }
 
@@ -1444,25 +1553,20 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       drainPendingRemoteActions()
       result(nil)
     case "clear":
-      artworkTask?.cancel()
-      artworkTask = nil
-      artworkURL = nil
-      artwork = nil
-      info = [:]
-      sessionPublished = false
-      stopActionWatchdog()
-      invalidateAudioSession()
-      removeNotification()
-      stopSilentPlayback()
-      MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
-      MPNowPlayingInfoCenter.default().playbackState = .stopped
-      // 收敛成完整退出：过去只清元数据却保留远控注册与响应链，系统侧
-      // 残留一张「有卡片、无可唤起进程」的幽灵播放器，点主体不会进 App，
-      // ⏮ / ⏭ 也只会返回 noActionableNowPlayingItem。下一次 apply 检测到
-      // 会话从未发布，会重新 beginReceiving + 装回 target。
-      removeRemoteTargets()
-      UIApplication.shared.endReceivingRemoteControlEvents()
-      FqNativeLog.log("[fqapp] now playing session cleared")
+      // 保留暂停态卡片：音乐类 App 停止播放后控制中心仍留一张可重新唤起
+      // 的卡片。只把速率与播放态写成 paused，元数据、远控注册、静音桥接、
+      // 通知入口全部保留 —— 过去「info=nil + endReceiving」留下的是一张
+      // 有卡片却没有可唤起进程的幽灵会话，点主体自然进不了 App。
+      var paused = info
+      paused[MPNowPlayingInfoPropertyPlaybackRate] = 0
+      info = paused
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = paused
+      MPNowPlayingInfoCenter.default().playbackState = .paused
+      keepSessionActive()
+      startSilentPlayback()
+      applyCommandAvailability()
+      if #available(iOS 16.2, *) { FqLiveActivityController.shared.pause() }
+      FqNativeLog.log("[fqapp] now playing session paused")
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
@@ -1497,9 +1601,14 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     let durationMs = args["durationMs"] as? Double ?? 0
     let speed = args["speed"] as? Double ?? 1
     let coverUrl = args["coverUrl"] as? String ?? ""
+    if durationMs > 0 { lastKnownDurationMs = durationMs }
+    // 切章取流窗口 durationMs=0 时沿用上一章真实时长，不再写 1 小时占位，
+    // 避免 nowPlayingInfo 在同一秒内被覆盖两次、灵动岛反复展开。
     let duration = durationMs > 0
       ? durationMs
-      : NowPlayingChannel.placeholderDurationMs
+      : (lastKnownDurationMs > 0
+          ? lastKnownDurationMs
+          : NowPlayingChannel.placeholderDurationMs)
 
     var next: [String: Any] = [
       // 系统靠 mediaType 把会话归类成音频播放器；缺了它卡片不把本 App
@@ -1515,7 +1624,18 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
       MPMediaItemPropertyPlaybackDuration: duration / 1000,
       MPNowPlayingInfoPropertyElapsedPlaybackTime:
         min(max(positionMs, 0), duration) / 1000,
+      MPMediaItemPropertyPersistentID:
+        NSNumber(value: NowPlayingChannel.stableID(title)),
     ]
+    // 队列字段让系统把会话识别成「有前后曲目的音频」而非单曲直播，两端
+    // 按钮与主体归属才稳定。章节序号由 episode 变化累计，不动公共通道签名。
+    if episode != lastEpisode {
+      if !lastEpisode.isEmpty { queueIndex += 1 }
+      lastEpisode = episode
+    }
+    next[MPNowPlayingInfoPropertyPlaybackQueueIndex] = queueIndex
+    next[MPNowPlayingInfoPropertyPlaybackQueueCount] =
+      queueIndex + (hasNext ? 2 : 1)
     if !title.isEmpty {
       next[MPMediaItemPropertyTitle] = title
       next[MPMediaItemPropertyAlbumTitle] = title
@@ -1529,46 +1649,53 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
     MPNowPlayingInfoCenter.default().nowPlayingInfo = next
     MPNowPlayingInfoCenter.default().playbackState = playing ? .playing : .paused
     applyCommandAvailability()
-    updateNotification(title: title, episode: episode, playing: playing)
+    updateNotification(title: title)
     loadArtwork(coverUrl)
     drainPendingRemoteActions()
+    if #available(iOS 16.2, *) {
+      FqLiveActivityController.shared.publish(
+        title: title,
+        episode: episode,
+        playing: playing,
+        hasPrev: hasPrev,
+        hasNext: hasNext,
+        positionMs: positionMs,
+        durationMs: duration
+      )
+    }
     FqNativeLog.log(
       "[fqapp] now playing apply: playing=\(playing) rate=\(playing ? speed : 0)"
         + " duration=\(duration / 1000) published=\(wasPublished)"
+        + " episode=\(episode)"
     )
   }
 
   // MARK: - 通知栏
 
-  /// 固定 identifier 的本地通知：重复 add 会替换同一条，不会堆积；点主体
-  /// 由系统带回 App，delegate 里恢复媒体会话。
-  private func updateNotification(
-    title: String,
-    episode: String,
-    playing: Bool
-  ) {
-    guard !title.isEmpty else { return }
-    // 章节边界 / 播放状态变了也要重投：category 在投递时就固定，旧条目
-    // 不会补上新的 actions；只比标题会让切章后的通知仍是旧按钮集。
-    let key = "\(title)|\(episode)|\(hasPrev)|\(hasNext)|\(playing)"
-    if !notificationNeedsRefresh && key == lastNotificationKey { return }
-    lastNotificationTitle = title
-    lastNotificationEpisode = episode
-    lastNotificationKey = key
-    notificationNeedsRefresh = false
-    UNUserNotificationCenter.current().getNotificationSettings { settings in
+  /// 固定 identifier 的常驻入口：一段播放只投递一次。
+  ///
+  /// 切章横幅的根因是过去把 episode / hasPrev / hasNext / playing 全放进去重
+  /// 键 —— 每换一章、每暂停、每次同步都重投同一条 .active 通知，系统按新通知
+  /// 重新 alert。现在只在首次起播投递，标题固定书名、正文固定文案，章节名只
+  /// 由 nowPlayingInfo 更新，切章不再产生横幅；保留 .active，让这条入口在
+  /// 锁屏 / 通知中心直接可见、可点，而不是被折叠到通知栈底部。
+  private func updateNotification(title: String) {
+    guard !title.isEmpty, !notificationDelivered else { return }
+    UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
       let status = settings.authorizationStatus
-      guard status == .authorized || status == .provisional || status == .ephemeral else { return }
+      guard status == .authorized || status == .provisional || status == .ephemeral else {
+        FqNativeLog.log("[fqapp] notification skipped: status=\(status.rawValue)")
+        return
+      }
+      guard let self else { return }
       let content = UNMutableNotificationContent()
       content.title = title
-      content.body = episode.isEmpty ? "正在播放" : episode
+      content.body = "正在听书 · 点此返回"
       content.threadIdentifier = NowPlayingChannel.notificationID
       // category 决定展开后的上一首 / 下一首按钮；不设的话通知栏里只有
       // 一条纯文本，按哪里都切不了章。
       content.categoryIdentifier = NowPlayingChannel.categoryID
       content.userInfo = ["nowPlaying": true]
-      // passive 条目在锁屏 / 通知中心被折叠，展开后的上一首 / 下一首用户
-      // 看不到；active 才作为可交互条目出现在通知栏。
       content.interruptionLevel = .active
       let request = UNNotificationRequest(
         identifier: NowPlayingChannel.notificationID,
@@ -1576,12 +1703,24 @@ final class NowPlayingChannel: NSObject, UNUserNotificationCenterDelegate {
         trigger: nil
       )
       DispatchQueue.main.async {
-        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+        guard !self.notificationDelivered else { return }
+        self.notificationDelivered = true
+        UNUserNotificationCenter.current().add(request) { error in
+          DispatchQueue.main.async {
+            if let error {
+              self.notificationDelivered = false
+              FqNativeLog.log("[fqapp] notification add failed: \(error)")
+            } else {
+              FqNativeLog.log("[fqapp] notification delivered once")
+            }
+          }
+        }
       }
     }
   }
 
   private func removeNotification() {
+    notificationDelivered = false
     lastNotificationTitle = ""
     lastNotificationEpisode = ""
     lastNotificationKey = ""

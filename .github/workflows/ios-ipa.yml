@@ -215,7 +215,8 @@ jobs:
 
       - name: Build unsigned Runner.app
         if: steps.mode.outputs.signed != 'true'
-        run: flutter build ios --release --no-codesign
+        # 构建号随 CI 运行递增：native.log 头能唯一定位到本次 IPA。
+        run: flutter build ios --release --no-codesign --build-number=$((1000 + ${{ github.run_number }}))
 
       - name: Pack unsigned IPA
         if: steps.mode.outputs.signed != 'true'
@@ -263,6 +264,7 @@ jobs:
         run: |
           mkdir -p out
           flutter build ipa --release \
+            --build-number=$((1000 + ${{ github.run_number }})) \
             --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
           cp build/ios/ipa/*.ipa out/ 2>/dev/null || {
             echo 'flutter build ipa did not emit an .ipa under build/ios/ipa/' >&2
