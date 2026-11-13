@@ -724,12 +724,6 @@
 			};
 			name = Release;
 		};
-			name = Debug;
-		};
-			name = Release;
-		};
-			name = Profile;
-		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
