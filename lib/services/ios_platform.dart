@@ -181,12 +181,11 @@ class IosPlatform {
     bool? mixWithOthers,
     bool reactivate = false,
   }) async {
-    // 媒体会话已经发布时不能再写回 mixWithOthers：带该选项的会话不会被
-    // 系统登记为 Now Playing App，卡片主体点击就没有可唤起的目标，⏮ / ⏭
-    // 也会派给上一个播放方。Swift 侧 activateSession() 同样强制独占。
-    final mix =
-        (mixWithOthers ?? AudioPreferences.instance.mixWithOthers.value) &&
-        _nowPlayingPayload == null;
+    // 媒体会话发布后，音频会话由原生层独占维护：Dart 再写类别会与
+    // flutter_tts 的 setSharedInstance 互相覆盖，mixable 会话不会被系统
+    // 登记为 Now Playing App，卡片主体点击就没有可唤起的目标。
+    if (_nowPlayingPayload != null) return;
+    final mix = mixWithOthers ?? AudioPreferences.instance.mixWithOthers.value;
     final options = <IosTextToSpeechAudioCategoryOptions>[
       IosTextToSpeechAudioCategoryOptions.allowBluetoothA2DP,
       if (mix) IosTextToSpeechAudioCategoryOptions.mixWithOthers,

@@ -1,5 +1,6 @@
 import ActivityKit
 import AVFoundation
+import Dispatch
 import Flutter
 import MediaPlayer
 import UIKit
@@ -80,14 +81,17 @@ private final class FqNativeLog {
 }
 
 /// 旧版本在锁屏挂过一张灵动岛 Live Activity；升级后它仍会留在锁屏上。
-/// 本版本只保留系统 Now Playing 卡片，启动时把遗留的实时活动一次性收掉，
-/// 不再请求或更新任何 Live Activity。
+/// 本版本删除了 Live Activity app extension，系统再无 UI 可渲染，同时把
+/// 系统守护进程里遗留的 activity 逐条结束，避免条目一直挂到 staleDate。
+/// 每次回前台都重跑一次，直到枚举为空。
 @available(iOS 16.2, *)
 private func endLegacyLiveActivities() {
   Task {
-    for activity in await Activity<FqListeningAttributes>.activities {
+    let activities = await Activity<FqListeningAttributes>.activities
+    for activity in activities {
       await activity.end(using: nil, dismissalPolicy: .immediate)
     }
+    FqNativeLog.log("[fqapp] legacy live activities ended: \(activities.count)")
   }
 }
 
@@ -111,11 +115,17 @@ private func endLegacyLiveActivities() {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    // 锁屏只保留系统 Now Playing 卡片：清掉旧版本投递的常驻通知与
+    // 锁屏只保留系统 Now Playing 卡片：清掉旧版本投递的本地通知与
     // 灵动岛实时活动，避免升级后仍出现两条额外入口。
+    cleanupLegacyLockScreenEntries()
+    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  /// 冷启动与每次回前台都执行：旧版本曾用动态 identifier 重投通知，也可能
+  /// 留下未结束的实时活动，只按固定 identifier 清一条是清不干净的。
+  func cleanupLegacyLockScreenEntries() {
     nowPlayingChannel.removePlaybackNotifications()
     if #available(iOS 16.2, *) { endLegacyLiveActivities() }
-    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
   /// 自有 URL scheme（Info.plist 里声明 `fqapp`）：自己消费掉，别再交给
@@ -913,8 +923,6 @@ final class NotificationPermissionChannel {
 /// Activity，卡片主体点击由系统按当前 Now Playing App 唤起本进程。
 final class NowPlayingChannel: NSObject {
   private static let channelName = "fqapp/ios_now_playing"
-  /// 旧版本常驻通知的固定 identifier，启动时用于清除残留条目。
-  private static let notificationID = "fqapp.nowplaying"
   /// 系统朗读没有真实时长，给一个有限占位，让卡片是「有进度的曲目」
   /// 而不是直播流 —— 直播流会把 ⏮ / ⏭ 换成 15 秒快退 / 快进。
   private static let placeholderDurationMs = 3_600_000.0
@@ -954,6 +962,11 @@ final class NowPlayingChannel: NSObject {
   /// 冻结到下次回前台。收到切章远控后的一段窗口里持续恢复会话身份。
   private var actionWatchdog: DispatchWorkItem?
   private var watchdogDeadline: Date?
+  /// 原生常驻守护：Dart 的 15 秒元数据心跳在后台会被节流，Now Playing
+  /// App 的资格（独占且 active 的会话 + 持续音频输出 + 完整条目）必须由
+  /// 原生层独立维持，不能依赖 isolate 存活。
+  private var sessionGuard: DispatchSourceTimer?
+  private var lastInfoRefresh = Date.distantPast
   /// 独占 playback 会话只在首次配置或系统重置 / 中断后配置一次。播放中
   /// 反复 setCategory / setActive 会中断 AVPlayer 的输出，后台切章就哑了。
   private var audioSessionConfigured = false
@@ -978,21 +991,50 @@ final class NowPlayingChannel: NSObject {
     installRemoteTargets()
     UIApplication.shared.beginReceivingRemoteControlEvents()
     observeSystemEvents()
+    startSessionGuard()
     // 冷启动不激活 playback 会话，避免抢走用户正在听的音乐；第一次起播
     // （apply）再激活。
   }
 
-  /// 旧版本以固定 identifier 投递过一条常驻通知作为回 App 的入口。
-  /// 现在锁屏只保留系统 Now Playing 卡片，启动时把残留条目与待投递请求
-  /// 一并清掉，升级后通知中心里不再出现这条横幅。
+  /// 后台全程维持系统登记身份：会话独占且 active、静音音轨不断、媒体条目
+  /// 不丢。2 秒一次，全部为幂等操作，不重设已正确的 category，也不重装
+  /// 远控 target，避免打断 AVPlayer 输出或让恰好按下的按钮找不到 target。
+  private func startSessionGuard() {
+    guard sessionGuard == nil else { return }
+    let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+    timer.schedule(
+      deadline: .now() + 2,
+      repeating: .seconds(2),
+      leeway: .milliseconds(500)
+    )
+    timer.setEventHandler { [weak self] in
+      guard let self, self.sessionPublished else { return }
+      self.activateSession()
+      if self.silentPlayer?.isPlaying != true {
+        self.startSilentPlayback(force: true)
+      }
+      guard Date().timeIntervalSince(self.lastInfoRefresh) >= 10,
+            !self.info.isEmpty else { return }
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = self.info
+      let rate =
+        (self.info[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber)?
+          .doubleValue ?? 0
+      MPNowPlayingInfoCenter.default().playbackState =
+        rate > 0 ? .playing : .paused
+      self.lastInfoRefresh = Date()
+    }
+    timer.resume()
+    sessionGuard = timer
+  }
+
+  /// 旧版本曾以固定和动态 identifier 投递常驻通知作为回 App 的入口。
+  /// 现在锁屏只保留系统 Now Playing 卡片，全量清空通知栈与待投递请求，
+  /// 并注销旧分类；升级后通知中心里不再出现本地通知横幅。
   func removePlaybackNotifications() {
     let center = UNUserNotificationCenter.current()
-    center.removeDeliveredNotifications(
-      withIdentifiers: [NowPlayingChannel.notificationID]
-    )
-    center.removePendingNotificationRequests(
-      withIdentifiers: [NowPlayingChannel.notificationID]
-    )
+    center.removeAllDeliveredNotifications()
+    center.removeAllPendingNotificationRequests()
+    center.setNotificationCategories([])
   }
 
   // MARK: - 会话身份
@@ -1010,8 +1052,12 @@ final class NowPlayingChannel: NSObject {
     // 的，能把被插件关掉的会话重新激活。
     let session = AVAudioSession.sharedInstance()
     do {
+      // .duckOthers 与 .mixWithOthers 一样让会话成为 mixable，而 mixable
+      // 会话按 Apple 的 Now Playing 资格规则永远不会被登记；插件写入这两种
+      // 选项时都必须纠正回独占 playback。
+      let mixable: AVAudioSession.CategoryOptions = [.mixWithOthers, .duckOthers]
       if session.category != .playback ||
-         session.categoryOptions.contains(.mixWithOthers) {
+         !session.categoryOptions.intersection(mixable).isEmpty {
         try session.setCategory(
           .playback,
           mode: .default,
@@ -1181,6 +1227,12 @@ final class NowPlayingChannel: NSObject {
         object: nil,
         queue: .main
       ) { [weak self] note in
+        if note.name == UIApplication.didBecomeActiveNotification {
+          // Scene 生命周期下 AppDelegate 不收 didBecomeActive 回调，但
+          // UIApplication 通知仍会发出；系统从锁屏卡片唤起时在这里收尾。
+          (UIApplication.shared.delegate as? AppDelegate)?
+            .cleanupLegacyLockScreenEntries()
+        }
         guard let self, self.sessionPublished else { return }
         FqNativeLog.log("[fqapp] lifecycle: \(note.name.rawValue)")
         self.ensurePlaybackIdentity()
@@ -1475,6 +1527,14 @@ final class NowPlayingChannel: NSObject {
     let positionMs = args["positionMs"] as? Double ?? 0
     let durationMs = args["durationMs"] as? Double ?? 0
     let speed = args["speed"] as? Double ?? 1
+    // 切章取流窗口（durationMs=0）不是用户暂停：保持上一帧的播放速率，
+    // 避免系统在这段音频真空里把本 App 从 Now Playing App 归属中撤销。
+    let transientGap = !playing && durationMs <= 0
+    let previousRate =
+      (info[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber)?
+        .doubleValue ?? speed
+    let reportedRate =
+      playing ? speed : (transientGap ? max(previousRate, speed) : 0)
     let coverUrl = args["coverUrl"] as? String ?? ""
     if durationMs > 0 { lastKnownDurationMs = durationMs }
     // 切章取流窗口 durationMs=0 时沿用上一章真实时长，不再写 1 小时占位，
@@ -1492,7 +1552,7 @@ final class NowPlayingChannel: NSObject {
       // 恒按「有进度的曲目」上报。声明成直播流会让控制中心把 ⏮ / ⏭
       // 换成 15 秒快退 / 快进，且系统不给该会话登记上一首 / 下一首。
       MPNowPlayingInfoPropertyIsLiveStream: false,
-      MPNowPlayingInfoPropertyPlaybackRate: playing ? speed : 0,
+      MPNowPlayingInfoPropertyPlaybackRate: reportedRate,
       MPNowPlayingInfoPropertyDefaultPlaybackRate: speed,
       // duration 与 elapsed 必须成对下发，缺一项卡片可能显示却不把本 App
       // 登记成 Now Playing App，主体点击与 ⏮ / ⏭ 都会落空。
@@ -1522,7 +1582,8 @@ final class NowPlayingChannel: NSObject {
 
     info = next
     MPNowPlayingInfoCenter.default().nowPlayingInfo = next
-    MPNowPlayingInfoCenter.default().playbackState = playing ? .playing : .paused
+    MPNowPlayingInfoCenter.default().playbackState =
+      reportedRate > 0 ? .playing : .paused
     applyCommandAvailability()
     loadArtwork(coverUrl)
     drainPendingRemoteActions()
