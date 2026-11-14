@@ -330,6 +330,13 @@ func topViewController() -> UIViewController? {
 final class LibraryBackupChannel: NSObject, UIDocumentPickerDelegate {
   /// 与 Android 端一致的备份体积上限：16 MB。
   private static let maxBytes = 16 * 1024 * 1024
+  /// 备份文件可能被「文件」App 或传输工具贴成动态 UTI（dyn.*），只按
+  /// `public.json` 过滤会被系统置灰。这里覆盖系统内置文本层级与所有
+  /// 文件的公共父类型；内容是否合法仍由 Dart 侧 `LibraryBackup.decode`
+  /// 校验，放宽可选范围不会让其它文件被当成备份写入。
+  private static let openableContentTypes: [UTType] = [
+    .json, .plainText, .text, .data, .content, .item,
+  ]
   /// 分卷文件名必须是这个形状，读回来时才知道没有越出采集目录。
   private static let partPattern = "^part-[0-9]+-[a-fA-F0-9-]+\\.json$"
   /// 导出文件名由调用方给出，必须是普通文件名，不能带路径分隔符。
@@ -438,8 +445,13 @@ final class LibraryBackupChannel: NSObject, UIDocumentPickerDelegate {
     pendingJob = job
     switch job {
     case .open:
+      // 用「导入副本」而不是「原地打开」：原地打开要求 App 声明文档类型
+      // 并取得 security-scoped 授权，位于「文件」App、iCloud 或应用共享
+      // 目录里的备份会被置灰。副本模式由系统先下载并复制到本进程可读的
+      // 临时位置，回传的 URL 直接可读，不依赖上述前置条件。
       let picker = UIDocumentPickerViewController(
-        forOpeningContentTypes: [.json, .plainText, .data])
+        forOpeningContentTypes: LibraryBackupChannel.openableContentTypes,
+        asCopy: true)
       present(picker)
     case .save(let data, let name):
       do {
