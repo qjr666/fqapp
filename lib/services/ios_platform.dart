@@ -349,6 +349,24 @@ class IosPlatform {
     }
   }
 
+  /// 把 Dart 状态机的播放命令同步给原生 AVQueuePlayer：出声者与
+  /// MPNowPlayingSession 登记的 player 是同一个对象，两条时间线不能各跑各的。
+  static Future<void> publishPlaybackCommand(
+    String action, {
+    int positionMs = 0,
+    double rate = 1.0,
+  }) async {
+    try {
+      await _nowPlayingChannel.invokeMethod<void>('playbackCommand', {
+        'action': action,
+        'positionMs': positionMs,
+        'rate': rate,
+      });
+    } catch (error) {
+      debugPrint('[ios-now-playing] playback command failed: $error');
+    }
+  }
+
   Future<void> _clearNowPlaying() async {
     if (_nowPlayingPayload == null) return;
     _nowPlayingPayload = null;
@@ -624,6 +642,9 @@ class _IosPlayer {
           url.contains('/_session/') && url.contains('/src/');
       if (disposed) return;
       await player.open(Media(url), play: false);
+      // iOS 上由原生 AVQueuePlayer 承担真实出声；media_kit 这条播放器只
+      // 提供进度与完成事件，静音以免两个音频客户端争抢同一会话的归属。
+      await player.setVolume(0);
       // 把章节的真实音频地址交给原生层，由 AVPlayer 建立可寻址的媒体
       // 时间线并显式登记 Now Playing 会话；系统朗读没有片源时原生层
       // 会退回本地静音轨，媒体客户端身份依然存在。
@@ -662,16 +683,22 @@ class _IosPlayer {
     switch (method) {
       case 'play':
         await player.play();
+        unawaited(IosPlatform.publishPlaybackCommand('play'));
         emit({'playerId': id, 'type': 'playWhenReady', 'value': true});
       case 'pause':
         await player.pause();
+        unawaited(IosPlatform.publishPlaybackCommand('pause'));
         emit({'playerId': id, 'type': 'playWhenReady', 'value': false});
       case 'seek':
-        await player.seek(
-          Duration(milliseconds: (args['positionMs'] as num).toInt()),
+        final positionMs = (args['positionMs'] as num).toInt();
+        await player.seek(Duration(milliseconds: positionMs));
+        unawaited(
+          IosPlatform.publishPlaybackCommand('seek', positionMs: positionMs),
         );
       case 'setRate':
-        await player.setRate((args['rate'] as num).toDouble());
+        final rate = (args['rate'] as num).toDouble();
+        await player.setRate(rate);
+        unawaited(IosPlatform.publishPlaybackCommand('rate', rate: rate));
       case 'setVolume':
         await player.setVolume(
           (args['volume'] as num).toDouble().clamp(0, 1) * 100,
