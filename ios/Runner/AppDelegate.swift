@@ -81,18 +81,68 @@ private final class FqNativeLog {
   }
 }
 
-/// 旧版本在锁屏挂过一张灵动岛 Live Activity；升级后它仍会留在锁屏上。
-/// 本版本删除了 Live Activity app extension，系统再无 UI 可渲染，同时把
-/// 系统守护进程里遗留的 activity 逐条结束，避免条目一直挂到 staleDate。
-/// 每次回前台都重跑一次，直到枚举为空。
+/// 锁屏 / 灵动岛上的最小 Live Activity：只作为「点一下回到 App」的入口。
+/// 系统 Now Playing 卡片由 MediaPlayer 单独渲染，两者互不干扰。整段播放只
+/// 维护一个 activity；切章与元数据心跳只在内容变化时更新，不重复 request
+/// （重复 request 会让灵动岛反复展开）。
 @available(iOS 16.2, *)
-private func endLegacyLiveActivities() {
-  Task {
-    let activities = await Activity<FqListeningAttributes>.activities
-    for activity in activities {
-      await activity.end(using: nil, dismissalPolicy: .immediate)
+private final class FqLiveActivityController {
+  static let shared = FqLiveActivityController()
+
+  private var activity: Activity<FqListeningAttributes>?
+  private var lastTitle = ""
+  private var lastEpisode = ""
+  private var lastPlaying = false
+
+  func publish(title: String, episode: String, playing: Bool) {
+    guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+    guard activity == nil
+      || title != lastTitle
+      || episode != lastEpisode
+      || playing != lastPlaying else { return }
+    lastTitle = title
+    lastEpisode = episode
+    lastPlaying = playing
+
+    let state = FqListeningAttributes.ContentState(
+      title: title,
+      episode: episode,
+      playing: playing,
+      hasPrev: false,
+      hasNext: false,
+      positionMs: 0,
+      durationMs: 0
+    )
+    let content = ActivityContent(
+      state: state,
+      staleDate: Date().addingTimeInterval(4 * 3600),
+      relevanceScore: 50
+    )
+    if let activity {
+      Task { await activity.update(content) }
+      return
     }
-    FqNativeLog.log("[fqapp] legacy live activities ended: \(activities.count)")
+    do {
+      activity = try Activity.request(
+        attributes: FqListeningAttributes(bookTitle: title),
+        content: content,
+        pushType: nil
+      )
+      FqNativeLog.log("[fqapp] live activity started")
+    } catch {
+      FqNativeLog.log("[fqapp] live activity unavailable: \(error)")
+    }
+  }
+
+  /// 停止听书时收起②；系统 Now Playing 卡片的暂停态仍由 NowPlayingChannel 保留。
+  func end() {
+    guard let activity else { return }
+    self.activity = nil
+    lastTitle = ""
+    lastEpisode = ""
+    lastPlaying = false
+    Task { await activity.end(using: nil, dismissalPolicy: .immediate) }
+    FqNativeLog.log("[fqapp] live activity ended")
   }
 }
 
@@ -116,17 +166,17 @@ private func endLegacyLiveActivities() {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    // 锁屏只保留系统 Now Playing 卡片：清掉旧版本投递的本地通知与
-    // 灵动岛实时活动，避免升级后仍出现两条额外入口。
+    // 本地通知横幅保持关闭：清掉旧版本残留的通知条目。
+    // 最小 Live Activity 由播放生命周期单独管理，不在这里结束。
     cleanupLegacyLockScreenEntries()
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
-  /// 冷启动与每次回前台都执行：旧版本曾用动态 identifier 重投通知，也可能
-  /// 留下未结束的实时活动，只按固定 identifier 清一条是清不干净的。
+  /// 冷启动与每次回前台都执行：旧版本曾用动态 identifier 重投通知，
+  /// 只按固定 identifier 清一条是清不干净的。实时活动不在此处清理，
+  /// 否则每次回前台都会把它结束掉。
   func cleanupLegacyLockScreenEntries() {
     nowPlayingChannel.removePlaybackNotifications()
-    if #available(iOS 16.2, *) { endLegacyLiveActivities() }
   }
 
   /// 自有 URL scheme（Info.plist 里声明 `fqapp`）：自己消费掉，别再交给
@@ -1632,8 +1682,8 @@ final class NowPlayingChannel: NSObject {
       // 保留暂停态卡片：音乐类 App 停止播放后控制中心仍留一张可重新唤起
       // 的卡片。只把速率与播放态写成 paused，元数据、远控注册、静音桥接
       // 全部保留 —— 过去「info=nil + endReceiving」留下的是一张有卡片却
-      // 没有可唤起进程的幽灵会话，点主体自然进不了 App。锁屏不再附带
-      // Live Activity 与本地通知。
+      // 没有可唤起进程的幽灵会话，点主体自然进不了 App。最小实时活动
+      // 在停止听书时收起，本地通知横幅继续保持关闭。
       var paused = info
       paused[MPNowPlayingInfoPropertyPlaybackRate] = 0
       info = paused
@@ -1643,6 +1693,7 @@ final class NowPlayingChannel: NSObject {
       keepSessionActive()
       startSilentPlayback()
       applyCommandAvailability()
+      if #available(iOS 16.2, *) { FqLiveActivityController.shared.end() }
       FqNativeLog.log("[fqapp] now playing session paused")
       result(nil)
     default:
@@ -1746,6 +1797,13 @@ final class NowPlayingChannel: NSObject {
     applyCommandAvailability()
     loadArtwork(coverUrl)
     drainPendingRemoteActions()
+    if #available(iOS 16.2, *) {
+      FqLiveActivityController.shared.publish(
+        title: title,
+        episode: episode,
+        playing: playing
+      )
+    }
     // 后台每 10 秒补一次播放器实测状态：此前只在 installTimeline 后 1 s
     // 采样，长后台窗口后半段没有任何判据，无法区分持续播放与断流。
     if Date().timeIntervalSince(lastTimelineSample) >= 10 {

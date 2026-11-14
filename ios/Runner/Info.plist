@@ -22,7 +22,7 @@
 	<string>$(FLUTTER_BUILD_NAME)</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
-	<!-- 通知栏播放器条目被点击时，系统用这个自有 scheme 把本 App 拉回前台。 -->
+	<!-- 实时活动被点击时，系统用这个自有 scheme 把本 App 拉回前台。 -->
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -59,9 +59,9 @@
 	<array>
 		<string>audio</string>
 	</array>
-	<!-- 本版本不提供 Live Activity，锁屏只有系统 Now Playing 媒体卡片。 -->
+	<!-- 最小的实时活动：只提供点一下回到 App 的入口，不承载播放控制。 -->
 	<key>NSSupportsLiveActivities</key>
-	<false/>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
