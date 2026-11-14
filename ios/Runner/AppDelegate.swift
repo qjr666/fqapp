@@ -973,29 +973,21 @@ final class NowPlayingChannel: NSObject {
   private var audioSessionConfigured = false
 
   /// 真实音频时间线：整个播放期只有一个 AVQueuePlayer 持续渲染章节音频
-  /// （本地回环服务解密后的明文流或本地静音轨），并承担真实出声。它同时
-  /// 是 MPNowPlayingSession 登记的 player，系统据此把本 App 记为 Now
-  /// Playing App，锁屏卡片主体点击才有可唤起的进程。
+  /// （本地回环服务解密后的明文流或本地静音轨），并承担真实出声。系统从
+  /// 这条唯一的音频客户端推断 Now Playing App 归属。
   private var timelinePlayer: AVQueuePlayer?
   private var timelineItem: AVPlayerItem?
   private var timelineURL: String?
-  /// iOS 16+ 的显式会话登记对象。部署目标为 iOS 15，用 NSObject 持有，
-  /// 避免在存储属性上直接标注 @available。
-  private var sessionObject: NSObject?
+  private var lastTimelineSample = Date.distantPast
 
+  /// 单播放器 App 只使用系统推断会话：显式创建独立会话对象后，系统不再
+  /// 为 App 建立 inferred session，而锁屏卡片主体点击依赖的 nowPlayingApp
+  /// 归属正是由该推断链路维护。两套 API 不能混用。
   private var infoCenter: MPNowPlayingInfoCenter {
-    if #available(iOS 16.0, *),
-       let session = sessionObject as? MPNowPlayingSession {
-      return session.nowPlayingInfoCenter
-    }
     return MPNowPlayingInfoCenter.default()
   }
 
   private var commandCenter: MPRemoteCommandCenter {
-    if #available(iOS 16.0, *),
-       let session = sessionObject as? MPNowPlayingSession {
-      return session.remoteCommandCenter
-    }
     return MPRemoteCommandCenter.shared()
   }
 
@@ -1121,9 +1113,9 @@ final class NowPlayingChannel: NSObject {
   /// 输出会被 CoreAudio 判成无音频活动，系统就不把本 App 记为正在播放。
   private func startSilentPlayback(force: Bool = false) {
     guard sessionPublished else { return }
-    // iOS 16+ 由 AVPlayer 时间线提供媒体身份，不再叠加 AVAudioPlayer，
-    // 避免两个音频客户端争抢同一会话的归属。iOS 15 保留原有静音轨。
-    if #available(iOS 16.0, *), timelinePlayer != nil { return }
+    // 由 AVPlayer 时间线提供媒体身份，不再叠加 AVAudioPlayer，
+    // 避免两个音频客户端争抢同一会话的归属。
+    if timelinePlayer != nil { return }
     // 会话被别的组件 deactivate 时 isPlaying 可能仍为 true，却没有音频输出；
     // 看门狗用 force 重启音轨，重新向 CoreAudio 声明本 App 正在播放。
     if !force && silentPlayer?.isPlaying == true { return }
@@ -1198,7 +1190,7 @@ final class NowPlayingChannel: NSObject {
     startSilentPlayback()
     UIApplication.shared.beginReceivingRemoteControlEvents()
     installRemoteTargets()
-    ensureSessionActive()
+    logNowPlayingIdentity()
   }
 
   /// 后台按上一章 / 下一章时，Dart 会停掉旧播放器再取流重建。旧播放器
@@ -1331,11 +1323,9 @@ final class NowPlayingChannel: NSObject {
   // MARK: - 真实音频时间线 / Now Playing 会话登记
 
   /// 统一的音频时间线：整个播放期只有一个 AVQueuePlayer，既承担真实出声，
-  /// 又由 MPNowPlayingSession 显式登记给系统。换章只替换 AVPlayerItem，
-  /// 绝不重建 player / session —— 每次重建都会让系统侧的 Now Playing
-  /// 客户端身份注销后重新注册，锁屏卡片主体点击就没有稳定的可唤起进程。
+  /// 又作为系统推断 Now Playing App 归属时的唯一音频客户端。换章只替换
+  /// AVPlayerItem，绝不重建 player，避免系统侧媒体客户端身份反复注销注册。
   private func installTimeline(urlString: String, startMs: Double) {
-    guard #available(iOS 16.0, *) else { return }
     let resolved: URL
     if let url = URL(string: urlString),
        url.scheme == "http" || url.scheme == "https" || url.isFileURL {
@@ -1349,7 +1339,7 @@ final class NowPlayingChannel: NSObject {
     let start = CMTime(value: Int64(max(startMs, 0)), timescale: 1000)
     if key == timelineURL, let player = timelinePlayer {
       if startMs > 0 { player.seek(to: start) }
-      ensureSessionActive()
+      logNowPlayingIdentity()
       return
     }
     let item = AVPlayerItem(url: resolved)
@@ -1362,8 +1352,7 @@ final class NowPlayingChannel: NSObject {
       timelineURL = key
       if startMs > 0 { player.seek(to: start) }
       if wasPlaying { player.play() }
-      if !info.isEmpty { applyStaticMetadata(info) }
-      ensureSessionActive()
+      logNowPlayingIdentity()
       FqNativeLog.log(
         "[fqapp] timeline item replaced: \(resolved.isFileURL ? "silence" : "chapter")"
       )
@@ -1377,15 +1366,11 @@ final class NowPlayingChannel: NSObject {
     timelineItem = item
     timelinePlayer = player
     timelineURL = key
-    let session = MPNowPlayingSession(players: [player])
-    // 章节名、封面与队列信息由 Dart 维护；自动发布会把音轨时长写进卡片
-    // 覆盖真实章节时长，因此保持手动发布（Apple 要求二者不能混用）。
-    session.automaticallyPublishesNowPlayingInfo = false
-    sessionObject = session
+    // 不创建独立会话对象：单播放器 App 由系统从唯一音频客户端推断
+    // nowPlayingApp 归属，显式会话会让推断链路失效。
     if startMs > 0 { player.seek(to: start) }
     installRemoteTargets()
-    ensureSessionActive()
-    if !info.isEmpty { applyStaticMetadata(info) }
+    logNowPlayingIdentity()
     FqNativeLog.log(
       "[fqapp] audio timeline installed: \(resolved.isFileURL ? "silence" : "chapter")"
     )
@@ -1413,64 +1398,40 @@ final class NowPlayingChannel: NSObject {
   }
 
   /// 现场判据：日志里 now playing apply 的 rate=1.0 是 Dart 写进字典的
-  /// 显示值，不是 AVPlayer 的实测状态。这里把播放器与会话的真实状态落盘，
-  /// 一次装机即可区分「时间线没建立」与「系统没选中本 App」。
+  /// 显示值，不是 AVPlayer 的实测状态。这里把播放器与推断链路真正依赖的
+  /// 系统侧会话快照落盘，用于区分「时间线没建立」「会话不合格」与
+  ///「系统没选中本 App」。
   private func logTimelineState() {
-    guard #available(iOS 16.0, *), timelinePlayer != nil else { return }
+    guard timelinePlayer != nil else { return }
     DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
       guard let self,
             let player = self.timelinePlayer,
             let item = self.timelineItem else { return }
       let audio = AVAudioSession.sharedInstance()
-      let active = (self.sessionObject as? MPNowPlayingSession)?.isActive ?? false
       FqNativeLog.log(
         "[fqapp] timeline state: item=\(item.status.rawValue)"
           + " control=\(player.timeControlStatus.rawValue)"
           + " rate=\(player.rate) volume=\(player.volume)"
-          + " sessionActive=\(active)"
+          + " likelyToKeepUp=\(item.isPlaybackLikelyToKeepUp)"
+          + " bufferEmpty=\(item.isPlaybackBufferEmpty)"
           + " category=\(audio.category.rawValue)"
+          + " options=\(audio.categoryOptions.rawValue)"
+          + " otherAudioPlaying=\(audio.isOtherAudioPlaying)"
           + " error=\(item.error?.localizedDescription ?? "none")"
       )
     }
   }
 
-  private func ensureSessionActive() {
-    if #available(iOS 16.0, *) {
-      guard let session = sessionObject as? MPNowPlayingSession else { return }
-      FqNativeLog.log(
-        "[fqapp] now playing session: canBecomeActive=\(session.canBecomeActive)"
-          + " isActive=\(session.isActive)"
-      )
-      guard !session.isActive else { return }
-      session.becomeActiveIfPossible { [weak self] success in
-        FqNativeLog.log("[fqapp] now playing session become active: \(success)")
-        guard let self, success, !self.info.isEmpty else { return }
-        self.infoCenter.nowPlayingInfo = self.info
-        let rate =
-          (self.info[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber)?
-            .doubleValue ?? 0
-        self.infoCenter.playbackState = rate > 0 ? .playing : .paused
-      }
-    }
-  }
-
-  private func applyStaticMetadata(_ next: [String: Any]) {
-    guard #available(iOS 16.0, *), let item = timelineItem else { return }
-    let keys = [
-      MPMediaItemPropertyTitle,
-      MPMediaItemPropertyArtist,
-      MPMediaItemPropertyAlbumTitle,
-      MPMediaItemPropertyArtwork,
-      MPMediaItemPropertyPersistentID,
-      MPNowPlayingInfoPropertyMediaType,
-      MPNowPlayingInfoPropertyPlaybackQueueIndex,
-      MPNowPlayingInfoPropertyPlaybackQueueCount,
-    ]
-    var staticInfo: [String: Any] = [:]
-    for key in keys {
-      if let value = next[key] { staticInfo[key] = value }
-    }
-    item.nowPlayingInfo = staticInfo
+  private func logNowPlayingIdentity() {
+    let audio = AVAudioSession.sharedInstance()
+    let hasInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo != nil
+    FqNativeLog.log(
+      "[fqapp] now playing identity: category=\(audio.category.rawValue)"
+        + " options=\(audio.categoryOptions.rawValue)"
+        + " otherAudioPlaying=\(audio.isOtherAudioPlaying)"
+        + " infoPublished=\(hasInfo)"
+        + " playCommandEnabled=\(MPRemoteCommandCenter.shared().playCommand.isEnabled)"
+    )
   }
 
   // MARK: - MPRemoteCommandCenter
@@ -1777,7 +1738,6 @@ final class NowPlayingChannel: NSObject {
     self.infoCenter.nowPlayingInfo = next
     self.infoCenter.playbackState =
       reportedRate > 0 ? .playing : .paused
-    applyStaticMetadata(next)
     if playing {
       if timelinePlayer?.rate == 0 { timelinePlayer?.play() }
     } else if reportedRate == 0 {
@@ -1786,6 +1746,12 @@ final class NowPlayingChannel: NSObject {
     applyCommandAvailability()
     loadArtwork(coverUrl)
     drainPendingRemoteActions()
+    // 后台每 10 秒补一次播放器实测状态：此前只在 installTimeline 后 1 s
+    // 采样，长后台窗口后半段没有任何判据，无法区分持续播放与断流。
+    if Date().timeIntervalSince(lastTimelineSample) >= 10 {
+      lastTimelineSample = Date()
+      logTimelineState()
+    }
     FqNativeLog.log(
       "[fqapp] now playing apply: playing=\(playing) rate=\(playing ? speed : 0)"
         + " duration=\(duration / 1000) published=\(wasPublished)"
@@ -1810,7 +1776,6 @@ final class NowPlayingChannel: NSObject {
         self.artwork = artwork
         self.info[MPMediaItemPropertyArtwork] = artwork
         self.infoCenter.nowPlayingInfo = self.info
-        self.applyStaticMetadata(self.info)
       }
     }
     artworkTask?.resume()
