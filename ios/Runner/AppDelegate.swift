@@ -1041,6 +1041,10 @@ final class NowPlayingChannel: NSObject {
   private var timelineItem: AVPlayerItem?
   private var timelineURL: String?
   private var lastTimelineSample = Date.distantPast
+  /// 用户设定的播放倍速。AVPlayer.play() 等价于 rate = 1.0，换章替换
+  /// item 或系统卡片刷新触发的起播都会抹掉已设速率，因此必须由原生侧
+  /// 持久记住，并在每次起播后写回。
+  private var desiredPlaybackRate: Float = 1.0
 
   /// 单播放器 App 只使用系统推断会话：显式创建独立会话对象后，系统不再
   /// 为 App 建立 inferred session，而锁屏卡片主体点击依赖的 nowPlayingApp
@@ -1413,7 +1417,7 @@ final class NowPlayingChannel: NSObject {
       timelineItem = item
       timelineURL = key
       if startMs > 0 { player.seek(to: start) }
-      if wasPlaying { player.play() }
+      if wasPlaying { startPlayback() }
       logNowPlayingIdentity()
       FqNativeLog.log(
         "[fqapp] timeline item replaced: \(resolved.isFileURL ? "silence" : "chapter")"
@@ -1439,13 +1443,21 @@ final class NowPlayingChannel: NSObject {
     logTimelineState()
   }
 
+  /// 统一起播入口：play() 会先把 rate 置为 1.0，随后写回用户设定的速率。
+  /// 音轨尚未就绪时 AVQueuePlayer 会保留该期望速率，可播放后按它渲染。
+  private func startPlayback() {
+    guard let player = timelinePlayer else { return }
+    player.play()
+    player.rate = desiredPlaybackRate
+  }
+
   /// Dart 状态机的播放命令同步作用在同一个 AVQueuePlayer 上，让「出声者」
   /// 与「被登记的 player」始终一致，避免两个播放器各跑一条时间线。
   private func applyPlaybackCommand(_ command: [String: Any]) {
     guard let player = timelinePlayer else { return }
     switch command["action"] as? String ?? "" {
     case "play":
-      player.play()
+      startPlayback()
     case "pause":
       player.pause()
     case "seek":
@@ -1453,7 +1465,13 @@ final class NowPlayingChannel: NSObject {
       player.seek(to: CMTime(value: Int64(max(ms, 0)), timescale: 1000))
     case "rate":
       let rate = (command["rate"] as? NSNumber)?.floatValue ?? 1
-      player.rate = max(rate, Float(0))
+      guard rate > 0 else {
+        player.pause()
+        return
+      }
+      desiredPlaybackRate = rate
+      // 暂停状态下不写 rate：非零速率会让 AVPlayer 隐式起播。
+      if player.rate > 0 { player.rate = rate }
     default:
       break
     }
@@ -1802,7 +1820,7 @@ final class NowPlayingChannel: NSObject {
     self.infoCenter.playbackState =
       reportedRate > 0 ? .playing : .paused
     if playing {
-      if timelinePlayer?.rate == 0 { timelinePlayer?.play() }
+      if timelinePlayer?.rate == 0 { startPlayback() }
     } else if reportedRate == 0 {
       timelinePlayer?.pause()
     }
