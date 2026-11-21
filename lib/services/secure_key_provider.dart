@@ -1,54 +1,12 @@
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:hive_ce/hive.dart';
 
-/// Minimal read/write surface over the platform secure store, kept as an
-/// interface so tests can substitute an in-memory fake instead of driving a
-/// MethodChannel.
-abstract interface class SecureKeyStorage {
-  Future<String?> read(String key);
-  Future<void> write(String key, String value);
-  Future<void> delete(String key);
-}
+import 'native_secure_key_storage.dart';
+import 'secure_key_storage.dart';
 
-/// Production backend: `flutter_secure_storage` (Android Keystore /
-/// EncryptedSharedPreferences, iOS Keychain, Windows DPAPI). The raw key bytes
-/// never touch SharedPreferences or any other plaintext store.
-class FlutterSecureKeyStorage implements SecureKeyStorage {
-  const FlutterSecureKeyStorage([this._storage = const FlutterSecureStorage()]);
-
-  final FlutterSecureStorage _storage;
-
-  @override
-  Future<String?> read(String key) => _storage.read(key: key);
-
-  @override
-  Future<void> write(String key, String value) =>
-      _storage.write(key: key, value: value);
-
-  @override
-  Future<void> delete(String key) => _storage.delete(key: key);
-}
-
-/// In-memory fake for tests and for environments without a platform channel.
-class InMemorySecureKeyStorage implements SecureKeyStorage {
-  final Map<String, String> _values = {};
-
-  @override
-  Future<String?> read(String key) async => _values[key];
-
-  @override
-  Future<void> write(String key, String value) async {
-    _values[key] = value;
-  }
-
-  @override
-  Future<void> delete(String key) async {
-    _values.remove(key);
-  }
-}
+export 'secure_key_storage.dart';
 
 /// Owns the random 256-bit keys that encrypt local data at rest.
 ///
@@ -71,29 +29,7 @@ class SecureKeyProvider {
   SecureKeyProvider({
     SecureKeyStorage? storage,
     this.storageTimeout = const Duration(seconds: 10),
-  }) : _storage = storage ?? const FlutterSecureKeyStorage(),
-       // 显式传入的存储一律可用（测试的内存实现、调用方自己的后端）；
-       // 只有走平台默认实现时才看这台机器有没有安全存储。判定放在调用时做，
-       // 不在构造时定死 —— 构造时可能正好有一处平台覆盖还没撤掉。
-       _usesPlatformStorage = storage == null;
-
-  /// Whether this host has a secure-storage backend the app can use.
-  ///
-  /// The app ships for Android / iOS / Windows. `flutter_secure_storage`'s
-  /// **Linux** backend talks to libsecret over D-Bus, and that read never
-  /// completes inside a widget test: real I/O does not run in the fake-async
-  /// zone, so only the storage timeout ends the wait — and that timeout is a
-  /// fake timer that outlives the test and leaves an in-flight future behind
-  /// that every later caller waits on forever. Linux only ever shows up here
-  /// as the CI host (there is no `linux/` target), so treat it as "no secure
-  /// storage": callers degrade exactly as they do when the keystore is broken.
-  static bool get _platformHasSecureStorage => switch (defaultTargetPlatform) {
-    TargetPlatform.android ||
-    TargetPlatform.iOS ||
-    TargetPlatform.macOS ||
-    TargetPlatform.windows => true,
-    TargetPlatform.linux || TargetPlatform.fuchsia => false,
-  };
+  }) : _storage = storage ?? defaultSecureKeyStorage();
 
   static final SecureKeyProvider instance = SecureKeyProvider();
 
@@ -107,7 +43,8 @@ class SecureKeyProvider {
   /// treated as unavailable. The platform channel normally answers in
   /// milliseconds; without a bound, a wedged Keystore — or, in widget tests,
   /// an unmocked channel whose Future never resolves — would hang startup
-  /// forever instead of letting callers degrade.
+  /// forever instead of letting callers degrade. Linux deliberately waits for
+  /// completion under the process writer lock to avoid late key writes.
   final Duration storageTimeout;
 
   /// Cooldown after a failed key load: lookups within one startup return the
@@ -117,11 +54,6 @@ class SecureKeyProvider {
   static const _failureCooldown = Duration(seconds: 30);
 
   final SecureKeyStorage _storage;
-
-  /// Whether [_storage] is the platform default (and therefore subject to the
-  /// platform probe) rather than a storage the caller supplied itself.
-  final bool _usesPlatformStorage;
-
   final Map<String, Uint8List> _cache = {};
   final Map<String, Future<Uint8List?>> _pending = {};
   final Map<String, DateTime> _failedAt = {};
@@ -142,15 +74,12 @@ class SecureKeyProvider {
 
   Future<Uint8List?> _loadOrCreate(String name) async {
     try {
-      // 这台机器没有可用的安全存储就直接放弃：不建超时定时器，也不去等一个
-      // 永远不会回来的读。等超时是唯一出口时，那个定时器会留在调用方的生命
-      // 周期之外（widget 测试里就是「还有定时器没清」），而且这次没结束的
-      // 读取会被 _pending 缓存下来，把后面每一个调用方一起拖死。
-      if (_usesPlatformStorage && !_platformHasSecureStorage) {
-        _failedAt[name] = DateTime.now();
-        return null;
-      }
-      final stored = await _storage.read(name).timeout(storageTimeout);
+      final read = _storage.read(name);
+      // Linux key operations retain ownership until completion; a timed-out
+      // write must never race a retry which creates a different key.
+      final stored = await (defaultTargetPlatform == TargetPlatform.linux
+          ? read
+          : read.timeout(storageTimeout));
       if (stored != null) {
         try {
           final decoded = base64Decode(stored);
@@ -163,8 +92,18 @@ class SecureKeyProvider {
           // Malformed entry: fall through and replace it (key lost).
         }
       }
+      if (stored != null && defaultTargetPlatform == TargetPlatform.linux) {
+        throw StateError('密钥损坏，拒绝替换现有 Linux 密钥');
+      }
       final fresh = Uint8List.fromList(Hive.generateSecureKey());
-      await _storage.write(name, base64Encode(fresh)).timeout(storageTimeout);
+      final write = _storage.write(name, base64Encode(fresh));
+      await (defaultTargetPlatform == TargetPlatform.linux
+          ? write
+          : write.timeout(storageTimeout));
+      if (defaultTargetPlatform == TargetPlatform.linux &&
+          await _storage.read(name) != base64Encode(fresh)) {
+        throw StateError('Linux 密钥写入确认失败');
+      }
       _cache[name] = fresh;
       return fresh;
     } catch (_) {

@@ -27,6 +27,7 @@ import '../models/reader_video_match.dart';
 import '../models/category_front.dart';
 import '../models/search_discovery.dart';
 import '../models/series_detail.dart';
+import '../models/ugc_story.dart';
 import 'app_log.dart';
 import 'api_response_decoder.dart';
 import 'backend_service.dart';
@@ -36,6 +37,24 @@ import 'request_gate.dart';
 
 export '../models/homepage_page.dart';
 part 'reader_video_api.dart';
+part 'ugc_story_api.dart';
+
+/// Why a content fetch was issued. Local-only: [ApiClient] appends it to the
+/// transport URI as `_playback_purpose`, after the [RequestGate] key is formed,
+/// so the Rust core can attribute a "video failed" log to a foreground load or
+/// a speculative prefetch while a demand and a prefetch for the same episode
+/// still coalesce onto one flight. It never reaches an upstream request, body
+/// or signature — the video endpoint signs its own constant-URL request.
+enum PlaybackPurpose {
+  foreground('foreground'),
+  prefetch('prefetch'),
+  other('other');
+
+  const PlaybackPurpose(this.wire);
+
+  /// The allowlisted value the Rust core reads back from the query.
+  final String wire;
+}
 
 /// iOS 取流要等 Rust 把整集 / 整章缓存并按 Range 解密，默认 20 秒的 API
 /// 超时会在下载中途把请求取消。只用于视频和音频这两条取流路径。
@@ -238,6 +257,7 @@ class ApiClient {
     Duration? timeout,
     String method = 'GET',
     Uint8List? body,
+    PlaybackPurpose? playbackPurpose,
   }) {
     // The transport owns the deadline: cancelling drops the in-flight Rust
     // dispatch (and therefore the upstream request, its retry backoff and any
@@ -247,6 +267,11 @@ class ApiClient {
     // 日志只记方法与路由模板（数值/长十六进制段打码），不记 query、参数与请求体
     // —— 隐私纪律同 PlayerLoadSample：never URLs, keys or API bodies。
     final route = '$method ${_logRoute(url)}';
+    // 用途只进传输 URI(见下方 send 闭包),不进 gate key;日志仅附带
+    // allowlist 枚举值,不记 query 本身。
+    final purposeSuffix = playbackPurpose == null
+        ? ''
+        : ' purpose=${playbackPurpose.wire}';
     final watch = Stopwatch()..start();
     Duration? queueTime;
     final future = _gate.run(
@@ -261,9 +286,12 @@ class ApiClient {
         if (remaining.inMilliseconds <= 0) {
           throw BackendRequestAborted('请求超时', timedOut: true);
         }
+        // 追加本地用途参数发生在 gate key 形成之后:同 URL 的
+        // foreground/prefetch 仍共享一次在飞请求,用途代表实际发起者。
+        final target = _withPlaybackPurpose(url, playbackPurpose);
         final response = await _transport.send(
           method,
-          Uri.parse(url),
+          target,
           body: body,
           timeout: remaining,
           request: request is BackendRequest ? request : null,
@@ -284,7 +312,7 @@ class ApiClient {
         AppLog.d(
           'api',
           '$route ${response.statusCode} ${watch.elapsedMilliseconds}ms '
-              'queue=${queueTime?.inMilliseconds ?? 'shared'}',
+              'queue=${queueTime?.inMilliseconds ?? 'shared'}$purposeSuffix',
         );
       },
       onError: (Object error) {
@@ -294,11 +322,25 @@ class ApiClient {
         AppLog.w(
           'api',
           '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType}) '
-              'queue=${queueTime?.inMilliseconds ?? 'waiting/shared'}',
+              'queue=${queueTime?.inMilliseconds ?? 'waiting/shared'}'
+              '$purposeSuffix',
         );
       },
     );
     return future;
+  }
+
+  static const String _playbackPurposeParam = '_playback_purpose';
+
+  /// Appends the local-only playback purpose to [url] for the transport hop.
+  /// The existing query is preserved verbatim; exactly one parameter is added.
+  static Uri _withPlaybackPurpose(String url, PlaybackPurpose? purpose) {
+    final target = Uri.parse(url);
+    if (purpose == null) return target;
+    final query = target.query.isEmpty
+        ? '$_playbackPurposeParam=${purpose.wire}'
+        : '${target.query}&$_playbackPurposeParam=${purpose.wire}';
+    return target.replace(query: query);
   }
 
   static final RegExp _hexSegment = RegExp(r'^[0-9a-fA-F]+$');
@@ -507,6 +549,7 @@ class ApiClient {
     String tab = '小说',
     String? toneId,
     String? mode,
+    PlaybackPurpose? purpose,
   }) async {
     // iOS 视频取流是唯一省略 mode 的短剧调用（见 episode_source_cache.dart
     // 的 videoContentMode）：核心此时要先下载整集再按 Range 解密，普通
@@ -515,6 +558,7 @@ class ApiClient {
     final r = await _get(
       _contentUrl(itemId, tab: tab, toneId: toneId, mode: mode),
       timeout: caching ? iosCacheFetchTimeout : null,
+      playbackPurpose: (tab == '短剧' || tab == '漫剧') ? purpose : null,
     );
     return _decodeAsync(r);
   }
@@ -711,29 +755,42 @@ class ApiClient {
   /// `genre` and `tone_id` are mandatory for a usable answer: the backend
   /// defaults (`genre=4`, `tone_id=99`) always return `1301008 no available
   /// speech text`, while a real tone id with `genre=1` returns the track. A
-  /// book without generated speech text yields [SubtitleTrack.empty].
+  /// book without generated speech text yields [SubtitleTrack.empty]. Transport
+  /// and decode failures propagate so the caller can retry and distinguish
+  /// temporary unavailability from a complete answer.
   Future<SubtitleTrack> chapterTimeline(
     String itemId, {
     String toneId = '1',
     int genre = 1,
+    Future<void>? cancel,
+    Duration? timeout,
   }) async {
+    final request = BackendRequest();
+    if (cancel != null) {
+      unawaited(cancel.then((_) => request.cancel()));
+    }
     try {
-      final response = await _get(
-        _url('/api/v1/chapters/${Uri.encodeComponent(itemId)}/timeline', {
-          'genre': '$genre',
-          'tone_id': toneId,
-        }),
-      );
-      final status = response.statusCode;
-      final bytes = response.bodyBytes;
-      return await Isolate.run(() {
-        final payload = _decodeEnvelope(status, bytes);
-        // "No speech text" is a normal, expected answer, not a failure.
-        if (isUnavailableCode(payload['code'])) return SubtitleTrack.empty;
-        return SubtitleTrack.fromPayload(payload);
+      return await withCancellation(request, () async {
+        final response = await _get(
+          _url('/api/v1/chapters/${Uri.encodeComponent(itemId)}/timeline', {
+            'genre': '$genre',
+            'tone_id': toneId,
+          }),
+          timeout: timeout,
+        );
+        final status = response.statusCode;
+        final bytes = response.bodyBytes;
+        return decodeResponseBody(bytes.length, () {
+          final payload = _decodeEnvelope(status, bytes);
+          // Only an explicit "no speech text" answer means the optional track
+          // does not exist. Transport/decode failures stay visible to the
+          // controller, which owns retrying.
+          return _parseSubtitleTrackPayload(payload);
+        });
       });
-    } on Exception {
-      return SubtitleTrack.empty;
+    } on BackendRequestAborted catch (error) {
+      if (error.timedOut) throw TimeoutException(error.message);
+      rethrow;
     }
   }
 
@@ -747,28 +804,58 @@ class ApiClient {
   /// `101049`，2 回 `101002`，4 虽然 `code:0` 但偏移全为 0。
   ///
   /// 真人讲书用 2 取音频时间轴；这一版上游对部分书直接拒绝（`101002
-  /// NOVEL_DATA_GET_ERROR`）或给空轨。失败的那一章随即改用 3 再取一次，并
-  /// 记住回落结果：同一章之后直接取 3，不反复试错。
+  /// NOVEL_DATA_GET_ERROR`）、给空轨，或只有音频坐标而没有原著章节映射。
+  /// 这些章节随即改用 3 再取一次，并
+  /// 记住回落结果：同一章之后直接取 3，不反复试错。超时、HTTP 失败或解码
+  /// 错误不属于“2 不支持”，会原样抛给调用方且不污染回落缓存。
   Future<AudioTimeTrack> chapterTimePoints(
     String bookId,
     String itemId, {
     String toneId = '0',
     int reqType = 3,
+    Future<void>? cancel,
+    Duration? timeout,
   }) async {
-    if (reqType != 2) {
-      return _chapterTimePoints(bookId, itemId, toneId, reqType);
+    final request = BackendRequest();
+    if (cancel != null) {
+      unawaited(cancel.then((_) => request.cancel()));
     }
-    final fallbackKey = '$itemId|$toneId';
-    if (_timePointFallbacks.contains(fallbackKey)) {
-      return _chapterTimePoints(bookId, itemId, toneId, 3);
+    try {
+      return await withCancellation(request, () async {
+        if (reqType != 2) {
+          return _chapterTimePoints(bookId, itemId, toneId, reqType, timeout);
+        }
+        final fallbackKey = '$bookId|$itemId|$toneId';
+        if (_timePointFallbacks.contains(fallbackKey)) {
+          return _chapterTimePoints(bookId, itemId, toneId, 3, timeout);
+        }
+        try {
+          final direct = await _chapterTimePoints(
+            bookId,
+            itemId,
+            toneId,
+            2,
+            timeout,
+          );
+          // A flat audio timeline without a novel chapter alias cannot drive
+          // listen-along. Type 3 supplies the audio-to-novel mapping.
+          if (direct.isNotEmpty && direct.novelItemId.isNotEmpty) return direct;
+        } on ApiException catch (error) {
+          // req_type=2's known unsupported response is deterministic. A
+          // timeout, HTTP 429/5xx, decode failure or cancellation must not be
+          // remembered as "type 2 unsupported".
+          if (error.statusCode != null || error.upstreamCode != 101002) rethrow;
+        }
+        _timePointFallbacks.add(fallbackKey);
+        return _chapterTimePoints(bookId, itemId, toneId, 3, timeout);
+      });
+    } on BackendRequestAborted catch (error) {
+      if (error.timedOut) throw TimeoutException(error.message);
+      rethrow;
     }
-    final direct = await _chapterTimePoints(bookId, itemId, toneId, 2);
-    if (direct.isNotEmpty) return direct;
-    _timePointFallbacks.add(fallbackKey);
-    return _chapterTimePoints(bookId, itemId, toneId, 3);
   }
 
-  /// 已经回落到 `req_type=3` 的章节（`itemId|toneId`）。只在内存里记，
+  /// 已经回落到 `req_type=3` 的章节（`bookId|itemId|toneId`）。只在内存里记，
   /// 进程重启后重新探测一次没有代价。
   final Set<String> _timePointFallbacks = {};
 
@@ -777,25 +864,22 @@ class ApiClient {
     String itemId,
     String toneId,
     int reqType,
+    Duration? timeout,
   ) async {
-    try {
-      final response = await _get(
-        _url('/api/v1/chapters/${Uri.encodeComponent(itemId)}/timepoints', {
-          'book_id': bookId,
-          'tone_id': toneId,
-          'req_type': '$reqType',
-        }),
-      );
-      final status = response.statusCode;
-      final bytes = response.bodyBytes;
-      return await Isolate.run(() {
-        final payload = _decodeEnvelope(status, bytes);
-        if (isUnavailableCode(payload['code'])) return AudioTimeTrack.empty;
-        return AudioTimeTrack.fromPayload(payload, audioItemId: itemId);
-      });
-    } on Exception {
-      return AudioTimeTrack.empty;
-    }
+    final response = await _get(
+      _url('/api/v1/chapters/${Uri.encodeComponent(itemId)}/timepoints', {
+        'book_id': bookId,
+        'tone_id': toneId,
+        'req_type': '$reqType',
+      }),
+      timeout: timeout,
+    );
+    final status = response.statusCode;
+    final bytes = response.bodyBytes;
+    return decodeResponseBody(bytes.length, () {
+      final payload = _decodeEnvelope(status, bytes);
+      return _parseAudioTimeTrackPayload(payload, audioItemId: itemId);
+    });
   }
 
   /// Chapter ideas (段评 / 章评): per-paragraph counts and comment ids.
@@ -1366,7 +1450,10 @@ class ApiClient {
       final status = response.statusCode;
       final bytes = response.bodyBytes;
       final detail = await Isolate.run(
-        () => SeriesDetail.fromPayload(_decodeEnvelope(status, bytes)),
+        () => SeriesDetail.fromPayload(
+          _decodeEnvelope(status, bytes),
+          requestedSeriesId: seriesId,
+        ),
       );
       if (strict && detail.isEmpty) {
         throw const ApiException('剧集详情暂时无法加载');
@@ -1644,7 +1731,11 @@ class ApiClient {
         final payload = _decodeEnvelope(statusCode, bodyBytes);
         final items = parseMediaItems(
           payload,
-          kind: tabType == 24 ? 'manju' : 'video',
+          // The second segment is a mixed recommendation stream. Let the card
+          // metadata decide whether each item is a video, book, audio book,
+          // manga or manju; forcing `video` here turns a book card into a
+          // request for `/api/v1/videos/<book-id>`.
+          kind: tabType == 24 ? 'manju' : null,
         );
         if (items.isEmpty) return null;
         final cells = parseHomeCells(payload);
@@ -1802,15 +1893,104 @@ Map<String, dynamic> _decodeEnvelope(int statusCode, List<int> bodyBytes) {
       payload['code'] != 0 &&
       !isUnavailableCode(payload['code']) &&
       !isUnavailableIdeaCode(payload['code'])) {
+    final code = payload['code'];
     throw ApiException(
       '${payload['message'] ?? '请求失败'}',
-      upstreamCode: payload['code'] is int ? payload['code'] as int : null,
+      upstreamCode: code is int ? code : int.tryParse('$code'),
     );
   }
   if (payload['success'] == false) {
     throw ApiException('${payload['error'] ?? payload['message'] ?? '请求失败'}');
   }
   return payload;
+}
+
+SubtitleTrack _parseSubtitleTrackPayload(Map<String, dynamic> payload) {
+  if (isUnavailableCode(payload['code'])) return SubtitleTrack.empty;
+
+  dynamic data;
+  if (payload.containsKey('data')) {
+    data = payload['data'];
+    if (data is Map && data['data'] is Map) data = data['data'];
+  } else if (payload.containsKey('speech_text')) {
+    // A few speech-text bridges return the data object without a wrapper.
+    data = payload;
+  } else {
+    throw const FormatException('字幕轨响应缺少 data');
+  }
+  if (data == null) return SubtitleTrack.empty;
+  if (data is! Map) throw const FormatException('字幕轨 data 类型错误');
+  if (!data.containsKey('speech_text')) return SubtitleTrack.empty;
+
+  final speechText = data['speech_text'];
+  if (speechText == null) return SubtitleTrack.empty;
+  if (speechText is! String) {
+    throw const FormatException('字幕轨 speech_text 类型错误');
+  }
+  final track = SubtitleTrack.parse(speechText);
+  if (speechText.trim().isNotEmpty && track.isEmpty) {
+    throw const FormatException('字幕轨 speech_text 无法解析');
+  }
+  return track;
+}
+
+AudioTimeTrack _parseAudioTimeTrackPayload(
+  Map<String, dynamic> payload, {
+  required String audioItemId,
+}) {
+  if (isUnavailableCode(payload['code'])) return AudioTimeTrack.empty;
+  if (!payload.containsKey('para_match_data') && !payload.containsKey('data')) {
+    throw const FormatException('时间轴响应缺少 data');
+  }
+  final match = payload['para_match_data'] ?? payload['data'];
+  if (match == null) return AudioTimeTrack.empty;
+  if (match is! Map) throw const FormatException('时间轴 data 类型错误');
+
+  final byAudio = match['audio_para_match_data'];
+  if (byAudio != null && byAudio is! Map) {
+    throw const FormatException('audio_para_match_data 类型错误');
+  }
+
+  final hasFlatPoints =
+      match.containsKey('time_points') || match.containsKey('timePoints');
+  final flatPoints = match['time_points'] ?? match['timePoints'];
+  if (flatPoints != null && flatPoints is! List) {
+    throw const FormatException('time_points 类型错误');
+  }
+
+  final track = AudioTimeTrack.fromPayload(payload, audioItemId: audioItemId);
+  if (track.isNotEmpty) return track;
+
+  if (byAudio is Map && byAudio.isNotEmpty) {
+    final key = byAudio.containsKey(audioItemId)
+        ? audioItemId
+        : '${byAudio.keys.first}';
+    final points = byAudio[key];
+    if (points == null || (points is List && points.isEmpty)) {
+      return AudioTimeTrack.empty;
+    }
+    if (points is! List) {
+      throw const FormatException('audio_para_match_data 分片类型错误');
+    }
+    throw const FormatException('时间轴 points 无法解析');
+  }
+
+  if (hasFlatPoints) {
+    if (flatPoints == null || (flatPoints is List && flatPoints.isEmpty)) {
+      return AudioTimeTrack.empty;
+    }
+    throw const FormatException('时间轴 time_points 无法解析');
+  }
+
+  const emptyKeys = {
+    'audio_para_match_data',
+    'item_ids',
+    'text_para_match_data',
+  };
+  if (match.keys.every(emptyKeys.contains)) {
+    return AudioTimeTrack.empty;
+  }
+  throw const FormatException('时间轴响应缺少可识别字段');
 }
 
 String _extractChapterText(Map<String, dynamic> payload) {
