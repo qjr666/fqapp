@@ -8,8 +8,9 @@ extension _ReaderPageProgress on _ReaderPageState {
       viewport: constraints.biggest,
       textScaler: MediaQuery.textScalerOf(context),
       preferences: _displayPreferences,
-      fontFamily:
-          _fontFamily ?? Theme.of(context).textTheme.bodyLarge?.fontFamily,
+      fontFamily: _displayPreferences.builtinSerifFont
+          ? 'Home Serif'
+          : _fontFamily ?? Theme.of(context).textTheme.bodyLarge?.fontFamily,
     );
     if (_chapterLayout?.spec == spec &&
         _layoutMode == _preferences.pageMode &&
@@ -94,10 +95,7 @@ extension _ReaderPageProgress on _ReaderPageState {
     // 下一次通知，高亮（以及「高亮在屏」这条判据）会晚一拍。排版一就位就
     // 直接算一次，构建阶段不能 setState，所以只赋值。
     final narration = _narrationLayoutRange(layout);
-    // 显示态受「朗读句高亮」偏好控制；导航锚点不受 —— 关掉高亮不该连带
-    // 关掉跟随翻页（这是「听书跟随翻页无效」的直接原因之一）。
     _narrationRange = _preferences.narrationHighlight ? narration : null;
-    _followAnchor = narration;
     _layoutMode = _preferences.pageMode;
     // Late paragraph bubbles can add pages. Keep a backward chapter entry
     // anchored to the text end, not the first layout's last-page start.
@@ -162,7 +160,11 @@ extension _ReaderPageProgress on _ReaderPageState {
   /// Settles the reading-time delta since the last event, legado-style:
   /// the time between this event and the previous one counts as reading.
   void _settleReadTime() {
-    if (!_sessionActive || _content.isEmpty) return;
+    if (!_sessionActive ||
+        _content.isEmpty ||
+        shuqiBookIdFromReaderId(widget.bookId) != null) {
+      return;
+    }
     final now = DateTime.now();
     final delta = now.difference(_readStart).inMilliseconds / 1000;
     if (delta >= 1) {
@@ -197,11 +199,13 @@ extension _ReaderPageProgress on _ReaderPageState {
   }
 
   void _onPageChanged(int page) {
+    // Layout restoration and explicit location jumps also report a page. They
+    // already own the exact text anchor; only a real page change replaces it.
+    if (!_progressReady || _changingChapter || page == _pageIndex) return;
     // Turning the page cancels the selection: the handles belong to the text,
     // the action bar's anchor would be stale. Reselecting is one long press.
     _closeSelectionBar(clearSelection: true);
     _clearLocationHighlight();
-    if (!_progressReady || _changingChapter || page == _pageIndex) return;
     if (_settingsPreviewSourceOffset == null) {
       _setState(() {
         _pageIndex = page;
@@ -267,6 +271,10 @@ extension _ReaderPageProgress on _ReaderPageState {
       direction: direction,
       page: layout.pages[_pageIndex.clamp(0, layout.pages.length - 1)],
       spec: layout.spec,
+      bookmarked:
+          AppUiScope.isClassic(context) &&
+          _bookmarkedPagesFor(layout).contains(_pageIndex),
+      bookmarkColor: _effectivePreset.selectionAccentColor,
     );
   }
 
@@ -354,11 +362,13 @@ extension _ReaderPageProgress on _ReaderPageState {
       maxScroll: max,
       index: index,
     );
+    final shuqiId = shuqiBookIdFromReaderId(widget.bookId);
     final entry = {
       'id': widget.bookId,
       'kind': 'book',
       'title': widget.title,
       'bookId': widget.bookId,
+      if (shuqiId != null) ...{'contentId': shuqiId, 'source': shuqiSourceId},
       'chapterId': chapterId,
       'episode': index,
       // 总章数：书架靠「第 N/M 章」区分「读到末尾」与「全书读完」
@@ -425,6 +435,10 @@ extension _ReaderPageProgress on _ReaderPageState {
     _pauseListenFollow();
     _finishChapterPreview();
     _changingChapter = true;
+    // 跟随触发的切章要记一笔：拼接模式跨章时靠它区分「用户滚过去的」与
+    // 「跟随带过去的」，后者不能退出跟随。
+    if (followListening) _followChapterJump = true;
+    final completion = _chapterNavigationCompletion = Completer<void>();
     try {
       _settleReadTime();
       await _persistProgress();
@@ -434,6 +448,11 @@ extension _ReaderPageProgress on _ReaderPageState {
       await _load(startAtEnd: startAtEnd, chapterTurn: turn);
     } finally {
       _changingChapter = false;
+      // 跨章完成后清除标志。拼接模式的 `_onJoinedPosition` 是在 `_load()`
+      // 期间回调的，所以这里清得比它晚一点才对。
+      _followChapterJump = false;
+      _chapterNavigationCompletion = null;
+      completion.complete();
     }
   }
 
@@ -448,6 +467,7 @@ extension _ReaderPageProgress on _ReaderPageState {
     _pauseListenFollow();
     _finishChapterPreview();
     _changingChapter = true;
+    final completion = _chapterNavigationCompletion = Completer<void>();
     try {
       _settleReadTime();
       await _persistProgress();
@@ -457,6 +477,8 @@ extension _ReaderPageProgress on _ReaderPageState {
       await _load(chapterTurn: turn);
     } finally {
       _changingChapter = false;
+      _chapterNavigationCompletion = null;
+      completion.complete();
     }
   }
 
@@ -476,16 +498,10 @@ extension _ReaderPageProgress on _ReaderPageState {
       return;
     }
     _changingChapter = true;
-    // 跟随触发的切章要记一笔：拼接模式跨章时靠它区分「用户滚过去的」与
-    // 「跟随带过去的」，后者不能退出跟随。
-    if (followListening) _followChapterJump = true;
+    final completion = _chapterNavigationCompletion = Completer<void>();
     try {
       // 闸门要排在结算/存盘**前面**：被闩锁挡住的这次跟随切章什么都没做，
       // 而在后面的话轮询每 100ms 都会存一次进度。
-      //
-      // 这里用 `matchesBookChapter`（不看播放态）而不是 `matches`：章末会先
-      // 发一帧 `playing:false` 再起下一章，用 `matches` 的话那一帧永远过不了
-      // 闸门，「读完一章不翻章」就成了必然。
       if (followListening &&
           (!_routeCurrent ||
               !_appActive ||
@@ -493,7 +509,7 @@ extension _ReaderPageProgress on _ReaderPageState {
               !_preferences.listeningFollow ||
               _autoTurnTimer != null ||
               DateTime.now().isBefore(_listenFollowPausedUntil) ||
-              !ListeningSession.instance.matchesBookChapter(
+              !ListeningSession.instance.matches(
                 widget.bookId,
                 widget.chapters[index].itemId,
               ))) {
@@ -510,9 +526,8 @@ extension _ReaderPageProgress on _ReaderPageState {
       await _load();
     } finally {
       _changingChapter = false;
-      // 跨章完成后清除标志。拼接模式的 `_onJoinedPosition` 是在 `_load()`
-      // 期间回调的，所以这里清得比它晚一点才对。
-      _followChapterJump = false;
+      _chapterNavigationCompletion = null;
+      completion.complete();
     }
   }
 

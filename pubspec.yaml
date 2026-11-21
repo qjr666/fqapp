@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.201+206
+version: 1.0.205+210
 
 environment:
   sdk: ^3.12.2
@@ -29,10 +29,6 @@ environment:
 # versions available, run `flutter pub outdated`.
 dependencies:
   flutter:
-    sdk: flutter
-  # 中文 Material 文案（复制/粘贴/全选等系统文本菜单）：没有 delegates 时
-  # Flutter 一律回退英文，即使系统语言是中文（issue #79）。
-  flutter_localizations:
     sdk: flutter
 
   http: ^1.6.0
@@ -66,6 +62,7 @@ dependencies:
   # Windows 专用 libmpv；不要把 umbrella 的 media_kit_libs_video 加回来，否则
   # Android/iOS/macOS/Linux 的播放库会一起进包（APK 多出 ~11 MB）。
   media_kit_libs_windows_video: 1.0.11
+  media_kit_libs_linux: 1.2.1
   # iOS 专用 libmpv/FFmpeg。与 Windows 一样只引平台专用包，不能换成
   # media_kit_libs_video umbrella（会把全平台原生库打进 Android APK）。
   media_kit_libs_ios_video: 1.1.4
@@ -77,6 +74,8 @@ dependencies:
   screen_retriever: 0.2.2
   smtc_windows: ^1.1.0
   ffi: ^2.1.4
+  material_ui: ^1.11.0
+  cupertino_ui: ^1.1.6
 dev_dependencies:
   integration_test:
     sdk: flutter
@@ -105,6 +104,7 @@ flutter:
   uses-material-design: true
 
   assets:
+    - assets/licenses/sync_storage.txt
     - assets/config/config.json
     - assets/config/filter.json
     - assets/config/device_pool.example.json

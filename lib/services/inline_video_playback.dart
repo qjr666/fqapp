@@ -10,7 +10,7 @@ import 'package:flutter/foundation.dart';
 import '../models/media_item.dart';
 import '../widgets/player/player_video_layout.dart';
 import 'api_client.dart';
-import 'connectivity_status.dart';
+import 'app_log.dart';
 import 'drama_download_store.dart';
 import 'drama_mute_preferences.dart';
 import 'episode_source_cache.dart';
@@ -34,10 +34,10 @@ import 'video_catalogue.dart';
 /// superseded activation is disposed instead of being adopted.
 ///
 /// Progress is saved when a player is stopped or released, using the same
-/// fields as the full page player (`player_page.dart`). Deliberately *not*
-/// implemented in this round: 累计阅读时长/统计、诊断日志、自动连播、相邻剧
-/// 地址预取 — the inline feed only starts, stops and remembers where the
-/// viewer was. 倍速（面板选档 + 长按快进）与横滑 seek 已在会话内支持。
+/// fields as the full page player (`player_page.dart`). A completed episode
+/// advances within the same series while playback is still wanted. Statistics,
+/// diagnostics, and adjacent-series prefetch remain intentionally out of scope.
+/// 倍速(面板选档 + 长按快进)与横滑 seek 已在会话内支持。
 class InlineVideoPlayback {
   InlineVideoPlayback({
     this.directoryLoader,
@@ -52,8 +52,10 @@ class InlineVideoPlayback {
     _sources =
         sources ??
         EpisodeSourceCache(
-          loader: (chapter) async =>
-              EpisodeSource.fromResponse(await _content(chapter.itemId)),
+          loader: (chapter, {required bool prefetch}) async =>
+              EpisodeSource.fromResponse(
+                await _content(chapter.itemId, prefetch: prefetch),
+              ),
         );
   }
 
@@ -238,13 +240,17 @@ class InlineVideoPlayback {
   bool _playbackRequested(NativePlayer player) =>
       player.playing || (player.playWhenReady && !player.completed);
 
-  Future<Map<String, dynamic>> _content(String itemId) {
+  Future<Map<String, dynamic>> _content(
+    String itemId, {
+    bool prefetch = false,
+  }) {
     final loader = contentLoader;
     if (loader != null) return loader(itemId, _tab);
     return ApiClient.instance.content(
       itemId,
       tab: _tab,
       mode: videoContentMode,
+      purpose: prefetch ? PlaybackPurpose.prefetch : PlaybackPurpose.foreground,
     );
   }
 
@@ -295,6 +301,10 @@ class InlineVideoPlayback {
     Duration? startPosition,
   }) async {
     if (_disposed) return;
+    if (!isVideoKind(series.kind)) {
+      AppLog.w('drama-inline', '拒绝为非视频内容启动播放器: ${series.kind}:${series.id}');
+      return;
+    }
     final generation = ++_generation;
     final contentId = series.seriesId ?? series.id;
     final tab = series.kind == 'manju' ? '漫剧' : '短剧';
@@ -621,9 +631,13 @@ class InlineVideoPlayback {
     await _applyPlaybackPrefs(player);
     if (!_current(generation, player)) return;
     if (!_wantsPlay) return;
-    _playIssued = true;
-    _progressDirty = true;
     try {
+      if (player.completed) {
+        await seek(Duration.zero);
+        if (!_current(generation, player) || !_wantsPlay) return;
+      }
+      _playIssued = true;
+      _progressDirty = true;
       await player.play();
     } catch (failure) {
       if (_current(generation, player)) await _fail(failure);
@@ -667,9 +681,13 @@ class InlineVideoPlayback {
     final player = _player;
     if (player == null || !player.isCreated || error.value != null) return;
     final generation = _generation;
-    _playIssued = true;
-    _progressDirty = true;
     try {
+      if (player.completed) {
+        await seek(Duration.zero);
+        if (!_current(generation, player) || !_wantsPlay) return;
+      }
+      _playIssued = true;
+      _progressDirty = true;
       await player.play();
     } catch (failure) {
       if (_current(generation, player)) await _fail(failure);
@@ -765,9 +783,6 @@ class InlineVideoPlayback {
       } catch (_) {
         // 离线索引读不出来就当没有缓存。
       }
-    }
-    if (contentLoader == null && !(await currentConnectivity()).online) {
-      throw const OfflineEpisodeUnavailable();
     }
     return _sources.request(episode).future;
   }
@@ -963,6 +978,23 @@ class InlineVideoPlayback {
           playing.value = _playbackRequested(player);
         }
       }),
+      player.completedStream.listen((completed) {
+        if (!completed ||
+            !_current(generation, player) ||
+            !_wantsPlay ||
+            !player.playWhenReady) {
+          return;
+        }
+        final series = _active;
+        final index = _activeIndex;
+        if (series == null || index == null) return;
+        if (index + 1 < _episodes.length) {
+          unawaited(activate(series, startEpisodeIndex: index + 1));
+          return;
+        }
+        playing.value = false;
+        unawaited(_persistProgress());
+      }),
       player.errorStream.listen((failure) {
         if (_current(generation, player)) unawaited(_fail(failure));
       }),
@@ -1064,6 +1096,13 @@ class InlineVideoPlayback {
   Future<void> _fail(Object failure) async {
     if (_disposed) return;
     ++_generation;
+    // The address may have expired or failed during native preparation. Drop
+    // this episode before teardown clears its identity: a retry must fetch a
+    // fresh source, not re-open the same failed two-minute cache entry.
+    final episode = activeEpisode;
+    if (episode != null) _sources.invalidate(episode.itemId);
+    _currentSource = null;
+    AppLog.e('drama', '内联短剧取流或播放失败', error: failure);
     error.value = failure is NativePlaybackException
         ? PlaybackIssue.fromError(failure).title
         : userFacingError(failure);

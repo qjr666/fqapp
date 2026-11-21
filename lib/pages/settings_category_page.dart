@@ -18,12 +18,9 @@
 //   full-width `GlassSettingMenu` cannot be expressed as a trailing widget.
 //   It renders exactly the upstream row shape inside the shared panel.
 
-import 'dart:async';
-
-import 'package:flutter/cupertino.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
 
 import '../services/app_style_tokens.dart';
-import '../services/notification_permission.dart';
 import '../widgets/settings/classic_settings_icons.dart';
 import '../widgets/settings/settings_widgets.dart';
 
@@ -47,6 +44,11 @@ class SettingsCategory {
   /// About page).
   final WidgetBuilder? pageBuilder;
 
+  /// Optional current value shown on the trailing side (e.g. the selected
+  /// theme). It sits next to the chevron, leaving [subtitle] free for the
+  /// description on every presentation.
+  final String? value;
+
   const SettingsCategory({
     required this.icon,
     required this.title,
@@ -54,6 +56,7 @@ class SettingsCategory {
     this.items = const [],
     this.itemsBuilder,
     this.pageBuilder,
+    this.value,
   });
 }
 
@@ -88,6 +91,7 @@ String settingsCategoryCode(String title) => switch (title) {
   '阅读' => 'SYSTEM / READING',
   '听书' => 'SYSTEM / LISTENING',
   '短剧' => 'SYSTEM / DRAMA',
+  '老板键' => 'SYSTEM / BOSS KEY',
   '数据' => 'SYSTEM / STORAGE',
   '服务' => 'SYSTEM / SERVICE',
   '关于' => 'SYSTEM / ABOUT',
@@ -120,21 +124,12 @@ class SettingsCategoryPage extends StatefulWidget {
 
 class _SettingsCategoryPageState extends State<SettingsCategoryPage> {
   @override
-  void initState() {
-    super.initState();
-    // 「听书」分类里有通知权限这一行：进页面时读一次真实状态，别让用户
-    // 看到过期的「已开启」。
-    if (widget.title == '听书') {
-      unawaited(NotificationPermission.instance.refresh());
-    }
-  }
-
-  @override
   Widget build(BuildContext context) {
     final items = widget.itemsBuilder?.call(context) ?? widget.items;
     if (AppStyleTokens.of(context).isClassic) {
       return SettingsScaffold(
         title: widget.title,
+        showBack: Navigator.of(context).canPop(),
         body: ListView(
           key: PageStorageKey('settings-category-classic-${widget.title}'),
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -203,6 +198,7 @@ abstract final class SettingsCategoryIcons {
   static const reading = CupertinoIcons.book;
   static const listening = CupertinoIcons.waveform;
   static const drama = CupertinoIcons.play_rectangle;
+  static const bossKey = CupertinoIcons.eye_slash;
   static const data = CupertinoIcons.folder;
   static const service = CupertinoIcons.wifi;
   static const about = CupertinoIcons.info;

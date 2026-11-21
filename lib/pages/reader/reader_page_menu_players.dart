@@ -10,7 +10,8 @@ extension _ReaderPageMenuPlayers on _ReaderPageState {
       final match = _videoMatch;
       // iOS 的 media_kit 进程内适配器已实现 native_player 契约，观影入口与
       // 短剧 tab 一起由 supportsVideoPlayback 统一放开。
-      final video = supportsVideoPlayback &&
+      final video =
+          supportsVideoPlayback &&
           _preferences.showVideoButton &&
           match != null &&
           match.available;
@@ -27,6 +28,7 @@ extension _ReaderPageMenuPlayers on _ReaderPageState {
             // 只管按它起播。起点仍是当前页第一段，跟随与高亮留在书页上。
             onSwitch: () => _openListening(fromPage: true),
             child: ReaderListenCapsuleHost(
+              key: _readerCapsuleKey,
               monochrome: preset.isEink,
               // 只在同一本书里收起菜单；借用别书胶囊时保留回到朗读书籍的跳转。
               onOpenBook: currentBook ? () => _setControlsVisible(false) : null,
@@ -75,7 +77,8 @@ extension _ReaderPageMenuPlayers on _ReaderPageState {
                             // 播放引擎」）。起点仍是当前页第一段。
                             onTap: _loading || _error != null
                                 ? null
-                                : () => unawaited(_openListening(fromPage: true)),
+                                : () =>
+                                      unawaited(_openListening(fromPage: true)),
                           ),
                         ),
                       ),

@@ -9,7 +9,7 @@ import 'package:archive/archive.dart';
 import 'package:ffi/ffi.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:media_kit/media_kit.dart';
@@ -22,6 +22,12 @@ import '../widgets/desktop_login.dart';
 import 'desktop_media.dart';
 import 'app_log.dart';
 import 'platform_channel.dart';
+import 'linux_platform.dart';
+
+bool get isMediaDesktop =>
+    !kIsWeb &&
+    (defaultTargetPlatform == TargetPlatform.windows ||
+        defaultTargetPlatform == TargetPlatform.linux);
 
 bool get isWindowsDesktop =>
     !kIsWeb && defaultTargetPlatform == TargetPlatform.windows;
@@ -29,9 +35,10 @@ bool get isWindowsDesktop =>
 /// On Windows an inactive window is still visible; it simply lacks input focus.
 /// Only hidden/paused/detached windows should defer foreground video playback.
 bool playbackAppIsActive(AppLifecycleState? state) =>
-    state == null ||
-    state == AppLifecycleState.resumed ||
-    (isWindowsDesktop && state == AppLifecycleState.inactive);
+    !(isLinuxDesktop && DesktopSystemSession.instance.blocked) &&
+    (state == null ||
+        state == AppLifecycleState.resumed ||
+        (isMediaDesktop && state == AppLifecycleState.inactive));
 
 /// 桌面窗口只是失焦时，是否仍算「在前台」。
 ///
@@ -42,12 +49,44 @@ bool playbackAppIsActive(AppLifecycleState? state) =>
 /// 与 [playbackAppIsActive] 是同一件事的两处用法：那个管视频前台播放，这个
 /// 管阅读页的跟随与高亮。平台范围比它宽一点，三个桌面平台都成立。
 bool desktopInactiveStillVisible(AppLifecycleState state) =>
-    state == AppLifecycleState.resumed ||
-    ((!kIsWeb &&
-            (defaultTargetPlatform == TargetPlatform.windows ||
-                defaultTargetPlatform == TargetPlatform.macOS ||
-                defaultTargetPlatform == TargetPlatform.linux)) &&
-        state == AppLifecycleState.inactive);
+    !(isLinuxDesktop && DesktopSystemSession.instance.blocked) &&
+    (state == AppLifecycleState.resumed ||
+        ((!kIsWeb &&
+                (defaultTargetPlatform == TargetPlatform.windows ||
+                    defaultTargetPlatform == TargetPlatform.macOS ||
+                    defaultTargetPlatform == TargetPlatform.linux)) &&
+            state == AppLifecycleState.inactive));
+
+/// logind hints are observable, but compositor lock reliability is unverified.
+class DesktopSystemSession extends ChangeNotifier {
+  static final instance = DesktopSystemSession();
+  bool locked = false;
+  bool suspended = false;
+  bool serviceAvailable = false;
+  bool get blocked => locked || suspended;
+  void accept(dynamic event) {
+    if (event is! Map || event['value'] is! bool) return;
+    final value = event['value'] as bool;
+    switch (event['type']) {
+      case 'locked':
+        if (locked == value) return;
+        locked = value;
+      case 'suspend':
+        if (suspended == value) return;
+        suspended = value;
+      case 'service':
+        serviceAvailable = value;
+        if (!value) AppLog.w('session', 'logind 不可用，无法保证锁屏/挂起通知');
+      default:
+        return;
+    }
+    notifyListeners();
+  }
+
+  AppLifecycleState get lifecycle => blocked
+      ? AppLifecycleState.hidden
+      : WidgetsBinding.instance.lifecycleState ?? AppLifecycleState.resumed;
+}
 
 class DesktopPlatform with WindowListener {
   DesktopPlatform._();
@@ -55,6 +94,7 @@ class DesktopPlatform with WindowListener {
   static final navigatorKey = GlobalKey<NavigatorState>();
   static final readerBrightness = ValueNotifier<double>(1);
   static final fullscreen = ValueNotifier<bool>(false);
+  static final maximized = ValueNotifier<bool>(false);
   final _events = <String, StreamController<dynamic>>{};
   final _players = <int, _DesktopPlayer>{};
   final _tts = FlutterTts();
@@ -63,6 +103,7 @@ class DesktopPlatform with WindowListener {
   int _nextId = 1000000;
   bool _closing = false;
   Future<void> Function()? beforeClose;
+  Future<void> _awakeQueue = Future.value();
   bool _readerAwake = false;
   bool _playerAwake = false;
   String? _readerSession;
@@ -91,10 +132,14 @@ class DesktopPlatform with WindowListener {
         ),
         center: true,
         title: '什锦铺',
+        titleBarStyle: TitleBarStyle.hidden,
       ),
       () async {
         await windowManager.show();
         await windowManager.focus();
+        try {
+          maximized.value = await windowManager.isMaximized();
+        } catch (_) {}
       },
     );
     _tts.setCompletionHandler(() {
@@ -138,6 +183,14 @@ class DesktopPlatform with WindowListener {
     }
   }
 
+  Future<void> disposeMedia() async {
+    final hosts = _players.values.toList();
+    _players.clear();
+    for (final host in hosts) {
+      await host.dispose();
+    }
+  }
+
   Widget videoSurface(int id, {Key? key}) {
     final host = _players[id];
     return host == null
@@ -153,8 +206,57 @@ class DesktopPlatform with WindowListener {
   }
 
   Future<void> setFullscreen(bool value) async {
-    await windowManager.setFullScreen(value);
+    try {
+      await windowManager.setFullScreen(value);
+    } catch (_) {}
     fullscreen.value = value;
+    if (!value) {
+      try {
+        maximized.value = await windowManager.isMaximized();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> minimizeWindow() async {
+    if (!isWindowsDesktop) return;
+    try {
+      await windowManager.minimize();
+    } catch (_) {}
+  }
+
+  Future<void> toggleMaximizeWindow() async {
+    if (!isWindowsDesktop) return;
+    try {
+      if (await windowManager.isMaximized()) {
+        await windowManager.unmaximize();
+      } else {
+        await windowManager.maximize();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> closeWindow() async {
+    if (!isWindowsDesktop) return;
+    try {
+      await windowManager.close();
+    } catch (_) {}
+  }
+
+  Future<void> startWindowDragging() async {
+    if (!isWindowsDesktop) return;
+    try {
+      await windowManager.startDragging();
+    } catch (_) {}
+  }
+
+  @override
+  void onWindowMaximize() {
+    maximized.value = true;
+  }
+
+  @override
+  void onWindowUnmaximize() {
+    maximized.value = false;
   }
 
   @override
@@ -199,6 +301,7 @@ class DesktopPlatform with WindowListener {
     switch (channel) {
       case 'fqapp/native_player':
         if (method == 'create') {
+          MediaKit.ensureInitialized();
           final id = _nextId++;
           final host = _DesktopPlayer(
             id,
@@ -211,8 +314,7 @@ class DesktopPlatform with WindowListener {
           return {'playerId': id};
         }
         if (method == 'setKeepScreenOn') {
-          _playerAwake = args['on'] == true;
-          _updateAwake();
+          await _setAwake(player: args['on'] == true);
           return null;
         }
         if (method == 'startListenForeground') {
@@ -259,6 +361,36 @@ class DesktopPlatform with WindowListener {
           return 'granted';
         }
         if (method == 'openNotificationSettings') return false;
+        if (isLinuxDesktop &&
+            !const {
+              'dispose',
+              'play',
+              'pause',
+              'seek',
+              'setRate',
+              'setVolume',
+              'getPlaybackSettings',
+            }.contains(method)) {
+          throw PlatformException(
+            code: 'unsupported_platform',
+            message: method,
+          );
+        }
+        if (isLinuxDesktop &&
+            !const {
+              'dispose',
+              'play',
+              'pause',
+              'seek',
+              'setRate',
+              'setVolume',
+              'getPlaybackSettings',
+            }.contains(method)) {
+          throw PlatformException(
+            code: 'unsupported_platform',
+            message: method,
+          );
+        }
         final id = (args['id'] as num?)?.toInt();
         final host = _players[id];
         if (method == 'dispose') {
@@ -269,12 +401,18 @@ class DesktopPlatform with WindowListener {
         if (host == null) {
           throw PlatformException(code: 'player_closed', message: '播放器已关闭');
         }
+        if (method == 'getPlaybackSettings') {
+          return {
+            'volume': host.player.state.volume / 100,
+            'rate': host.player.state.rate,
+          };
+        }
         await host.command(method, args);
         return null;
       case 'fqapp/library_backup':
         return _backup(method, args);
       case 'fqapp/local_books':
-        if (method == 'pickBookFile') return _pickBook();
+        if (method == 'pickBookFile') return pickBook();
       case 'fqapp/downloads':
         if (method == 'saveText') {
           final path = await _save(
@@ -312,9 +450,6 @@ class DesktopPlatform with WindowListener {
       case 'fqapp/volume-key':
         return null;
       case 'fqapp/fair_memory':
-        return null;
-      // 混播策略是移动端的音频焦点/会话概念，桌面端没有对应开关，直接忽略。
-      case 'fqapp/audio_mix':
         return null;
     }
     throw MissingPluginException('$channel/$method');
@@ -380,6 +515,13 @@ class DesktopPlatform with WindowListener {
   }
 
   Future<dynamic> _reader(String method, Map args) async {
+    if (isLinuxDesktop &&
+        (method == 'setImmersive' || method == 'setBrightness')) {
+      throw PlatformException(
+        code: 'unsupported_platform',
+        message: 'Linux does not provide this Android device control',
+      );
+    }
     switch (method) {
       case 'start':
         _readerSession = args['session'] as String?;
@@ -388,21 +530,19 @@ class DesktopPlatform with WindowListener {
           const Duration(minutes: 1),
           (_) => _emit('fqapp/reader/events', _readerStatus()),
         );
-        _setBrightness(args['brightness']);
+        if (!isLinuxDesktop) _setBrightness(args['brightness']);
         return _readerStatus();
       case 'setBrightness':
         _setBrightness(args['brightness']);
         return true;
       case 'keepScreenOn':
-        _readerAwake = args['on'] == true;
-        _updateAwake();
+        await _setAwake(reader: args['on'] == true);
         return null;
       case 'stop':
       case 'suspend':
         _readerTimer?.cancel();
         readerBrightness.value = 1;
-        _readerAwake = false;
-        _updateAwake();
+        await _setAwake(reader: false);
         return null;
       case 'setImmersive':
         return null;
@@ -426,6 +566,9 @@ class DesktopPlatform with WindowListener {
         await File(file.path).copy(target.path);
         return {'path': target.path, 'name': file.name};
     }
+    if (isLinuxDesktop) {
+      throw PlatformException(code: 'unsupported_platform', message: method);
+    }
     return null;
   }
 
@@ -437,9 +580,33 @@ class DesktopPlatform with WindowListener {
   Map<String, dynamic> _readerStatus() => {
     'session': _readerSession,
     'timestamp': DateTime.now().millisecondsSinceEpoch,
-    'systemBrightness': 1.0,
+    if (!isLinuxDesktop) 'systemBrightness': 1.0,
   };
-  void _updateAwake() {
+  Future<void> _setAwake({bool? reader, bool? player}) {
+    final request = _awakeQueue.then((_) async {
+      final oldReader = _readerAwake, oldPlayer = _playerAwake;
+      _readerAwake = reader ?? oldReader;
+      _playerAwake = player ?? oldPlayer;
+      try {
+        await _updateAwake();
+      } catch (_) {
+        _readerAwake = oldReader;
+        _playerAwake = oldPlayer;
+        rethrow;
+      }
+    });
+    _awakeQueue = request.catchError((Object _) {});
+    return request;
+  }
+
+  Future<void> _updateAwake() async {
+    if (isLinuxDesktop) {
+      await const MethodChannel('fqapp/desktop_session').invokeMethod<void>(
+        'setKeepScreenOn',
+        {'on': _readerAwake || _playerAwake},
+      );
+      return;
+    }
     final call = DynamicLibrary.open('kernel32.dll')
         .lookupFunction<Uint32 Function(Uint32), int Function(int)>(
           'SetThreadExecutionState',
@@ -459,8 +626,104 @@ class DesktopPlatform with WindowListener {
       acceptedTypeGroups: [XTypeGroup(label: '文件', extensions: extensions)],
     );
     if (location == null) return null;
-    await XFile.fromData(bytes, name: name).saveTo(location.path);
+    if (isLinuxDesktop) {
+      if (!await _saveLinux(location.path, bytes)) return null;
+    } else {
+      await XFile.fromData(bytes, name: name).saveTo(location.path);
+    }
     return location.path;
+  }
+
+  Future<bool> _saveLinux(String path, Uint8List bytes) async {
+    final libc = DynamicLibrary.process();
+    final open = libc
+        .lookupFunction<
+          Int32 Function(Pointer<Utf8>, Int32, Uint32),
+          int Function(Pointer<Utf8>, int, int)
+        >('open');
+    final close = libc.lookupFunction<Int32 Function(Int32), int Function(int)>(
+      'close',
+    );
+    final errno = libc
+        .lookupFunction<Pointer<Int32> Function(), Pointer<Int32> Function()>(
+          '__errno_location',
+        );
+    // Linux open flags: write-only, no symlink following, nonblocking, close-on-exec.
+    const flags = 0x1 | 0x20000 | 0x800 | 0x80000;
+    final nativePath = path.toNativeUtf8();
+    int fd;
+    var existing = false;
+    try {
+      fd = open(
+        nativePath,
+        flags | 0x40 | 0x80,
+        0x1b6,
+      ); // O_CREAT | O_EXCL, 0666
+      if (fd < 0 && errno().value == 17) {
+        // EEXIST
+        existing = true;
+        fd = open(nativePath, flags, 0);
+      }
+      if (fd < 0) {
+        throw FileSystemException('无法打开保存文件', path, OSError('', errno().value));
+      }
+    } finally {
+      malloc.free(nativePath);
+    }
+    try {
+      // Pin the opened inode: a replaced path must never redirect this write.
+      final file = File('/proc/self/fd/$fd');
+      final before = await file.stat();
+      if (before.type != FileSystemEntityType.file) {
+        throw FileSystemException('只能保存到普通文件', path);
+      }
+      if (existing) {
+        final context = navigatorKey.currentContext;
+        if (context == null || !context.mounted) {
+          throw PlatformException(code: 'not_ready', message: '窗口尚未就绪');
+        }
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('覆盖已有文件？'),
+            content: Text('文件已存在，覆盖后无法撤销：\n$path'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('覆盖'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed != true) return false;
+      }
+      final after = await file.stat();
+      if (await FileSystemEntity.type(path, followLinks: false) !=
+              FileSystemEntityType.file ||
+          await Link(file.path).target() !=
+              await File(path).resolveSymbolicLinks() ||
+          before.size != after.size ||
+          before.modified != after.modified ||
+          before.changed != after.changed ||
+          before.mode != after.mode) {
+        throw PlatformException(
+          code: 'file_changed',
+          message: '目标文件已变化，请重新选择保存位置',
+        );
+      }
+      await file.writeAsBytes(bytes, flush: true);
+      if (await Link(file.path).target() !=
+          await File(path).resolveSymbolicLinks()) {
+        throw PlatformException(code: 'file_changed', message: '保存期间目标文件已被替换');
+      }
+      return true;
+    } finally {
+      close(fd);
+    }
   }
 
   Future<Directory> _captureDirectory() async {
@@ -472,9 +735,6 @@ class DesktopPlatform with WindowListener {
       RegExp(r'^part-[0-9]+-[a-fA-F0-9-]+\.json$').hasMatch(name);
   Future<dynamic> _backup(String method, Map args) async {
     switch (method) {
-      case 'hasPicker':
-        // 能力探测：桌面端有系统文件选择器。
-        return true;
       case 'saveBackup':
         return await _save(args['name'] as String, args['bytes'] as Uint8List, [
               'json',
@@ -542,7 +802,7 @@ class DesktopPlatform with WindowListener {
     throw MissingPluginException(method);
   }
 
-  Future<Map<String, dynamic>?> _pickBook() async {
+  Future<Map<String, dynamic>?> pickBook() async {
     final file = await openFile(
       acceptedTypeGroups: [
         const XTypeGroup(label: '本地书籍', extensions: ['txt', 'epub']),
@@ -553,13 +813,43 @@ class DesktopPlatform with WindowListener {
       throw PlatformException(code: 'file_size', message: '书籍不能超过 32 MB');
     }
     final bytes = await file.readAsBytes();
+    final text = Platform.isLinux && file.name.toLowerCase().endsWith('.txt')
+        ? await decodeLinuxText(bytes)
+        : null;
     return {
       'name': file.name,
       'bytes': bytes,
       'byteLength': bytes.length,
       if (file.name.toLowerCase().endsWith('.txt'))
-        'text': decodeDesktopText(bytes),
+        'text': text ?? decodeDesktopText(bytes),
     };
+  }
+}
+
+/// Decode the already size-checked bytes; never re-read a mutable picked file.
+Future<String> decodeLinuxText(Uint8List bytes) async {
+  if (bytes.length >= 2 &&
+      ((bytes[0] == 255 && bytes[1] == 254) ||
+          (bytes[0] == 254 && bytes[1] == 255))) {
+    return decodeDesktopText(bytes);
+  }
+  try {
+    return utf8.decode(bytes).replaceFirst(RegExp('^\uFEFF'), '');
+  } on FormatException {
+    final process = await Process.start('iconv', [
+      '-f',
+      'GB18030',
+      '-t',
+      'UTF-8',
+    ]);
+    final output = process.stdout.transform(utf8.decoder).join();
+    final errors = process.stderr.drain<void>();
+    process.stdin.add(bytes);
+    await process.stdin.close();
+    final text = await output;
+    await errors;
+    if (await process.exitCode != 0) throw const FormatException('无法解码本地书籍');
+    return text;
   }
 }
 
@@ -609,6 +899,10 @@ String decodeDesktopText(Uint8List bytes) {
 class _DesktopPlayer {
   _DesktopPlayer(this.id, this.emit) {
     video = VideoController(player);
+    // media_kit initializes textures after a frame, including on an idle window.
+    if (defaultTargetPlatform == TargetPlatform.linux) {
+      WidgetsBinding.instance.scheduleFrame();
+    }
     void event(String type, dynamic value) {
       if (!disposed) emit({'playerId': id, 'type': type, 'value': value});
     }
@@ -713,10 +1007,14 @@ class _DesktopPlayer {
   Future<void> dispose() async {
     if (disposed) return;
     disposed = true;
+    if (!ready.isCompleted) ready.complete();
     for (final subscription in subscriptions) {
       await subscription.cancel();
     }
-    await player.dispose();
-    media?.close();
+    try {
+      await player.dispose();
+    } finally {
+      media?.close();
+    }
   }
 }

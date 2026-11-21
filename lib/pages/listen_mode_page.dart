@@ -1,6 +1,8 @@
 import 'dart:async';
+import '../services/desktop_platform.dart';
+import '../services/linux_platform.dart';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
 import '../models/media_item.dart';
@@ -9,7 +11,6 @@ import '../services/app_theme.dart';
 import '../services/audio_floating_routes.dart';
 import '../services/audio_preferences.dart';
 import '../services/episode_source_cache.dart';
-import '../services/ios_platform.dart';
 import '../services/native_player.dart';
 import '../services/player_preferences.dart';
 import '../widgets/home/home_design.dart';
@@ -55,6 +56,7 @@ class _ListenModePageState extends State<ListenModePage>
     with WidgetsBindingObserver {
   NativePlayer? _player;
   StreamSubscription<bool>? _completedSub;
+  StreamSubscription<bool>? _playingSub;
   StreamSubscription<Duration>? _positionSub;
   StreamSubscription<Duration>? _durationSub;
   bool _switching = false;
@@ -81,26 +83,7 @@ class _ListenModePageState extends State<ListenModePage>
     AudioFloatingRouteScope.configure(context, hidden: true);
   }
 
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    unawaited(AudioPreferences.instance.load());
-    NativePlayer.setRemoteCommandHandler(
-      onAction: _handleRemoteAction,
-      onBecomingNoisy: _handleBecomingNoisy,
-    );
-    // iOS 的远控动作先按活跃会话栈分发；本页不注册就只落到静态槽，别的
-    // 听书会话残留时上一章 / 下一章会被它吞掉或无人接收。
-    if (isIOSPlatform) IosPlatform.registerMediaHandler(_iosRemote);
-    unawaited(_load(_index, autoplay: true));
-    PlayerPreferences.loadPlaybackRate().then((rate) {
-      if (!mounted) return;
-      _rate = _rates.contains(rate) ? rate : 1.0;
-      unawaited(_player?.setRate(_rate));
-      if (mounted) setState(() {});
-    });
-  }
+  final String _mediaOwner = NativePlayer.allocateRemoteOwner();
 
   /// 同一个 tear-off 对象用于注册和注销。
   late final bool Function(String) _iosRemote = _handleIosRemote;
@@ -112,18 +95,59 @@ class _ListenModePageState extends State<ListenModePage>
     return true;
   }
 
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    if (isLinuxDesktop) {
+      DesktopSystemSession.instance.addListener(_systemSessionChanged);
+    }
+    unawaited(AudioPreferences.instance.load());
+    // iOS 的远控动作先按活跃会话栈分发；本页不注册就只落到静态槽，别的
+    // 听书会话残留时上一章 / 下一章会被它吞掉或无人接收。
+    if (isIOSPlatform) IosPlatform.registerMediaHandler(_iosRemote);
+    NativePlayer.setRemoteCommandHandler(
+      owner: _mediaOwner,
+      onSetting: (property, value) async {
+        final player = _player;
+        if (player == null) throw StateError('No player');
+        if (property == 'Volume') {
+          await player.setVolume(value);
+        } else {
+          await player.setRate(value);
+        }
+        if (!mounted || !identical(player, _player)) {
+          throw StateError('Stale player');
+        }
+        if (property == 'Rate') setState(() => _rate = value);
+        return value;
+      },
+      onSeek: (ms) => unawaited(_remoteSeek(ms)),
+      onAction: _handleRemoteAction,
+      onBecomingNoisy: _handleBecomingNoisy,
+    );
+    unawaited(_load(_index, autoplay: true));
+    PlayerPreferences.loadPlaybackRate().then((rate) {
+      if (!mounted) return;
+      _rate = _rates.contains(rate) ? rate : 1.0;
+      unawaited(_player?.setRate(_rate));
+      if (mounted) setState(() {});
+    });
+  }
+
+  int? _systemResumeIndex;
+  Future<void> _systemPause = Future.value();
+
   void _handleRemoteAction(String action) {
+    _systemResumeIndex = null;
     if (!mounted) return;
     switch (action) {
+      case 'play':
+        if (!(_player?.playWhenReady ?? false)) unawaited(_togglePlay());
+      case 'pause':
+        if (_player?.playWhenReady ?? false) unawaited(_togglePlay());
       case 'playPause':
         unawaited(_togglePlay());
-      // iOS 控制中心的播放与暂停是两枚独立按钮，不能都当切换处理。
-      case 'play':
-        unawaited(_player?.play());
-        unawaited(_startForeground());
-      case 'pause':
-        unawaited(_player?.pause());
-        unawaited(_startForeground());
       case 'prev':
         if (_index > 0) unawaited(_step(-1));
       case 'next':
@@ -136,31 +160,70 @@ class _ListenModePageState extends State<ListenModePage>
   }
 
   void _handleBecomingNoisy() {
+    _systemResumeIndex = null;
     if (!mounted) return;
     unawaited(_player?.pause());
     unawaited(_stopForeground());
     if (mounted) setState(() {});
   }
 
+  void _systemSessionChanged() =>
+      didChangeAppLifecycleState(DesktopSystemSession.instance.lifecycle);
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // iOS 由系统 Now Playing 会话接管后台，不在切后台时自撤卡片。
-    if (state != AppLifecycleState.resumed &&
-        !isIOSPlatform &&
-        !AudioPreferences.instance.backgroundPlayback.value) {
-      unawaited(_player?.pause());
-      unawaited(_stopForeground());
-      if (mounted) setState(() {});
+    if (!isLinuxDesktop) {
+      // iOS 由系统 Now Playing 会话接管后台，不在切后台时自撤卡片。
+      if (state != AppLifecycleState.resumed &&
+          !isIOSPlatform &&
+          !AudioPreferences.instance.backgroundPlayback.value) {
+        unawaited(_player?.pause());
+        unawaited(_stopForeground());
+        if (mounted) setState(() {});
+      }
+      return;
     }
+
+    if (!desktopInactiveStillVisible(state) &&
+        (!AudioPreferences.instance.backgroundPlayback.value ||
+            DesktopSystemSession.instance.suspended)) {
+      if (_player?.playWhenReady ?? false) {
+        _systemResumeIndex = _index;
+        _systemPause = _player!.pause();
+      }
+      unawaited(_stopForeground());
+    } else if (desktopInactiveStillVisible(state)) {
+      unawaited(_resumeSystemPause());
+    }
+  }
+
+  Future<void> _resumeSystemPause() async {
+    final index = _systemResumeIndex;
+    final player = _player;
+    await _systemPause;
+    if (!mounted ||
+        index == null ||
+        index != _index ||
+        _systemResumeIndex != index ||
+        !NativePlayer.ownsRemoteOwner(_mediaOwner) ||
+        !identical(player, _player) ||
+        !desktopInactiveStillVisible(DesktopSystemSession.instance.lifecycle)) {
+      return;
+    }
+    _systemResumeIndex = null;
+    await player?.play();
+    await _startForeground();
   }
 
   @override
   void dispose() {
     _popped = true;
+    DesktopSystemSession.instance.removeListener(_systemSessionChanged);
     WidgetsBinding.instance.removeObserver(this);
-    NativePlayer.clearRemoteCommandHandler(_handleRemoteAction);
+    NativePlayer.clearRemoteCommandHandler(owner: _mediaOwner);
     if (isIOSPlatform) IosPlatform.unregisterMediaHandler(_iosRemote);
     _completedSub?.cancel();
+    _playingSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
     _position.dispose();
@@ -172,6 +235,7 @@ class _ListenModePageState extends State<ListenModePage>
 
   Future<void> _load(int index, {required bool autoplay}) async {
     if (_switching || widget.episodes.isEmpty) return;
+    _systemResumeIndex = null;
     _switching = true;
     // messenger 要等首个 await 之后再取：initState 的同步前缀里
     // dependOnInheritedWidget 会触发框架断言。
@@ -198,18 +262,7 @@ class _ListenModePageState extends State<ListenModePage>
       // 继续指向已释放的句柄，播放按钮可点却静默无响应。
       final previous = _player;
       _player = null;
-      // 后台换集时旧播放器 dispose 偶发超时（日志里有 TimeoutException）；
-      // 直接 await 会把整条换集链吞进 catch，新播放器根本没建起来，于是
-      // 静音卡住、回到前台才继续。释放照常发起，但不再阻塞新集起播。
-      if (previous != null) {
-        unawaited(Future<void>(() async {
-          try {
-            await previous.dispose().timeout(const Duration(seconds: 3));
-          } catch (_) {
-            // 旧实例释放失败不能阻断本集接管音频会话。
-          }
-        }));
-      }
+      await previous?.dispose();
       NativePlayer? created;
       try {
         final player =
@@ -222,6 +275,14 @@ class _ListenModePageState extends State<ListenModePage>
         _completedSub = player.completedStream.listen((completed) {
           if (completed) _onEpisodeEnded();
         });
+        _playingSub?.cancel();
+        if (isLinuxDesktop) {
+          _playingSub = player.playingStream.listen((_) {
+            if (mounted && !_switching && identical(player, _player)) {
+              unawaited(_startForeground());
+            }
+          });
+        }
         _positionSub?.cancel();
         _positionSub = player.positionStream.listen((position) {
           if (mounted && !_switching) _position.value = position;
@@ -263,6 +324,8 @@ class _ListenModePageState extends State<ListenModePage>
   }
 
   Future<void> _togglePlay() async {
+    if (isLinuxDesktop) NativePlayer.claimRemoteOwner(_mediaOwner);
+    _systemResumeIndex = null;
     final player = _player;
     if (player == null) return;
     if (player.playWhenReady) {
@@ -281,18 +344,26 @@ class _ListenModePageState extends State<ListenModePage>
     await _load(target, autoplay: true);
   }
 
-  Future<void> _startForeground() {
+  Future<void> _startForeground({bool seeked = false}) {
     if (!isIOSPlatform &&
+        !isLinuxDesktop &&
         !AudioPreferences.instance.backgroundPlayback.value) {
       return _stopForeground();
     }
     final player = _player;
     return NativePlayer.startListenForeground(
+      owner: _mediaOwner,
+      seeked: seeked,
+      linuxPlayerId: player?.playerId,
+      minimumRate: 0.75,
+      maximumRate: 2,
       title: widget.seriesTitle,
       episode: _episodeTitle(_index),
       // 通知左上角与系统媒体卡片显示的就是这张封面（对齐官方）。
       coverUrl: widget.coverUrl,
-      playing: player?.playWhenReady ?? true,
+      playing: isLinuxDesktop
+          ? (player?.playing ?? false) && (player?.playWhenReady ?? false)
+          : player?.playWhenReady ?? true,
       hasPrev: _index > 0,
       hasNext: _index < widget.episodes.length - 1,
       // 位置 + 倍速交给系统外推；总时长决定媒体卡片两侧的时间。
@@ -302,19 +373,37 @@ class _ListenModePageState extends State<ListenModePage>
     );
   }
 
-  Future<void> _stopForeground() => NativePlayer.stopListenForeground();
+  Future<void> _stopForeground() =>
+      NativePlayer.stopListenForeground(owner: _mediaOwner);
+
+  Future<void> _remoteSeek(int ms) async {
+    final player = _player;
+    if (player == null || player.duration.inMilliseconds <= 0) return;
+    await _seekTo(ms / player.duration.inMilliseconds);
+  }
+
+  int _seekGeneration = 0;
 
   Future<void> _seekTo(double value) async {
     final player = _player;
     if (player == null || player.duration.inMilliseconds <= 0) return;
+    final chapter = _index;
+    final generation = ++_seekGeneration;
     final target = Duration(
       milliseconds: (value * player.duration.inMilliseconds).round(),
     );
     // 拖动结束才走到这里：先把滑块钉在目标位置，等位置流回填。
     _position.value = target;
     await player.seek(target);
-    if (!mounted) return;
-    await _startForeground();
+    if (!mounted ||
+        _popped ||
+        !identical(player, _player) ||
+        chapter != _index ||
+        generation != _seekGeneration ||
+        !NativePlayer.ownsRemoteOwner(_mediaOwner)) {
+      return;
+    }
+    await _startForeground(seeked: true);
   }
 
   void _exitWithResult() =>
