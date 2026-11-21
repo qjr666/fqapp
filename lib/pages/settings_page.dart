@@ -13,15 +13,16 @@
 //   `setting_menu.dart` / `glass_controls.dart`.
 // - Upstream items fqapp does not have (force portrait, start page, combined
 //   shelf, language, fonts, dictionaries, lane sync, widgets, frame rate,
-//   low-performance mode, haptics) are intentionally absent, per the product
+//   low-performance mode) are intentionally absent, per the product
 //   boundary: "do not add upstream settings fqapp lacks".
+// - Haptics use fqapp's app-wide preference, shared by both UI styles (#303).
 // - Windows keeps the existing two-pane `DesktopSettingsBody` inside the
 //   archive shell so the desktop settings workflow is unchanged.
 
 import 'dart:async';
 
-import 'package:flutter/cupertino.dart';
-import 'package:flutter/material.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -30,60 +31,107 @@ import '../services/app_theme_style.dart';
 import '../services/app_style_tokens.dart';
 import '../services/audio_preferences.dart';
 import '../services/desktop_platform.dart';
+import '../services/linux_platform.dart' show isLinuxDesktop;
 import '../services/native_player.dart';
-import '../services/notification_permission.dart';
 import '../services/player_layout_preferences.dart';
 import '../services/player_preferences.dart';
 import '../services/book_open_preferences.dart';
+import '../services/notification_permission.dart';
+import '../services/boss_key_preferences.dart';
 import '../services/drama_mute_preferences.dart';
+import '../services/haptic_preferences.dart';
 import '../services/library_store.dart';
 import '../widgets/desktop_settings_body.dart';
+import '../widgets/desktop_shell_scope.dart';
+import '../widgets/home/home_design.dart';
 import '../widgets/settings/settings_archive_rows.dart';
 import '../widgets/settings/settings_widgets.dart';
 import '../widgets/settings/classic_settings_icons.dart';
 import '../widgets/wenku/wenku_ui.dart';
 import 'about_page.dart';
 import 'api_service_page.dart';
+import 'boss_key_settings_page.dart';
 import 'cached_books_page.dart';
 import 'cached_dramas_page.dart';
 import 'library_backup_page.dart';
+import 'multi_device_sync_page.dart';
 import 'settings_category_page.dart';
 import 'system_tts_settings_page.dart';
 import 'text_replacement_page.dart';
 import 'theme_page.dart';
+import 'reader_preferences_page.dart';
 import 'ai_reading/settings/ai_settings_page.dart';
 
 /// Settings home: a list of category entries (PiliPlus multi-level
 /// navigation). Each category opens its own archive option page.
-class SettingsPage extends StatelessWidget {
+class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  @override
+  void initState() {
+    super.initState();
+    if (isWindowsDesktop) DesktopShellState.enterSettings();
+  }
+
+  @override
+  void dispose() {
+    if (isWindowsDesktop) DesktopShellState.exitSettings();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     // 开关读的是 ValueNotifier：先把持久化的值读出来，读到后自动重绘。
     unawaited(BookOpenPreferences.instance.load());
+    if (!isMediaDesktop) return _buildContent(context);
+    unawaited(BossKeyPreferences.instance.load());
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        BossKeyPreferences.instance.enabled,
+        BossKeyPreferences.instance.shortcut,
+      ]),
+      builder: (context, _) => _buildContent(context),
+    );
+  }
+
+  Widget _buildContent(BuildContext context) {
     final style = AppStyleTokens.of(context);
+    final bossKeyPrefs = BossKeyPreferences.instance;
+    final bossKeyValue = bossKeyPrefs.enabled.value
+        ? bossKeyPrefs.shortcut.value.formatLabel()
+        : '已关闭';
     final categories = <SettingsCategory>[
       SettingsCategory(
         icon: SettingsCategoryIcons.appearance,
         title: '外观',
-        subtitle: '主题模式、OLED 纯黑、播放页布局',
+        subtitle: isMediaDesktop
+            ? '主题模式、OLED 纯黑'
+            : HapticPreferences.supported
+            ? '主题模式、振动反馈、播放页布局'
+            : '主题模式、OLED 纯黑、播放页布局',
         // 用 builder 而不是固定 items：切到深色 / 切回浅色后，分类页重建
         // 时会重新判定，OLED 行不必退出重进就能出现或消失。
-        // 播放页布局只在手机端有效（Windows 由 DesktopVideoChrome 承担）。
+        // 播放页布局只在手机端有效（Windows/Linux 由桌面播放器承担）。
         itemsBuilder: (context) => [
           _themeModeItem(),
+          if (HapticPreferences.supported) _hapticsItem(),
           if (isDarkAppearance(
             systemBrightness: MediaQuery.platformBrightnessOf(context),
           ))
             _oledModeItem(),
-          if (!isWindowsDesktop) _playerLayoutItem(),
+          if (!isMediaDesktop) _playerLayoutItem(),
         ],
       ),
       SettingsCategory(
         icon: CupertinoIcons.paintbrush,
         title: '主题',
         subtitle: '经典主题、档案主题',
+        value: AppThemeStyleStore.instance.value.label,
         pageBuilder: (_) => const ThemePage(),
         items: const [],
       ),
@@ -92,6 +140,15 @@ class SettingsPage extends StatelessWidget {
         title: '阅读',
         subtitle: '阅读入口、正文替换、AI 阅读优化',
         items: [
+          SettingsItem(
+            icon: LucideIcons.book_open_check,
+            title: '小说阅读器',
+            subtitle: '阅读背景、翻页、字体与版面',
+            onTap: (context, _) => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const ReaderPreferencesPage()),
+            ),
+          ),
           _openDetailFirstItem(),
           _shelfDirectReaderItem(),
           _discoverDirectReaderItem(),
@@ -121,9 +178,9 @@ class SettingsPage extends StatelessWidget {
         subtitle: '后台播放、通知栏控制与系统朗读',
         items: [
           _backgroundAudioItem(),
-          if (!isWindowsDesktop) _audioRateEngineItem(),
-          if (!isWindowsDesktop) _mixWithOthersItem(),
-          if (!isWindowsDesktop) _notificationPermissionItem(),
+          if (!isMediaDesktop) _audioRateEngineItem(),
+          if (!isMediaDesktop) _mixWithOthersItem(),
+          if (!isMediaDesktop) _notificationPermissionItem(),
           SettingsItem(
             icon: CupertinoIcons.mic,
             title: '系统朗读',
@@ -135,21 +192,40 @@ class SettingsPage extends StatelessWidget {
           ),
         ],
       ),
-      SettingsCategory(
-        icon: SettingsCategoryIcons.drama,
-        title: '短剧',
-        subtitle: '播放',
-        items: [
-          _muteWhenColdStartItem(),
-          if (!isWindowsDesktop) _floatingWindowItem(),
-          if (!isWindowsDesktop) _videoDecoderItem(),
-        ],
-      ),
+      if (!isLinuxDesktop)
+        SettingsCategory(
+          icon: SettingsCategoryIcons.drama,
+          title: '短剧',
+          subtitle: '播放',
+          items: [
+            _muteWhenColdStartItem(),
+            if (!isMediaDesktop) _floatingWindowItem(),
+            if (!isMediaDesktop) _videoDecoderItem(),
+          ],
+        ),
+      if (isMediaDesktop)
+        SettingsCategory(
+          icon: SettingsCategoryIcons.bossKey,
+          title: '老板键',
+          subtitle: '全局快捷键隐藏窗口并暂停播放',
+          value: bossKeyValue,
+          pageBuilder: (_) => const BossKeySettingsPage(),
+          items: const [],
+        ),
       SettingsCategory(
         icon: SettingsCategoryIcons.data,
         title: '数据',
-        subtitle: '备份与恢复、缓存、阅读与播放历史',
+        subtitle: '多端同步、备份与恢复、缓存与历史',
         items: [
+          SettingsItem(
+            icon: Icons.sync,
+            title: '多端同步',
+            subtitle: '仅同步番茄收藏、阅读播放记录和已看剧集',
+            onTap: (context, _) => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const MultiDeviceSyncPage()),
+            ),
+          ),
           SettingsItem(
             icon: CupertinoIcons.folder,
             title: '备份与导入',
@@ -171,7 +247,7 @@ class SettingsPage extends StatelessWidget {
           SettingsItem(
             icon: CupertinoIcons.play_rectangle,
             title: '短剧离线缓存',
-            subtitle: '短剧下载、离线播放和清理缓存',
+            subtitle: isLinuxDesktop ? '管理已下载文件和下载任务' : '短剧下载、离线播放和清理缓存',
             onTap: (context, _) => Navigator.push(
               context,
               MaterialPageRoute(builder: (_) => const CachedDramasPage()),
@@ -199,21 +275,13 @@ class SettingsPage extends StatelessWidget {
     // Keep the desktop body at one element path while switching themes: its
     // nested Navigator owns the theme picker and must not be recreated mid-tap.
     if (isWindowsDesktop) {
-      return WenkuPage(
-        header: _header(context),
-        child: Padding(
-          padding: EdgeInsets.only(
-            top:
-                MediaQuery.paddingOf(context).top + FrostedHeader.toolbarHeight,
-          ),
-          child: DesktopSettingsBody(
-            categories: style.isClassic
-                ? [
-                    for (final category in categories)
-                      _classicCategory(category),
-                  ]
-                : categories,
-          ),
+      final palette = HomePalette.of(context);
+      return Scaffold(
+        backgroundColor: palette.canvas,
+        body: DesktopSettingsBody(
+          categories: style.isClassic
+              ? [for (final category in categories) _classicCategory(category)]
+              : categories,
         ),
       );
     }
@@ -239,6 +307,7 @@ class SettingsPage extends StatelessWidget {
                     iconTile: true,
                     title: category.title,
                     subtitle: category.subtitle,
+                    value: category.value,
                     onTap: () => _openCategory(context, category),
                   ),
               ],
@@ -265,9 +334,10 @@ class SettingsPage extends StatelessWidget {
                   title: categories[index].title,
                   subtitle: categories[index].subtitle,
                   icon: categories[index].icon,
-                  trailing: categories[index].title == '主题'
-                      ? Text(AppThemeStyleStore.instance.value.label)
-                      : null,
+                  // The current theme is a value, not a control: it belongs
+                  // next to the chevron, and the chevron has to land in the
+                  // same place as every other row's.
+                  trailingText: categories[index].value,
                   onTap: () => _openCategory(context, categories[index]),
                 ),
               ],
@@ -283,6 +353,7 @@ class SettingsPage extends StatelessWidget {
         icon: classicSettingsIcon(category.title, category.icon),
         title: category.title,
         subtitle: category.subtitle,
+        value: category.value,
         items: category.items,
         itemsBuilder: category.itemsBuilder,
         pageBuilder: category.pageBuilder,
@@ -396,6 +467,29 @@ class SettingsPage extends StatelessWidget {
       }
     }
   }
+
+  SettingsItem _hapticsItem() => SettingsItem(
+    icon: CupertinoIcons.waveform,
+    title: '振动反馈',
+    rowBuilder: (context) => ValueListenableBuilder<bool>(
+      valueListenable: HapticPreferences.instance,
+      builder: (context, value, _) => SettingsToggleRow(
+        key: const ValueKey('settings-haptics'),
+        icon: CupertinoIcons.waveform,
+        title: '振动反馈',
+        description: '控制按钮、书架与播放手势的振动，不影响系统键盘',
+        value: value,
+        onChanged: (enabled) async {
+          final saved = await HapticPreferences.instance.setEnabled(enabled);
+          if (!saved && context.mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(const SnackBar(content: Text('未能完整应用或保存振动设置，请重试')));
+          }
+        },
+      ),
+    ),
+  );
 
   /// OLED 纯黑：画布纯黑省电，卡片 / 弹层保持近黑，靠描边撑住层次。
   /// 只在深色外观下显示（浅色 / 墨水屏没有可省的黑）。
@@ -513,29 +607,6 @@ class SettingsPage extends StatelessWidget {
     }
   }
 
-  /// 「书架点书先看详情页」：书架、阅读历史、收藏里点书时先打开详情页。
-  ///
-  /// 默认开。以前书架点书只有「直达阅读器」一条路（默认开），点开任何一本
-  /// 小说都会被抢在详情页前面顶进阅读器，简介、目录、评分一个都看不到；
-  /// 而首页/搜索的发现入口默认进详情页，于是同一个 App 里两处行为相反。
-  /// 详情页上本来就有「继续阅读 · 第N章」按钮，续读并不需要跳过详情页。
-  ///
-  /// 这条开关关掉后，才轮到下面的「书架点书直接进入阅读」生效。
-  SettingsItem _openDetailFirstItem() => SettingsItem(
-    icon: CupertinoIcons.book,
-    title: '书架点书先看详情页',
-    rowBuilder: (context) => ValueListenableBuilder<bool>(
-      valueListenable: BookOpenPreferences.instance.openDetailFirst,
-      builder: (context, value, _) => SettingsToggleRow(
-        icon: CupertinoIcons.book,
-        title: '书架点书先看详情页',
-        description: '在书架、阅读历史、收藏里点书时先打开小说详情页，再从详情页开始阅读',
-        value: value,
-        onChanged: (v) => BookOpenPreferences.instance.setOpenDetailFirst(v),
-      ),
-    ),
-  );
-
   /// 默认关＝现有行为（先进详情页）。听书/短剧与加载失败时仍停留在详情页。
   ///
   /// 书架的「我的书」和发现入口分成两条（issue #103）：书架里的书点开多半是
@@ -548,7 +619,7 @@ class SettingsPage extends StatelessWidget {
       builder: (context, value, _) => SettingsToggleRow(
         icon: CupertinoIcons.book,
         title: '书架点书直接进入阅读',
-        description: '在书架、阅读历史里点书时跳过详情页，接着上次进度读（需先关闭「书架点书先看详情页」）',
+        description: '在书架、阅读历史里点书时跳过详情页，接着上次进度读',
         value: value,
         onChanged: (v) => BookOpenPreferences.instance.setShelfDirectReader(v),
       ),
@@ -610,11 +681,30 @@ class SettingsPage extends StatelessWidget {
     ),
   );
 
-  /// 听书是否与其他应用的音频同时播放。
+  /// 「书架点书先看详情页」：书架、阅读历史、收藏里点书时先打开详情页。
   ///
-  /// 默认独占：听书出声时向系统申请音频焦点，别人的音乐自动暂停（iOS 走
-  /// playback 类别不带 mixWithOthers，Android 走 AUDIOFOCUS_GAIN）。打开后
-  /// 改成混播，两边各播各的。策略要推给原生才能生效，见 AudioMixPolicy。
+  /// 默认开。以前书架点书只有「直达阅读器」一条路（默认开），点开任何一本
+  /// 小说都会被抢在详情页前面顶进阅读器，简介、目录、评分一个都看不到；
+  /// 而首页/搜索的发现入口默认进详情页，于是同一个 App 里两处行为相反。
+  /// 详情页上本来就有「继续阅读 · 第N章」按钮，续读并不需要跳过详情页。
+  ///
+  /// 这条开关关掉后，才轮到下面的「书架点书直接进入阅读」生效。
+  SettingsItem _openDetailFirstItem() => SettingsItem(
+    icon: CupertinoIcons.book,
+    title: '书架点书先看详情页',
+    rowBuilder: (context) => ValueListenableBuilder<bool>(
+      valueListenable: BookOpenPreferences.instance.openDetailFirst,
+      builder: (context, value, _) => SettingsToggleRow(
+        icon: CupertinoIcons.book,
+        title: '书架点书先看详情页',
+        description: '在书架、阅读历史、收藏里点书时先打开小说详情页，再从详情页开始阅读',
+        value: value,
+        onChanged: (v) => BookOpenPreferences.instance.setOpenDetailFirst(v),
+      ),
+    ),
+  );
+
+  /// 是否与其他应用混播：关闭后听书独占音频，其它 App 的声音会被打断。
   SettingsItem _mixWithOthersItem() => SettingsItem(
     icon: CupertinoIcons.speaker_2,
     title: '允许与其他应用同时播放',
@@ -671,11 +761,6 @@ class SettingsPage extends StatelessWidget {
     ),
   );
 
-  /// 申请通知权限；已经被拒过（系统不会再弹）就直接带去系统设置页。
-  ///
-  /// [context] 由调用方传入：这个页面是 StatelessWidget，没有自己的
-  /// BuildContext，而 SnackBar 必须在 await 之前就把 messenger 取出来 ——
-  /// await 之后再用 context 会触发 `use_build_context_synchronously`。
   Future<void> _openNotificationSettings(BuildContext context) async {
     final messenger = ScaffoldMessenger.maybeOf(context);
     // 申请之前的状态：用来区分「刚被用户拒绝」与「早就是拒绝状态」。
@@ -693,6 +778,7 @@ class SettingsPage extends StatelessWidget {
   }
 
   // ── 短剧 ──────────────────────────────────────────────────────────────
+
   /// 官方设置项「开启应用时默认静音」（`GlobalMuteConfig` 标题，持久层
   /// `open_mute_when_cold_start`，默认 false＝有声起播）。
   SettingsItem _muteWhenColdStartItem() => SettingsItem(
