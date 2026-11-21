@@ -99,11 +99,15 @@ extension _ReaderPageListening on _ReaderPageState {
 
   /// 双向跟随的落定点：把音频跳到当前视口第一段。
   ///
+  /// [force] 给「用户明确换章」用：取章可能耗时几秒，[_takeOverListening] 的
+  /// 兜底计时器早就把标记清掉了，但这次跳章确实该跟，不能因为慢就放弃。
+  ///
   /// 只对「本书正在播」生效——不在播时翻页纯粹是在看书，不该把播放位置
   /// 悄悄拖走。找不到锚点（纯图片页、没时间轴的章）就什么都不做，交给原来
   /// 的 15 秒闩锁自动接回朗读处。
-  void _settlePageFollow() {
-    if (!_pageFollowPending || !mounted) return;
+  void _settlePageFollow({bool force = false}) {
+    if (!force && !_pageFollowPending) return;
+    if (!mounted) return;
     _pageFollowPending = false;
     _pageFollowSettleTimer?.cancel();
     _pageFollowSettleTimer = null;

@@ -436,7 +436,8 @@ extension _ReaderPageProgress on _ReaderPageState {
     ++_readerNavigationGeneration;
     if (_index <= 0 || _changingChapter) return;
     // 用户主动换章 = 不想被朗读拽回去，否则轮询 100ms 后又跳回正在播的那章。
-    _pauseListenFollow();
+    // 落定后由 `_settlePageFollow` 把音频带到新章，翻页/换章双向闭环。
+    _takeOverListening();
     _finishChapterPreview();
     _changingChapter = true;
     final completion = _chapterNavigationCompletion = Completer<void>();
@@ -456,7 +457,7 @@ extension _ReaderPageProgress on _ReaderPageState {
       completion.complete();
       // 换章也算一次「页面落定」：从目录/进度条/章末跳到另一章后，音频要
       // 跟到新章第一段，而不是停在上一个章的位置继续念。
-      _settlePageFollow();
+      _settlePageFollow(force: true);
     }
   }
 
@@ -467,8 +468,8 @@ extension _ReaderPageProgress on _ReaderPageState {
       _showMessage('已是最后一章');
       return;
     }
-    // 同 [_prev]：主动翻到下一章也要退出跟随。
-    _pauseListenFollow();
+    // 同 [_prev]：主动翻到下一章也要退出跟随，落定后音频跟到新章第一段。
+    _takeOverListening();
     _finishChapterPreview();
     _changingChapter = true;
     final completion = _chapterNavigationCompletion = Completer<void>();
@@ -485,7 +486,7 @@ extension _ReaderPageProgress on _ReaderPageState {
       completion.complete();
       // 换章也算一次「页面落定」：从目录/进度条/章末跳到另一章后，音频要
       // 跟到新章第一段，而不是停在上一个章的位置继续念。
-      _settlePageFollow();
+      _settlePageFollow(force: true);
     }
   }
 
@@ -495,7 +496,8 @@ extension _ReaderPageProgress on _ReaderPageState {
     int? navigationGeneration,
   }) async {
     if (!followListening) {
-      _pauseListenFollow();
+      // 目录/进度条/搜索跳章都是用户主动：先接管，落定后音频跟到新章。
+      _takeOverListening();
       if (navigationGeneration == null) ++_readerNavigationGeneration;
     }
     if (_changingChapter ||
@@ -540,7 +542,7 @@ extension _ReaderPageProgress on _ReaderPageState {
       completion.complete();
       // 换章也算一次「页面落定」：从目录/进度条/章末跳到另一章后，音频要
       // 跟到新章第一段，而不是停在上一个章的位置继续念。
-      _settlePageFollow();
+      _settlePageFollow(force: !followListening);
     }
   }
 
