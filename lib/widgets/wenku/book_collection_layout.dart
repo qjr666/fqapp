@@ -492,12 +492,12 @@ class BookCollectionView extends StatelessWidget {
       // Upstream: LibraryReflowScope.clipOf(context). No reflow scope exists
       // in fqapp, so the inactive-scope value applies.
       clipBehavior: Clip.hardEdge,
-      scrollCacheExtent: ScrollCacheExtent.pixels(
-        BookCollectionLayout.cacheExtentFor(
-          constraints.maxWidth - padding.horizontal,
-          base: 250,
-          grid: grid,
-        ),
+      // Upstream: `ScrollCacheExtent.pixels(...)`; this dependency set has no
+      // such type, so the equivalent numeric cache extent is passed instead.
+      cacheExtent: BookCollectionLayout.cacheExtentFor(
+        constraints.maxWidth - padding.horizontal,
+        base: 250,
+        grid: grid,
       ),
       slivers: [
         SliverPadding(

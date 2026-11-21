@@ -1,5 +1,6 @@
 import 'dart:async';
 import '../services/desktop_platform.dart';
+import '../services/ios_platform.dart';
 import '../services/linux_platform.dart';
 
 import 'package:material_ui/material_ui.dart';

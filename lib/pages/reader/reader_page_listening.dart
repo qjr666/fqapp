@@ -33,9 +33,49 @@ extension _ReaderPageListening on _ReaderPageState {
 
   void _pauseListenFollow() {
     _listenFollowPausedUntil = DateTime.now().add(const Duration(seconds: 15));
-    // 用户自己翻页 = 不想被拽回去，直接退出跟随。以前只暂停 15 秒，按钮还
-    // 显示「跟随中」，看着像坏了。
-    ListeningSession.instance.setFollowArmed(false);
+    // 用户自己翻页 = 不想被拽回去。记下「用户接管过」，闩锁到期后可以自动
+    // 恢复跟随；以前只暂停 15 秒，按钮还显示「跟随中」，看着像坏了。
+    _listenFollowTakeover = true;
+    // 接管前先记下当前播放态。下面的 [setFollowArmed] 会**同步**通知所有
+    // 监听者，阅读页的 tick 就在这条通知里重入一次 —— 它若还以为「刚恢复
+    // 播放」，就会把刚关掉的跟随立刻打开，翻页等于没翻。
+    final session = ListeningSession.instance;
+    _listenWasPlaying = session.playing && session.matchesBook(widget.bookId);
+    session.setFollowArmed(false);
+  }
+
+  /// 提示一次「正在播放的章节不在本书目录里」。
+  ///
+  /// 轮询是 10Hz，不限频的话会连着弹一串一模一样的提示。
+  void _showFollowChapterMissing() {
+    final now = DateTime.now();
+    if (now.difference(_followChapterMissingAt) < const Duration(seconds: 10)) {
+      return;
+    }
+    _followChapterMissingAt = now;
+    _showMessage('正在播放的章节不在本书目录里，无法跟随翻页');
+  }
+
+  /// 闩锁到期后的自愈：用户接管过、但音频一直在放 → 把跟随重新打开，
+  /// 并把页面拉回正在读的那一句。
+  ///
+  /// 官方的行为是「不自动恢复，等用户点原进度」（`AudioSyncReaderController`
+  /// `d.java:288-293`）。这里保留「接管后短时间内不抢」的手感（15 秒），
+  /// 但到期后自动接回 —— 否则一次拖动就让跟随永久死掉，用户既不知道也
+  /// 没有出口。
+  void _resumeListenFollowIfTakenOver() {
+    if (!_listenFollowTakeover) return;
+    // 「跟随翻页」是总闸：用户把它关掉了，就不许再自动接回 —— 否则开关看着
+    // 是关的，15 秒后页面又被拽回朗读处，开关等于没用。
+    if (!_preferences.listeningFollow) return;
+    if (DateTime.now().isBefore(_listenFollowPausedUntil)) return;
+    final session = ListeningSession.instance;
+    if (!session.playing || !session.matchesBook(widget.bookId)) return;
+    _listenFollowTakeover = false;
+    ListeningSession.instance.setFollowArmed(true);
+    // 重新接回之前先把页面挪到正在读的那一句，否则页面会先停在用户拖到的
+    // 地方，等下一次句子边界才跳过去，看着像卡住了。
+    _addressToPlayback(quiet: true);
   }
 
   /// 手动翻页 = 接管跟随：退出自动跟随并亮出「原进度 / 从本页听」。
@@ -106,7 +146,11 @@ extension _ReaderPageListening on _ReaderPageState {
     // Keep highlighting on the same sentence as _addressToPlayback. Upstream
     // paragraph coordinates are a fallback when no current cue can be mapped.
     _ensureCueIndex(layout);
-    if (_cueIndex.isNotEmpty) {
+    // 系统朗读没有音频时间轴：会话 position 恒为 0，阅读页为真人讲书预取
+    // 到的字幕表在这里查不到任何句子，索引非空却给不出锚点，句高亮与跟随
+    // 导航会一起变 null。系统朗读只认 sentenceRange 那条路。
+    final systemTts = session.textProgress != null && session.subtitles == null;
+    if (!systemTts && _cueIndex.isNotEmpty) {
       final span = _cueIndex.spanAtPositionMs(
         session.position.inMilliseconds + readAheadMs,
         crossCueHoldMs: crossCueHoldMs,
@@ -161,6 +205,8 @@ extension _ReaderPageListening on _ReaderPageState {
     if (next != _narrationRange) {
       _setState(() => _narrationRange = next);
     }
+    // 锚点只取**本拍**的结果，不做「保留上一拍」的延留：导航要的是当前位置。
+    _followAnchor = narration;
   }
 
   /// 把字幕的当前句映射到本章正文的字符区间（布局坐标）。
@@ -241,13 +287,17 @@ extension _ReaderPageListening on _ReaderPageState {
   /// 翻过页。
   void _followPollTick() {
     if (!mounted || !_routeCurrent || !_appActive) return;
-    // 跟随开关由迷你栏那个按钮管：关着就是自由翻页，什么都不做。
-    if (!ListeningSession.instance.followArmed) return;
-    // 设置里的「跟随翻页」是总闸，关掉就永不跟。
+    final session = ListeningSession.instance;
+    // 用户接管过、闩锁已过 → 重新接回跟随。这一步必须在下面的
+    // [followArmed] 闸门**之前**：接管时 followArmed 被清成了 false，
+    // 而 15 秒闩锁过期救不回来（那个检查排在后面，永远先卡在 followArmed）。
+    _resumeListenFollowIfTakenOver();
+    // 设置里的「跟随翻页」是总闸，关掉就永不跟。它必须排在 [followArmed]
+    // 前面：会话级闩锁由用户的手动操作控制，跟随总闸才是用户此刻的意图。
     if (!_preferences.listeningFollow) return;
+    if (!ListeningSession.instance.followArmed) return;
     // 工具条展开时不翻页（用户正在操作页面），自动翻页进行时也不抢。
     if (_controlsVisible || _autoTurnTimer != null) return;
-    final session = ListeningSession.instance;
     if (!session.playing) return;
     if (!session.matchesBook(widget.bookId)) return;
     if (_loading || _changingChapter || _error != null) return;
@@ -261,7 +311,13 @@ extension _ReaderPageListening on _ReaderPageState {
       final next = widget.chapters.indexWhere(
         (c) => c.itemId == session.readerChapterId,
       );
-      if (next >= 0) unawaited(_jumpToChapter(next, followListening: true));
+      if (next >= 0) {
+        unawaited(_jumpToChapter(next, followListening: true));
+      } else {
+        // 目标章不在本书目录里：原来这里静默放弃，用户完全看不出为什么
+        // 不跟着翻页。给一次提示（限频，避免每 100ms 弹一次）。
+        _showFollowChapterMissing();
+      }
       return;
     }
     // 跟随每 20 拍（≈2s）补一次落盘。
@@ -300,19 +356,24 @@ extension _ReaderPageListening on _ReaderPageState {
     }
     _ensureCueIndex(layout);
     final positionMs = session.position.inMilliseconds + readAheadMs;
-    final span = _cueIndex.spanAtPositionMs(
-      positionMs,
-      crossCueHoldMs: crossCueHoldMs,
-      currentRange: _narrationRange,
-    );
+    // 同上：系统朗读的 position 是 0，不能拿真人讲书的时间轴去查句子。
+    final systemTts = session.textProgress != null && session.subtitles == null;
+    final span = systemTts
+        ? null
+        : _cueIndex.spanAtPositionMs(
+            positionMs,
+            crossCueHoldMs: crossCueHoldMs,
+            currentRange: _narrationRange,
+          );
     // [_narrationRange] 是**显示**状态：某一拍没匹配上时故意留着不清，好让
     // 高亮晚半拍而不是整页变黑。它绝不能当导航锚点 —— 字幕第一句从 3 秒才
     // 开始（`[3025, 0]`）时，位置 0 查不到句，用它寻址会把页面停到本章最后
     // 一句上，而且再也回不来。只有整章没有字幕表（官方时间点是唯一锚点）时
-    // 才退回它。
+    // 才退回 [_followAnchor] —— 它不受「朗读句高亮」偏好影响，所以关掉高亮
+    // 不会连带让跟随失去锚点。
     final offset =
         span?.spokenOffset(positionMs) ??
-        (_cueIndex.isEmpty ? _narrationRange?.$1 : null);
+        (systemTts || _cueIndex.isEmpty ? _followAnchor?.$1 : null);
     if (offset == null) {
       if (!quiet) _showMessage('找不到当前朗读句');
       return false;
@@ -373,6 +434,46 @@ extension _ReaderPageListening on _ReaderPageState {
   void _returnToOriginalProgress() {
     ListeningSession.instance.setFollowArmed(true);
     _jumpToPlaybackPosition();
+  }
+
+  /// 重新打开跟随（受「跟随翻页」总闸约束）。
+  ///
+  /// 所有「把跟随打开」的动作都要走这里：会话级的 [ListeningSession.followArmed]
+  /// 是被用户手动操作清掉的一次性闩锁，而偏好才是用户此刻的意图 —— 偏好关着
+  /// 的时候，任何路径都不许把它打开。
+  void _rearmListenFollow() {
+    if (!_preferences.listeningFollow) return;
+    ListeningSession.instance.setFollowArmed(true);
+  }
+
+  /// 「跟随翻页」总闸被切换时的收口。
+  ///
+  /// 打开时必须把跟随**真正启动**起来：只放开偏好没用 ——
+  /// [ListeningSession.followArmed] 这道会话闩锁可能早就被用户手动翻页清成了
+  /// false（那正是「开关打开但页面不跟随」的由来，看着就是开关无效）。
+  /// 所以这里同时清掉 15 秒闩锁、重新 arm 跟随，并把页面立刻拉到正在读的那
+  /// 一句。
+  ///
+  /// 关闭时反向做：把会话闩锁也清掉，否则 15 秒后
+  /// [_resumeListenFollowIfTakenOver] 会把跟随接回来 —— 用户明明关了跟随，
+  /// 页面却又被拽走。
+  void _applyListeningFollowToggle(bool enabled) {
+    final session = ListeningSession.instance;
+    if (!enabled) {
+      session.setFollowArmed(false);
+      _listenFollowTakeover = false;
+      _followPoll.sync();
+      return;
+    }
+    _listenFollowPausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    _listenFollowTakeover = false;
+    if (session.playing && session.matchesBook(widget.bookId)) {
+      session.setFollowArmed(true);
+      // 立刻归位到正在读的那一句：否则页面还停在用户拖走的地方，要等下一次
+      // 轮询（最多 100ms）才跳过去，看着像开关没生效。
+      _addressToPlayback(quiet: true);
+    }
+    _followPoll.sync();
   }
 
   /// 双击正文：跳到**点中段落**的段首（官方行为），可以跨章。

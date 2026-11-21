@@ -288,8 +288,7 @@ class NativeLogSource {
   /// `# fqapp native log | build <version> (<build>) | bundle <id>`。
   static String buildInfo(String? text) {
     if (text == null) return '未知（无原生日志）';
-    for (final line in text.split('
-').reversed) {
+    for (final line in text.split('\n').reversed) {
       if (line.startsWith('# fqapp native log | build ')) {
         return line.substring(2).trim();
       }

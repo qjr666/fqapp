@@ -435,9 +435,6 @@ extension _ReaderPageProgress on _ReaderPageState {
     _pauseListenFollow();
     _finishChapterPreview();
     _changingChapter = true;
-    // 跟随触发的切章要记一笔：拼接模式跨章时靠它区分「用户滚过去的」与
-    // 「跟随带过去的」，后者不能退出跟随。
-    if (followListening) _followChapterJump = true;
     final completion = _chapterNavigationCompletion = Completer<void>();
     try {
       _settleReadTime();
@@ -498,6 +495,9 @@ extension _ReaderPageProgress on _ReaderPageState {
       return;
     }
     _changingChapter = true;
+    // 跟随触发的切章要记一笔：拼接模式跨章时靠它区分「用户滚过去的」与
+    // 「跟随带过去的」，后者不能退出跟随。
+    if (followListening) _followChapterJump = true;
     final completion = _chapterNavigationCompletion = Completer<void>();
     try {
       // 闸门要排在结算/存盘**前面**：被闩锁挡住的这次跟随切章什么都没做，

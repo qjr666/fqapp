@@ -1,6 +1,7 @@
 import 'platform_channel.dart';
 import 'desktop_platform.dart';
 import 'linux_platform.dart';
+import 'ios_platform.dart';
 import 'dart:async';
 
 import 'package:flutter/services.dart';

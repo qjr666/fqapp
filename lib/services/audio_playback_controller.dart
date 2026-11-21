@@ -598,8 +598,8 @@ class _AudioPlaybackController extends ChangeNotifier
       // 若后台听书开关关闭，切后台自动暂停播放并移除前台通知。
       // iOS 由系统 Now Playing 会话接管，切后台不停、不撤卡片。
       if (!isIOSPlatform &&
-      if (!AudioPreferences.instance.backgroundPlayback.value ||
-          (isLinuxDesktop && DesktopSystemSession.instance.suspended)) {
+          (!AudioPreferences.instance.backgroundPlayback.value ||
+              (isLinuxDesktop && DesktopSystemSession.instance.suspended))) {
         _cancelAdvanceCountdown(this);
         if (_wantPlay) {
           final resume = isLinuxDesktop;

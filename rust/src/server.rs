@@ -243,9 +243,8 @@ async fn handle_request(state: AppState, req: axum::extract::Request) -> Respons
     // Reads answer any local client: external readers (Legado book sources,
     // local tooling) cannot know the per-launch capability. Device-bound
     // writes still need it.
-    let capability_ok = scoped.is_some()
-        || bearer == Some(format!("Bearer {}", state.token).as_str())
-        || cookie_ok;
+    let capability_ok =
+        scoped.is_some() || bearer == Some(format!("Bearer {}", state.token).as_str()) || cookie_ok;
     if !capability_ok && crate::dispatch::requires_capability(&request_path) {
         return refuse(StatusCode::UNAUTHORIZED, "session required");
     }
