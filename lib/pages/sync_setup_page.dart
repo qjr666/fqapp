@@ -426,16 +426,19 @@ class _SyncSetupPageState extends State<SyncSetupPage> {
                         onPressed: busy ? null : () => run(connect),
                         child: const Text('使用已有登录继续'),
                       ),
-                    TextButton(
-                      onPressed: busy
-                          ? null
-                          : () => setState(() {
-                              manual = true;
-                              step = 1;
-                              error = null;
-                            }),
-                      child: const Text('使用已有 Token'),
-                    ),
+                    // 夸克的凭据是一整份 JSON，没有可以手输的单一 Token：
+                    // 这条路进去只会建出一个没有 fid 的会话，直接收起来。
+                    if (provider != 'quark')
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () => setState(() {
+                                manual = true;
+                                step = 1;
+                                error = null;
+                              }),
+                        child: const Text('使用已有 Token'),
+                      ),
                   ],
                 ] else if (step == 1) ...[
                   if (manual && session == null) ...[
