@@ -33,6 +33,7 @@
 
 import 'dart:math' as math;
 
+import 'package:flutter/widgets.dart' show ScrollCacheExtent;
 import 'package:material_ui/material_ui.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart' as easy;
 
@@ -492,12 +493,12 @@ class BookCollectionView extends StatelessWidget {
       // Upstream: LibraryReflowScope.clipOf(context). No reflow scope exists
       // in fqapp, so the inactive-scope value applies.
       clipBehavior: Clip.hardEdge,
-      // Upstream: `ScrollCacheExtent.pixels(...)`; this dependency set has no
-      // such type, so the equivalent numeric cache extent is passed instead.
-      cacheExtent: BookCollectionLayout.cacheExtentFor(
-        constraints.maxWidth - padding.horizontal,
-        base: 250,
-        grid: grid,
+      scrollCacheExtent: ScrollCacheExtent.pixels(
+        BookCollectionLayout.cacheExtentFor(
+          constraints.maxWidth - padding.horizontal,
+          base: 250,
+          grid: grid,
+        ),
       ),
       slivers: [
         SliverPadding(

@@ -167,7 +167,11 @@ fn fetch(url: &str) -> Vec<u8> {
 fn assert_media(root: &std::path::Path, url: &str, expected: &[u8]) {
     let path = root.join("video.part");
     run(crate::endpoints::video::stream_download_to_file_with_cap(
-        url, "test", &path, 1024,
+        url,
+        "test",
+        &path,
+        1024,
+        Duration::from_secs(120),
     ))
     .unwrap();
     assert_eq!(
@@ -436,7 +440,8 @@ fn unified_network_policy() {
             &origin.url,
             "test",
             &root.join("failed.part"),
-            1024
+            1024,
+            Duration::from_secs(120),
         ))
         .is_err()
     );
