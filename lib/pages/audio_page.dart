@@ -5,6 +5,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
 import '../models/audio_extra.dart';
@@ -283,6 +284,17 @@ class _AudioPageState extends State<AudioPage> {
 
   static const int _expandedTextCacheLimit = 3;
 
+  /// 听书播放器是**竖屏专属**版式：横过来只剩一条窄带，进度条、控制行和
+  /// 换版本行会挤成好几层。这里强制竖屏，离开本页必须还原 ——
+  /// `SystemChrome.setPreferredOrientations` 是引擎级设置，不随路由释放，
+  /// 还原用空列表交回系统，否则后面的阅读页（允许横屏）与视频页会被一起锁死。
+  bool _portraitPinned = false;
+
+  /// 本页被别的路由盖住时暂时交还方向（如「边听边读」打开的阅读页）。
+  bool _portraitSuspended = false;
+  Animation<double>? _coverAnimation;
+  bool _routeCovered = false;
+
   _AudioPlaybackController get c => _session!;
 
   void _syncCoverTheme() {
@@ -308,6 +320,8 @@ class _AudioPageState extends State<AudioPage> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     AudioFloatingRouteScope.configure(context, hidden: true);
+    _pinPortrait();
+    _syncRouteListener();
     if (!_attaching) {
       _attaching = true;
       _owner = context.findAncestorStateOfType<_AudioPlaybackScopeState>();
@@ -320,6 +334,62 @@ class _AudioPageState extends State<AudioPage> {
       // 时才给弹框，问过（允许或拒绝）都不再弹。
       unawaited(NotificationPermission.instance.requestIfUndetermined());
     }
+  }
+
+  /// 锁定竖屏。桌面窗口没有设备方向，直接跳过。
+  void _pinPortrait() {
+    if (isMediaDesktop || _portraitPinned || _portraitSuspended) return;
+    _portraitPinned = true;
+    unawaited(_applyOrientation(const [DeviceOrientation.portraitUp]));
+  }
+
+  /// 交还方向控制权：被上层路由盖住、或本页被 pop 时调用。
+  ///
+  /// 没钉过就不动：上层路由此刻可能正持有自己的方向锁，清空会把别人一起解开。
+  void _releaseOrientation() {
+    if (!_portraitPinned) return;
+    _portraitPinned = false;
+    unawaited(_applyOrientation(const <DeviceOrientation>[]));
+  }
+
+  /// 下发方向限制。宿主不支持时静默忽略 —— 方向锁不能反过来挡住播放。
+  Future<void> _applyOrientation(List<DeviceOrientation> orientations) async {
+    try {
+      await SystemChrome.setPreferredOrientations(orientations);
+    } catch (_) {
+      // 桌面端 / 测试宿主没有方向通道，忽略。
+    }
+  }
+
+  /// 「本页被别的路由盖住」用本路由的 `secondaryAnimation` 判断：不引入
+  /// 全局 RouteObserver，测试里的裸 MaterialApp 也能生效。
+  ///
+  /// 阅读页（边听边读）自己会按偏好锁方向，被听书页的竖屏锁压着就转不过
+  /// 去；回到听书页时必须重新钉回竖屏。
+  void _syncRouteListener() {
+    final animation = ModalRoute.of(context)?.secondaryAnimation;
+    if (identical(animation, _coverAnimation)) return;
+    _coverAnimation?.removeListener(_handleCoverChanged);
+    _coverAnimation = animation;
+    _coverAnimation?.addListener(_handleCoverChanged);
+    _handleCoverChanged();
+  }
+
+  void _handleCoverChanged() {
+    final animation = _coverAnimation;
+    if (animation == null) return;
+    final covered = animation.value > 0;
+    if (covered == _routeCovered) return;
+    _routeCovered = covered;
+    if (covered) {
+      if (!_portraitPinned) return;
+      _portraitSuspended = true;
+      _releaseOrientation();
+      return;
+    }
+    if (!_portraitSuspended) return;
+    _portraitSuspended = false;
+    _pinPortrait();
   }
 
   Future<void> _attach() async {
@@ -455,6 +525,9 @@ class _AudioPageState extends State<AudioPage> {
 
   @override
   void dispose() {
+    _coverAnimation?.removeListener(_handleCoverChanged);
+    _coverAnimation = null;
+    _releaseOrientation();
     final session = _session;
     session?.removeListener(_changed);
     session?._readAlong.removeListener(_onReadAlongChanged);

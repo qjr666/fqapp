@@ -3,6 +3,8 @@ import 'widgets/desktop_app_frame.dart';
 import 'widgets/desktop_shell_scope.dart';
 import 'services/native_player.dart';
 import 'services/desktop_platform.dart';
+import 'services/ios_platform.dart';
+import 'services/notification_permission.dart';
 import 'services/platform_capabilities.dart';
 import 'services/platform_channel.dart';
 
@@ -113,6 +115,15 @@ Future<void> _prepareRuntime() async {
   });
   if (isLinuxDesktop) await LinuxPlatform.install();
   if (isWindowsDesktop) await DesktopPlatform.instance.initialize();
+  // iOS 的 media_kit / flutter_tts 进程内适配器必须在 runApp 之前装好，
+  // 否则 native_player / system_tts / audio_mix 会落到真通道并抛
+  // MissingPluginException —— 表现就是听书与智能朗读全都播不出来。
+  if (isIOSPlatform) await IosPlatform.instance.initialize();
+  // iOS 的通知栏权限必须由应用**主动**申请：UNUserNotificationCenter 不会
+  // 自己弹框。冷启动问一次，问过就不再打扰（Android 在起播时顺带申请）。
+  if (isIOSPlatform) {
+    unawaited(NotificationPermission.instance.requestIfUndetermined());
+  }
   // 应用内日志：接管 debugPrint 与 FlutterError.onError，未处理异步异常由
   // [main] 的 runZonedGuarded 捕获；文件持久化异步开启，失败只退回内存模式。
   AppLog.instance.install();
