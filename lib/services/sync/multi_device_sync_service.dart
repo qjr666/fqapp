@@ -2,8 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'package:crypto/crypto.dart';
-import 'package:flutter/foundation.dart'
-    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:hive_ce/hive.dart';
@@ -41,15 +39,14 @@ class SyncProvider {
   const SyncProvider(this.id, this.title, this.help);
   final String id, title, help;
   bool get available =>
-      id == 'webdav' ||
-      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+      id == 'webdav' || id == 'quark' || nativeAndroidCloudSync;
   static const values = [
     SyncProvider('webdav', 'WebDAV', '连接 WebDAV 服务并选择同步目录。'),
     SyncProvider('ali', '阿里云盘', '官方手机网页登录，使用网页授权凭据直接读写，支持刷新令牌；登录后可验证持续同步。'),
     SyncProvider(
       'quark',
       '夸克网盘',
-      '官方客户端授权，无需粘贴授权码，授权后返回本应用。固定快照通过双区轮换替换；夸克回收站可能保留旧快照。',
+      '官方网页授权：在浏览器登录并点「授权」即可，无需粘贴授权码。固定快照通过双区轮换替换；夸克回收站可能保留旧快照。',
     ),
     SyncProvider('tianyi', '天翼云盘', '官方手机网页登录，使用覆盖提交保存固定快照。'),
     SyncProvider('mobile139', '中国移动云盘', '官方手机网页登录，登录后可运行持续同步验证。'),

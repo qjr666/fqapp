@@ -340,6 +340,20 @@ extension _ReaderPageListeningLaunch on _ReaderPageState {
     if (layout == null || layout.pages.isEmpty) {
       return (startMs: null, textId: null);
     }
+    // 滚动模式没有「页」：[ReaderChapterLayout.pages] 是进入本章时算好的排版
+    // 网格，`_pageIndex` 之后不再更新（滚动只改 `_textOffset`）。继续按
+    // `_pageIndex` 取锚点，等于永远取章首那一页 —— 这正是「点听书从章首播」
+    // 和「翻页后音频不跟」在滚动模式下的共同来源。改用视口首行所在的正文段。
+    if (!_paged) {
+      final offset = _textOffset.clamp(0, layout.textLength);
+      for (final block in layout.blocks) {
+        if (block.isTitle || block.isImage || block.text.isEmpty) continue;
+        if (offset < block.start + block.text.length) {
+          return (startMs: block.startMs, textId: block.textId);
+        }
+      }
+      return (startMs: null, textId: null);
+    }
     final page = layout.pages[_pageIndex.clamp(0, layout.pages.length - 1)];
     ({int? startMs, int? textId})? carried;
     for (final fragment in page.fragments) {

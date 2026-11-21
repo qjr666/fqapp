@@ -2,6 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
+import 'quark_sync_transport.dart';
 import 'sync_document.dart';
 import 'sync_folder_name.dart';
 import 'sync_transport.dart';
@@ -11,6 +14,14 @@ import 'package:flutter/services.dart';
 
 typedef SaveSyncCredentials =
     Future<void> Function(Map<String, String> updates);
+
+/// 云端登录与传输是否必须走 Android 原生通道。
+///
+/// 阿里/天翼/移动/微云的凭据都靠 `CloudLoginActivity` 在 WebView 里抓 Cookie，
+/// 只有 Android 有这条链路；夸克改用官方 agent API 后不再需要它。
+bool get nativeAndroidCloudSync =>
+    !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
 SyncTransport createCloudSyncTransport(
   Map<String, String> config,
   SaveSyncCredentials save,
@@ -21,6 +32,11 @@ SyncTransport createCloudSyncTransport(
     case 'ali':
       return AliSyncTransport(config, save);
     case 'quark':
+      // Android 上继续用已经稳定的原生实现（含 WebView 登录）；其它平台
+      // 走纯 Dart 的 agent API，两条路共用同一份凭据 JSON。
+      return nativeAndroidCloudSync
+          ? AndroidCloudSyncTransport(config, save)
+          : QuarkSyncTransport(config, save);
     case 'tianyi':
     case 'mobile139':
       return AndroidCloudSyncTransport(config, save);

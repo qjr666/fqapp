@@ -78,13 +78,70 @@ extension _ReaderPageListening on _ReaderPageState {
     _addressToPlayback(quiet: true);
   }
 
-  /// 手动翻页 = 接管跟随：退出自动跟随并亮出「原进度 / 从本页听」。
+  /// 手动翻页 = 接管跟随，并在页面落定后把音频跟到本页第一段（双向）。
   ///
   /// 官方 `handlePlayWhenPageChange`（`AudioSyncReaderController.java:1242-1295`）
-  /// 在同章翻页时还会 `pausePlayer()`；这里**刻意不暂停** —— 边翻边听不打断，
-  /// 双击跳读随时可用；要回同步点点「原进度」。
+  /// 在同章翻页时还会 `pausePlayer()`；这里**刻意不暂停** —— 边翻边听不打断。
+  ///
+  /// 与官方不同的是方向：官方只让音频推着页面走，用户翻页就判定「脱钩」；
+  /// 这里翻页反过来推音频，翻完接着跟，形成闭环。代价是必须等页面真的翻
+  /// 过去才能取锚点，所以只置标记，落定处再消费。
   void _takeOverListening() {
     _pauseListenFollow();
+    _pageFollowPending = true;
+    _pageFollowSettleTimer?.cancel();
+    // 2 秒兜底：翻页被闸门挡掉（正在换章、还没排版好）时不会有落定事件，
+    // 标记留着会让一次迟到的翻页把播放器跳到别的章。
+    _pageFollowSettleTimer = Timer(const Duration(seconds: 2), () {
+      _pageFollowPending = false;
+    });
+  }
+
+  /// 双向跟随的落定点：把音频跳到当前视口第一段。
+  ///
+  /// 只对「本书正在播」生效——不在播时翻页纯粹是在看书，不该把播放位置
+  /// 悄悄拖走。找不到锚点（纯图片页、没时间轴的章）就什么都不做，交给原来
+  /// 的 15 秒闩锁自动接回朗读处。
+  void _settlePageFollow() {
+    if (!_pageFollowPending || !mounted) return;
+    _pageFollowPending = false;
+    _pageFollowSettleTimer?.cancel();
+    _pageFollowSettleTimer = null;
+    final session = ListeningSession.instance;
+    if (!session.playing || !session.matchesBook(widget.bookId)) return;
+    final anchor = _currentPageAnchor();
+    // 已经停在这段开头（跟随刚把页面带过来）：只把跟随接回去，别再 seek
+    // 一次，否则每翻一页都要重新取流。
+    if (anchor.startMs != null &&
+        session.matchesChapter(_chapter.itemId) &&
+        (session.position.inMilliseconds - anchor.startMs!).abs() < 800) {
+      _resumeFollowFromPage();
+      return;
+    }
+    var moved = false;
+    if (anchor.startMs != null) {
+      moved = AudioPlaybackScope.jumpToChapter(
+        context,
+        _chapter.itemId,
+        Duration(milliseconds: anchor.startMs!),
+      );
+    } else if (anchor.textId != null) {
+      final paragraph = _paragraphAnchor(anchor.textId!);
+      moved = AudioPlaybackScope.jumpToParagraph(
+        context,
+        _chapter.itemId,
+        paraIndex: paragraph.paraIndex,
+        ordinal: paragraph.ordinal,
+      );
+    }
+    if (moved) _resumeFollowFromPage();
+  }
+
+  /// 页面成了主导：把跟随接回来，之后的翻页仍由音频接着推。
+  void _resumeFollowFromPage() {
+    _listenFollowTakeover = false;
+    _listenFollowPausedUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    ListeningSession.instance.setFollowArmed(true);
   }
 
   bool get _listenDoubleTapArmed =>

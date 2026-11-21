@@ -596,6 +596,7 @@ class _ReaderPageState extends State<ReaderPage>
     unawaited(_device.keepScreenOn(false));
     unawaited(_device.close());
     _saveTimer?.cancel();
+    _pageFollowSettleTimer?.cancel();
     _settleReadTime();
     _sessionActive = false;
     unawaited(_persistProgress());

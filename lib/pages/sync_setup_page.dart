@@ -1,9 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart' show Clipboard;
 import 'package:material_ui/material_ui.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/platform_channel.dart';
+import '../services/sync/cloud_sync_transport.dart' show nativeAndroidCloudSync;
 import '../services/sync/multi_device_sync_service.dart';
+import '../services/sync/quark_login.dart';
 import '../services/sync/sync_folder_name.dart';
 import '../services/sync/sync_settings_store.dart';
 import '../services/sync/sync_setup_session.dart';
@@ -123,7 +127,15 @@ class _SyncSetupPageState extends State<SyncSetupPage> {
   }
 
   Future<void> login() => run(() async {
-    final token = await widget.login(provider);
+    // 夸克的凭据来自官方 agent API，iOS/桌面上没有 WebView 登录通道，改用
+    // 系统浏览器授权 + page_code 轮询。Android 仍走已有的原生 WebView 流程。
+    final token = provider == 'quark' && !nativeAndroidCloudSync
+        ? await showDialog<String>(
+            context: context,
+            barrierDismissible: false,
+            builder: (_) => const _QuarkAuthorizeDialog(),
+          )
+        : await widget.login(provider);
     if (!mounted || token == null || token.isEmpty) return;
     password.text = token;
     await connect();
@@ -522,6 +534,135 @@ class _SyncSetupPageState extends State<SyncSetupPage> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// 夸克网盘的浏览器授权。
+///
+/// 官方 agent API 只要求「在授权页登录一次」：令牌绑在 `page_code` 上，App
+/// 蹲着轮询就能取到，所以这里不需要 WebView，也不需要 URL scheme 回跳 ——
+/// 打开系统浏览器、用户点完授权、回到 App 时这里已经拿好了凭据。
+class _QuarkAuthorizeDialog extends StatefulWidget {
+  const _QuarkAuthorizeDialog();
+
+  @override
+  State<_QuarkAuthorizeDialog> createState() => _QuarkAuthorizeDialogState();
+}
+
+class _QuarkAuthorizeDialogState extends State<_QuarkAuthorizeDialog> {
+  static const _timeout = Duration(minutes: 5);
+  static const _interval = Duration(seconds: 2);
+
+  QuarkAuthorization? _authorization;
+  Timer? _timer;
+  String? _error;
+  bool _busy = true;
+  final DateTime _deadline = DateTime.now().add(_timeout);
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_start());
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _authorization?.close();
+    super.dispose();
+  }
+
+  Future<void> _start() async {
+    try {
+      final authorization = await QuarkAuthorization.begin();
+      if (!mounted) {
+        authorization.close();
+        return;
+      }
+      _authorization = authorization;
+      final opened = await launchUrl(
+        authorization.url,
+        mode: LaunchMode.externalApplication,
+      );
+      if (!mounted) return;
+      if (!opened) {
+        setState(() {
+          _busy = false;
+          _error = '无法打开浏览器，请手动访问：\n${authorization.url}';
+        });
+        return;
+      }
+      setState(() => _busy = false);
+      _timer = Timer.periodic(_interval, (_) => unawaited(_poll()));
+    } on SyncFailure catch (failure) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = failure.message;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = '无法连接夸克网盘，请检查网络后重试';
+      });
+    }
+  }
+
+  Future<void> _poll() async {
+    final authorization = _authorization;
+    if (authorization == null || !mounted) return;
+    if (DateTime.now().isAfter(_deadline)) {
+      _timer?.cancel();
+      setState(() => _error = '授权已超时，请重新打开授权页');
+      return;
+    }
+    try {
+      final credentials = await authorization.poll();
+      if (!mounted || credentials == null) return;
+      _timer?.cancel();
+      Navigator.of(context).pop(credentials);
+    } catch (_) {
+      // 网络抖动不该中断整个流程：下一拍继续，直到超时。
+    }
+  }
+
+  Future<void> _reopen() async {
+    final authorization = _authorization;
+    if (authorization == null) return;
+    final opened = await launchUrl(
+      authorization.url,
+      mode: LaunchMode.externalApplication,
+    );
+    if (!mounted) return;
+    if (!opened) setState(() => _error = '无法打开浏览器');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('授权夸克网盘'),
+      content: Text(
+        _error ??
+            (_busy
+                ? '正在准备授权页…'
+                : '已在浏览器打开夸克授权页。\n登录并点「授权」后回到本应用，这里会自动完成。'),
+      ),
+      actions: [
+        if (!_busy && _authorization != null)
+          TextButton(
+            onPressed: () => unawaited(_reopen()),
+            child: const Text('重新打开授权页'),
+          ),
+        TextButton(
+          onPressed: () {
+            _timer?.cancel();
+            Navigator.of(context).pop();
+          },
+          child: const Text('取消'),
+        ),
+      ],
     );
   }
 }

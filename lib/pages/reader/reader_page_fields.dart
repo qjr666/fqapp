@@ -89,6 +89,19 @@ mixin _ReaderPageFields on State<ReaderPage> {
   /// .agents/notes/implemented/feature/2026-09-11-reader-paragraph-bubble.md
   Timer? _autoTurnTimer;
 
+  /// 双向跟随：用户手动翻页后，等页面**落定**再把音频跳到本页第一段。
+  ///
+  /// 记录位置和消费位置必须分开：所有手动翻页都在动作**之前**调
+  /// [_takeOverListening]（见 reader_page_navigation / preferences），那一刻
+  /// `_pageIndex` 还是旧页，就地取锚点只会把播放拉回上一页。所以这里只置
+  /// 标记，由真正落定的地方消费——分页的 [_onPageChanged]、滚动停稳、换章
+  /// 完成的 finally。
+  bool _pageFollowPending = false;
+
+  /// 滚动模式「停稳」去抖：拖动和滚轮会连着来，每一拍都 seek 一次会让播放
+  /// 一顿一顿。落定后 [_pageFollowPending] 才被消费。
+  Timer? _pageFollowSettleTimer;
+
   /// 听书跟随翻页: the audio page is narrating this chapter, so land on the
   /// page holding the estimated playback position. Instant jumps — the
   /// narration keeps moving and an animated chase would always lag.

@@ -6,6 +6,7 @@ import 'package:xml/xml.dart';
 import '../platform_channel.dart';
 import 'cloud_sync_transport.dart';
 import 'multi_device_sync_service.dart';
+import 'quark_sync_transport.dart';
 import 'sync_folder_name.dart';
 import 'sync_transport.dart';
 
@@ -48,6 +49,7 @@ class _SetupSession implements SyncSetupSession {
   WebDavSyncTransport? dav;
   WeiyunSyncTransport? weiyun;
   AliSyncTransport? ali;
+  QuarkSyncTransport? quark;
   AndroidCloudSyncTransport? android;
 
   Future<void> saveCredentials(Map<String, String> updates) async {
@@ -101,6 +103,10 @@ class _SetupSession implements SyncSetupSession {
       ali = AliSyncTransport(config, saveCredentials);
       await ali!.authenticate();
       root = const SyncFolder('root', '我的网盘', path: '/');
+    } else if (provider == 'quark' && !nativeAndroidCloudSync) {
+      quark = QuarkSyncTransport(config, saveCredentials);
+      await quark!.authenticate();
+      root = const SyncFolder('0', '我的网盘', path: '/');
     } else {
       android = AndroidCloudSyncTransport(config, saveCredentials);
       await android!.open();
@@ -214,6 +220,12 @@ class _SetupSession implements SyncSetupSession {
           if (row['type'] == 'folder')
             _child(parent, row['file_id'] as String, row['name'] as String),
       ];
+    } else if (quark != null) {
+      result = [
+        for (final row in await quark!.entries(parent.id))
+          if (row['dir'] == true)
+            _child(parent, row['id'] as String, row['name'] as String),
+      ];
     } else {
       final rows =
           await android!.call<List>('folders', {'parent': parent.id}) ?? [];
@@ -263,6 +275,8 @@ class _SetupSession implements SyncSetupSession {
                 'check_name_mode': 'refuse',
               }))['file_id']
               as String;
+    } else if (quark != null) {
+      id = await quark!.createFolder(parent.id, name);
     } else {
       id = (await android!.call<String>('createFolder', {
         'parent': parent.id,
@@ -285,6 +299,7 @@ class _SetupSession implements SyncSetupSession {
     dav?.close();
     weiyun?.close();
     ali?.close();
+    quark?.close();
     android?.close();
   }
 }

@@ -154,6 +154,8 @@ extension _ReaderPageProgress on _ReaderPageState {
     _saveTimer = Timer(const Duration(milliseconds: 500), () {
       _settleReadTime();
       unawaited(_persistProgress());
+      // 滚动停稳 500ms：这才是滚动模式的「翻页落定」，双向跟随在这里消费。
+      _settlePageFollow();
     });
   }
 
@@ -221,6 +223,8 @@ extension _ReaderPageProgress on _ReaderPageState {
     unawaited(_maybeAiPrefetch());
     // 分页模式的实际翻页：累加墨水屏刷新计数（覆盖音量键/自动翻页/点按翻页）。
     _recordEinkPageTurn();
+    // 双向跟随：页面已经落定，可以让音频跳到本页第一段了。
+    _settlePageFollow();
   }
 
   /// 墨水屏：弹窗/菜单关闭后刷一次，清掉弹窗残影。非墨水屏不做事。
@@ -450,6 +454,9 @@ extension _ReaderPageProgress on _ReaderPageState {
       _followChapterJump = false;
       _chapterNavigationCompletion = null;
       completion.complete();
+      // 换章也算一次「页面落定」：从目录/进度条/章末跳到另一章后，音频要
+      // 跟到新章第一段，而不是停在上一个章的位置继续念。
+      _settlePageFollow();
     }
   }
 
@@ -476,6 +483,9 @@ extension _ReaderPageProgress on _ReaderPageState {
       _changingChapter = false;
       _chapterNavigationCompletion = null;
       completion.complete();
+      // 换章也算一次「页面落定」：从目录/进度条/章末跳到另一章后，音频要
+      // 跟到新章第一段，而不是停在上一个章的位置继续念。
+      _settlePageFollow();
     }
   }
 
@@ -528,6 +538,9 @@ extension _ReaderPageProgress on _ReaderPageState {
       _changingChapter = false;
       _chapterNavigationCompletion = null;
       completion.complete();
+      // 换章也算一次「页面落定」：从目录/进度条/章末跳到另一章后，音频要
+      // 跟到新章第一段，而不是停在上一个章的位置继续念。
+      _settlePageFollow();
     }
   }
 
