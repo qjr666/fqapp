@@ -1,25 +1,37 @@
 import 'dart:async';
 
-import 'package:flutter/cupertino.dart';
-import 'package:flutter/material.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../models/shuqi_book.dart';
 import '../services/api_client.dart';
 import '../services/app_style_tokens.dart';
+import '../services/app_theme_style.dart';
 import '../services/library_store.dart';
+import '../services/player_history.dart';
+import '../services/reader_history.dart';
+import '../services/shuqi_reader_source.dart';
 import '../services/user_facing_error.dart';
+import '../widgets/app_ui/app_ui_scope.dart';
+import '../widgets/app_ui/content_anchor.dart';
 import '../widgets/detail/detail_archive.dart';
 import '../widgets/detail/detail_states.dart';
+import '../widgets/detail/detail_style.dart';
+import '../widgets/home/home_design.dart';
 import '../widgets/wenku/wenku_ui.dart';
 import 'reader_page.dart';
 
+part 'detail/shuqi_detail_classic.dart';
+
 /// 书旗书籍详情 + 目录。
 ///
-/// 页面版式来自上游 `DetailPage`（revision ebcd7f1）：磨砂头栏、档案分区、
-/// 行内目录和底部玻璃操作坞。书旗仍是一条**只读**链路：不写书架、不写阅读
-/// 历史、不下载。阅读器以 `localOnly: true` 打开，从而跳过番茄那套目录同步与
-/// 磁盘缓存；阅读器内部的进度/阅读时长写入则靠注入 [_ReadOnlyReaderStore]
-/// 丢弃。
+/// 档案主题沿用上游 `DetailPage`（revision ebcd7f1）：磨砂头栏、档案分区、
+/// 行内目录和底部玻璃操作坞；经典主题走 `detail/shuqi_detail_classic.dart`
+/// 的旧版式（Material AppBar、封面头部、简介与目录行），两者共用同一个
+/// `_ShuqiDetailPageState` 和同一批 loader。书旗只读取上游内容，支持加入本机
+/// 书架与阅读进度，不提供手动下载入口。阅读器以 `localOnly: true`
+/// 打开，使用书旗正文加载器，并以 `shuqi:` 作用域复用磁盘章节缓存；
+/// 本机历史使用相同作用域，阅读时长仍不计入统计。
 ///
 /// 书旗 bookId 与番茄同为纯数字，所以在阅读器里加 `shuqi:` 前缀，避免两套 id
 /// 在同一条进度/缓存键上相撞。
@@ -33,6 +45,8 @@ class ShuqiDetailPage extends StatefulWidget {
   /// 注入点：留空走后端，与 SearchPage 的 loader 约定一致。
   final Future<Map<String, dynamic>> Function(String bookId)? bookLoader;
   final Future<Map<String, dynamic>> Function(String bookId)? tocLoader;
+  final ReaderStore? readerStore;
+  final ChapterTextLoader? chapterLoader;
 
   const ShuqiDetailPage({
     super.key,
@@ -41,6 +55,8 @@ class ShuqiDetailPage extends StatefulWidget {
     this.initialCover = '',
     this.bookLoader,
     this.tocLoader,
+    this.readerStore,
+    this.chapterLoader,
   });
 
   @override
@@ -56,11 +72,60 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
   /// 目录的加载/错误状态独立于详情：目录失败时详情照常展示。
   bool _tocLoading = true;
   String? _tocError;
+  Map<String, dynamic>? _savedHistory;
+
+  ReaderStore get _readerStore => widget.readerStore ?? LibraryStore.instance;
+
+  int? get _resumeIndex =>
+      resumeEpisodeIndex(_savedHistory, _toc?.toReaderChapters() ?? const []);
+
+  String get _readLabel => _resumeIndex == null ? '开始阅读' : '继续阅读';
+
+  /// Both layouts read the same chapter list, so one controller serves the
+  /// classic and the archive body.
+  final _scroll = ScrollController();
+
+  /// 经典 ⇄ 档案换的是两棵不同的树：ScrollPosition 会重建，必须按内容 ID
+  /// 恢复位置，而不是靠同一个 controller 的初始偏移。深章节在切换后通常还
+  /// 没被懒列表构建，靠 [_anchorIndexOf] 先定位到它附近，再按 ID 精确对齐。
+  late final _anchors = ContentAnchorKeeper(
+    _scroll,
+    indexOf: _anchorIndexOf,
+    visibleTopInset: _anchorTopInset,
+  );
+
+  /// 档案 的滚动区延伸到浮动玻璃头栏下方，经典是 AppBar 之后的正文；
+  /// 锚点的“可见顶部”必须按当前布局算，否则内容会落在页头后面。
+  double _anchorTopInset(BuildContext context, AppThemeStyle style) =>
+      style == AppThemeStyle.classic ? 0 : archiveChromeInset(context);
+
+  /// 目录行的数据下标；分区锚点（header/directory）没有下标。
+  int? _anchorIndexOf(String anchorId) {
+    const prefix = 'directory/chapter:';
+    if (!anchorId.startsWith(prefix)) return null;
+    final id = anchorId.substring(prefix.length);
+    final chapters = _toc?.chapters ?? const <ShuqiChapter>[];
+    final index = chapters.indexWhere((chapter) => chapter.chapterId == id);
+    return index < 0 ? null : index;
+  }
 
   @override
   void initState() {
     super.initState();
     unawaited(_load());
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _anchors.attach(AppUiScope.maybeOf(context)?.notifier, context);
+  }
+
+  @override
+  void dispose() {
+    _anchors.detach();
+    _scroll.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -71,7 +136,27 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
       _tocError = null;
     });
     // 详情与目录互不依赖，并行发出：目录首次可能是一次整本 H5 页。
-    await Future.wait([_loadBook(), _loadToc()]);
+    await Future.wait([_loadBook(), _loadToc(), _loadHistory()]);
+  }
+
+  Future<void> _loadHistory() async {
+    Map<String, dynamic>? saved;
+    try {
+      saved = await ReaderHistory(
+        _readerStore,
+      ).load(shuqiReaderId(widget.bookId));
+      if (saved?['kind'] != null && saved?['kind'] != 'book') saved = null;
+    } catch (_) {
+      // An unavailable history store must not prevent online reading.
+    }
+    if (mounted) setState(() => _savedHistory = saved);
+  }
+
+  Future<void> _openReading() async {
+    // Wait for the previous reader's saves, including an exit immediately
+    // followed by reopening. Explicit catalogue choices bypass this index.
+    await _loadHistory();
+    if (mounted) await _openChapter(_resumeIndex ?? 0);
   }
 
   Future<void> _loadBook() async {
@@ -129,30 +214,22 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
       context,
       MaterialPageRoute<void>(
         builder: (_) => ReaderPage(
-          bookId: 'shuqi:${widget.bookId}',
+          bookId: shuqiReaderId(widget.bookId),
           title: book.name,
           cover: book.coverUrl,
+          shelfItem: book.toMediaItem(),
           chapters: toc.toReaderChapters(),
           startIndex: start,
           localOnly: true,
-          // `localOnly` 只关掉目录同步与磁盘缓存；`_persistProgress` 仍会写
-          // 历史（kind=book, id=shuqi:<id>），污染本机历史与阅读统计。
-          readerStore: const _ReadOnlyReaderStore(),
-          chapterLoader: (chapter) async {
-            final payload = await ApiClient.instance.shuqiChapter(
-              widget.bookId,
-              chapter.itemId,
-            );
-            final data = payload['data'];
-            final text = data is Map ? data['content'] : null;
-            if (text is! String || text.isEmpty) {
-              throw StateError('这一章没有取到正文（${chapter.title}）');
-            }
-            return text;
-          },
+          // `localOnly` 关闭番茄在线功能，不禁止书旗独立作用域的自动缓存。
+          readerStore: _readerStore,
+          chapterLoader:
+              widget.chapterLoader ??
+              (chapter) => loadShuqiChapter(widget.bookId, chapter),
         ),
       ),
     );
+    if (mounted) await _loadHistory();
   }
 
   String get _title => _book?.name.isNotEmpty == true
@@ -160,27 +237,35 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
       : (widget.initialTitle.isEmpty ? '书旗' : widget.initialTitle);
 
   @override
-  Widget build(BuildContext context) => WenkuPage(
-    header: ArchiveHeaderBar(
-      leading: GlassIconButton(
-        icon: CupertinoIcons.back,
-        label: '返回',
-        onPressed: () => Navigator.maybePop(context),
-      ),
-      title: FittedBox(
-        fit: BoxFit.scaleDown,
-        child: const AppText(
-          '书籍详情',
-          style: TextStyle(
-            fontSize: 18,
-            height: 1.2,
-            fontWeight: FontWeight.w700,
+  Widget build(BuildContext context) {
+    final palette = HomePalette.of(context);
+    final style = AppUiScope.of(context);
+    _anchors.noteLayoutStyle(style);
+    if (style == AppThemeStyle.classic) {
+      return _buildClassicPage(context, palette);
+    }
+    return WenkuPage(
+      header: ArchiveHeaderBar(
+        leading: GlassIconButton(
+          icon: CupertinoIcons.back,
+          label: '返回',
+          onPressed: () => Navigator.maybePop(context),
+        ),
+        title: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: const AppText(
+            '书籍详情',
+            style: TextStyle(
+              fontSize: 18,
+              height: 1.2,
+              fontWeight: FontWeight.w700,
+            ),
           ),
         ),
       ),
-    ),
-    child: Builder(builder: _body),
-  );
+      child: Builder(builder: _body),
+    );
+  }
 
   Widget _body(BuildContext context) {
     final safe = MediaQuery.paddingOf(context);
@@ -231,7 +316,7 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
     final chapters = toc?.chapters ?? const <ShuqiChapter>[];
     final geometry = glassActionDockGeometry(
       context,
-      primary: chapters.isEmpty ? '暂无章节' : '开始阅读',
+      primary: chapters.isEmpty ? '暂无章节' : _readLabel,
       secondary: '',
     );
     // 目录条目可能上万章，只有真正进入视口的行才构建（上游目录同样是
@@ -242,6 +327,7 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
         Positioned.fill(
           child: CustomScrollView(
             key: const Key('shuqi-detail-scroll'),
+            controller: _scroll,
             physics: const BouncingScrollPhysics(
               parent: AlwaysScrollableScrollPhysics(),
             ),
@@ -257,13 +343,19 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      _identity(context, book),
+                      KeyedSubtree(
+                        key: contentAnchorKey('header'),
+                        child: _identity(context, book),
+                      ),
                       if (book.intro.isNotEmpty) ...[
                         const SizedBox(height: 28),
                         DetailArchiveSynopsis(text: book.intro),
                       ],
                       const SizedBox(height: 30),
-                      _contentsHeading(context, toc, chapters),
+                      KeyedSubtree(
+                        key: contentAnchorKey('directory'),
+                        child: _contentsHeading(context, toc, chapters),
+                      ),
                       if (_tocError != null)
                         DetailInlineError(
                           message: _tocError!,
@@ -319,9 +411,9 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
                 maxWidth: DockLayout.actionMaxWidth,
               ),
               child: DetailArchiveDock(
-                primaryLabel: chapters.isEmpty ? '暂无章节' : '开始阅读',
+                primaryLabel: chapters.isEmpty ? '暂无章节' : _readLabel,
                 primaryIcon: CupertinoIcons.play_fill,
-                onPrimary: chapters.isEmpty ? null : () => _openChapter(0),
+                onPrimary: chapters.isEmpty ? null : _openReading,
               ),
             ),
           ),
@@ -440,6 +532,18 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
 
   Widget _chapterRow(BuildContext context, ShuqiChapter chapter, int index) {
     final scheme = Theme.of(context).colorScheme;
+    return KeyedSubtree(
+      key: contentAnchorKey('directory/chapter:${chapter.chapterId}'),
+      child: _archiveChapterRow(context, chapter, index, scheme),
+    );
+  }
+
+  Widget _archiveChapterRow(
+    BuildContext context,
+    ShuqiChapter chapter,
+    int index,
+    ColorScheme scheme,
+  ) {
     return JellyTapSurface(
       key: ValueKey('shuqi-chapter-$index'),
       onTap: () => unawaited(_openChapter(index)),
@@ -492,49 +596,4 @@ class _ShuqiDetailPageState extends State<ShuqiDetailPage> {
       ),
     );
   }
-}
-
-/// 只读阅读会话的存储：读取一律为空，写入一律丢弃。
-///
-/// 书旗是第三方只读源，`shuqi:<id>` 不该出现在本机历史、阅读统计或已看集合
-/// 里。`ReaderPage` 只有一个 [ReaderStore] 注入点，且进度保存不受 `localOnly`
-/// 控制，所以用这个空实现挡住 `_persistProgress` / `_settleReadTime` 的写入。
-class _ReadOnlyReaderStore implements ReaderStore {
-  const _ReadOnlyReaderStore();
-
-  @override
-  Future<Map<String, dynamic>?> historyEntry(String id) async => null;
-
-  @override
-  Future<void> addHistory(Map<String, dynamic> entry) async {}
-
-  @override
-  Future<void> updateProgress(
-    String id,
-    int episode,
-    double progress, {
-    String? chapterId,
-    double? position,
-    double? maxScroll,
-  }) async {}
-
-  @override
-  Future<void> accumulateReadTime(
-    String bookId,
-    String kind,
-    double seconds, {
-    DateTime? at,
-  }) async {}
-
-  @override
-  Future<Set<String>> watchedEpisodeIds(String id) async => const {};
-
-  @override
-  Future<void> markEpisodeWatched(
-    String id,
-    Iterable<String> episodeIds,
-  ) async {}
-
-  @override
-  Future<void> forgetWatchedEpisodes(String id) async {}
 }

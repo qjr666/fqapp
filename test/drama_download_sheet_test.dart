@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -200,11 +200,11 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('download-ahead-3')));
     await tester.pumpAndSettle();
 
-    expect(
-      engine.value.map((task) => task.itemId).toList(),
-      ['ep3', 'ep4', 'ep5'],
-      reason: '只从当前集往后取 3 集，且都是自动缓存之外的手动任务',
-    );
+    expect(engine.value.map((task) => task.itemId).toList(), [
+      'ep3',
+      'ep4',
+      'ep5',
+    ], reason: '只从当前集往后取 3 集，且都是自动缓存之外的手动任务');
     expect(engine.value.every((task) => !task.auto), isTrue);
   });
 
@@ -291,8 +291,20 @@ void main() {
       tester,
       episodeCount: 3,
       qualities: const [
-        EpisodeVariant(name: '1080P', url: 'u1080', keyHex: '', height: 1080),
-        EpisodeVariant(name: '360P', url: 'u360', keyHex: '', height: 360),
+        EpisodeVariant(
+          name: '1080P',
+          url: 'u1080',
+          keyHex: '',
+          height: 1080,
+          qualityHeight: 1080,
+        ),
+        EpisodeVariant(
+          name: '360P',
+          url: 'u360',
+          keyHex: '',
+          height: 360,
+          qualityHeight: 360,
+        ),
       ],
     );
 
@@ -325,8 +337,20 @@ void main() {
 
   testWidgets('存的上限不在本剧档位里时，高亮实际会取的那一档', (tester) async {
     const qualities = [
-      EpisodeVariant(name: '1080P', url: 'u1080', keyHex: '', height: 1080),
-      EpisodeVariant(name: '360P', url: 'u360', keyHex: '', height: 360),
+      EpisodeVariant(
+        name: '1080P',
+        url: 'u1080',
+        keyHex: '',
+        height: 1080,
+        qualityHeight: 1080,
+      ),
+      EpisodeVariant(
+        name: '360P',
+        url: 'u360',
+        keyHex: '',
+        height: 360,
+        qualityHeight: 360,
+      ),
     ];
     HomeChip chip(String height) => tester.widget<HomeChip>(
       find.byKey(ValueKey('download-quality-$height')),

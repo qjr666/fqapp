@@ -1,12 +1,13 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/main.dart' as app;
 import 'package:fqapp/services/app_log.dart';
 import 'package:fqapp/services/library_store.dart';
+import 'package:fqapp/widgets/home/home_skeleton.dart';
 import 'package:hive_ce/hive.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -59,6 +60,8 @@ void main() {
         ),
       ),
     );
+    // 等真实 Hive I/O 走完,不能用有界推进:骨架只在闸门挂起时在位,
+    // 闸门放行后 pumpAndSettle 自然静止(见 test/support/pump_until.dart)。
     await tester.pumpAndSettle();
     expect(find.text('无法读取本地数据'), findsOneWidget);
     expect(history.get('kept'), record);
@@ -89,6 +92,11 @@ void main() {
     );
     expect(find.text('ready'), findsNothing);
     expect(attempts, 1);
+    // 成功路径不再整屏「转圈 + 文案」：本地数据就绪前只有首页骨架，等待
+    // 提示只留给失败路径（#318）。
+    expect(find.text('正在读取本地数据…'), findsNothing);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    expect(find.byType(HomeSkeleton), findsOneWidget);
     first.completeError(StateError('cannot open stored data'));
     await tester.pump();
     expect(find.text('无法读取本地数据'), findsOneWidget);

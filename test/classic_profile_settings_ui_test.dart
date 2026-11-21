@@ -1,7 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive_ce/hive.dart';
@@ -150,21 +150,38 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.byType(ClassicShellDock), findsOneWidget);
       expect(find.byType(GlassDock), findsNothing);
-      final bar = tester.widget<NavigationBar>(find.byType(NavigationBar));
-      expect(bar.selectedIndex, 2);
-      expect(
-        bar.destinations.cast<NavigationDestination>().map(
-          (item) => item.label,
-        ),
-        ['首页', '短剧', '书架', '我的'],
+      // 自定义 dock（不再用 M3 NavigationBar 的 64×32 icon pill）：四个入口
+      // 齐全，选中高亮落在“书架”。
+      expect(find.byType(NavigationBar), findsNothing);
+      for (final label in ['首页', '短剧', '书架', '我的']) {
+        expect(find.text(label), findsOneWidget);
+      }
+      final bar = tester.widget<SizedBox>(
+        find.byKey(const ValueKey('classic-navigation-bar')),
       );
-      final theme = NavigationBarTheme.of(
-        tester.element(find.byType(NavigationBar)),
+      expect(bar.height, 64);
+      // 同心圆角：选中背景圆角 28 = 外轮廓 32 − 内缩间距 4；高亮是全局
+      // 唯一的浮动背景块，selectedIndex=2 时落在“书架”位置。形状必须是
+      // 连续曲率 squircle（对齐 PiliPlus FloatingNavigationBar）。
+      final selection = tester.widget<DecoratedBox>(
+        find.byKey(const ValueKey('classic-dock-selection')),
       );
-      expect(theme.height, 64);
       expect(
-        theme.indicatorShape,
-        RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        ((selection.decoration as ShapeDecoration).shape
+                as RoundedSuperellipseBorder)
+            .borderRadius
+            .resolve(TextDirection.ltr)
+            .topLeft
+            .x,
+        28,
+      );
+      // 背景块中心与“书架”文字中心对齐（屏宽无关）。
+      expect(
+        tester
+            .getRect(find.byKey(const ValueKey('classic-dock-selection')))
+            .center
+            .dx,
+        moreOrLessEquals(tester.getRect(find.text('书架')).center.dx, epsilon: 1),
       );
       await tester.tap(find.text('我的'));
       await tester.pumpAndSettle();

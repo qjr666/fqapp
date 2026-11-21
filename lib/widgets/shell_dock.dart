@@ -1,8 +1,9 @@
-import 'package:flutter/cupertino.dart';
-import 'package:flutter/material.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../services/app_theme.dart';
 import '../services/app_style_tokens.dart';
+import '../services/frame_stats.dart';
 import 'classic_shell_dock.dart';
 import 'wenku/src/easy_glass.dart';
 import 'wenku/wenku_ui.dart';
@@ -16,6 +17,7 @@ class ShellDock extends StatelessWidget {
     required this.onSelected,
     required this.overVideo,
     required this.staticMaterial,
+    this.animating = false,
   });
 
   final int selectedIndex;
@@ -27,6 +29,10 @@ class ShellDock extends StatelessWidget {
   /// 背后每帧都在变（视频流）或是 OLED 纯黑画布时，不跑实时折射/模糊，
   /// 改用上游轻量模式的同色底板。
   final bool staticMaterial;
+
+  /// 页面切换动画进行中：经典 dock 跳过 BackdropFilter 实时模糊；档案
+  /// GlassDock 同样改用轻量预设，不做实时折射与边缘模糊。
+  final bool animating;
 
   static const _items = [
     GlassDockItem(CupertinoIcons.house, '首页'),
@@ -46,16 +52,34 @@ class ShellDock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // 临时诊断：量出 dock 自身重建吃了多少毫秒。切底部 tab 时壳层会 setState
+    // 两次（起手一次、动画结束恢复玻璃一次），需要知道这笔开销的归属。
+    // release 下 enabled 恒假，连 Stopwatch 都不创建。
+    if (!FrameStats.enabled) return _buildShell(context);
+    final watch = Stopwatch()..start();
+    final result = _buildShell(context);
+    FrameStats.mark(
+      'dock build ${watch.elapsedMicroseconds ~/ 1000}ms '
+      'anim=$animating static=$staticMaterial overVideo=$overVideo',
+    );
+    return result;
+  }
+
+  Widget _buildShell(BuildContext context) {
     if (AppStyleTokens.of(context).isClassic) {
       return ClassicShellDock(
         selectedIndex: selectedIndex,
         onSelected: onSelected,
         overVideo: overVideo,
+        animating: animating,
       );
     }
+    // 页面切换动画期间与静态底板同待遇：轻量预设关掉 glass/blur/edgeBlur，
+    // 胶囊折射与 underlay 边缘模糊一并跳过，不对滑动中的页面每帧做全屏
+    // 高斯模糊（动画结束自动恢复），与经典 dock 的 animating 行为对齐。
     Widget dock = WenkuScope(
       entrance: false,
-      performance: staticMaterial
+      performance: staticMaterial || animating
           ? _lightweight
           : const PerformancePreferences(),
       child: Builder(builder: _buildDock),

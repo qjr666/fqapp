@@ -1,6 +1,8 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/foundation.dart';
+import 'package:fqapp/services/platform_channel.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/models/media_item.dart';
@@ -36,6 +38,64 @@ void main() {
       return null;
     });
   });
+
+  test(
+    'Linux transport retains seek payload and rejects stale owners',
+    () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      final old = NativePlayer.allocateRemoteOwner();
+      final current = NativePlayer.allocateRemoteOwner();
+      final actions = <String>[];
+      final seeks = <int>[];
+      NativePlayer.setRemoteCommandHandler(
+        owner: old,
+        onAction: (_) => fail('stale callback'),
+      );
+      NativePlayer.setRemoteCommandHandler(
+        owner: current,
+        onAction: actions.add,
+        onSeek: seeks.add,
+      );
+      await NativePlayer.startListenForeground(
+        owner: current,
+        title: 'synthetic',
+        episode: 'one',
+      );
+      expect(calls.last.arguments, containsPair('transportV2', true));
+      expect(calls.last.arguments, containsPair('seekSupported', true));
+      await PlatformChannels.notify(
+        'fqapp/native_player',
+        'onNotificationAction',
+        {'owner': old, 'action': 'pause'},
+      );
+      NativePlayer.clearRemoteCommandHandler(owner: old);
+      for (final action in ['play', 'play', 'pause']) {
+        await PlatformChannels.notify(
+          'fqapp/native_player',
+          'onNotificationAction',
+          {'owner': current, 'action': action},
+        );
+      }
+      await PlatformChannels.notify(
+        'fqapp/native_player',
+        'onNotificationAction',
+        {'owner': current, 'action': 'seekTo', 'positionMs': 4200},
+      );
+      expect(actions, ['play', 'play', 'pause']);
+      expect(seeks, [4200]);
+      final count = calls.length;
+      await NativePlayer.startListenForeground(
+        owner: old,
+        title: 'late',
+        episode: 'old',
+      );
+      expect(calls.length, count);
+      await NativePlayer.stopListenForeground(owner: current);
+      expect(calls.last.arguments, {'owner': current});
+      NativePlayer.clearRemoteCommandHandler(owner: current);
+    },
+  );
 
   Future<void> cleanUp(WidgetTester tester, NativePlayer player) async {
     if (find.byType(VideoPlayerChrome).evaluate().isNotEmpty) {
@@ -427,45 +487,45 @@ void main() {
     },
   );
 
-  nativeTest(
-    'textureChanged resets a pre-swap rotation correction (#36)',
-    (tester, player) async {
-      final creation = player.create(
-        'https://example.invalid/swap-rotation.mp4',
-        '',
-      );
-      await tester.pump();
-      await _sendEvent({'playerId': 71, 'type': 'created', 'value': 9});
-      await tester.pump();
-      expect(await creation, 9);
-      // The size event landed before the SurfaceTexture swap, so it still
-      // carries the pre-swap correction for the rotated source.
-      await _sendEvent({
-        'playerId': 71,
-        'type': 'videoSize',
-        'width': 1920,
-        'height': 1080,
-        'rotationCorrection': 90,
-      });
-      await tester.pump();
-      expect(player.videoRotationCorrection, 90);
-      // The swap moves output to a SurfaceTexture, which applies the format
-      // rotation itself: the correction must drop to 0, or the texture gets
-      // rotated a second time and stretches up to fullscreen. The geometry
-      // re-emit is what refreshes the feed's rotation notifier.
-      final sizes = <Size>[];
-      final sub = player.videoSizeStream.listen(sizes.add);
-      await _sendEvent({'playerId': 71, 'type': 'textureChanged', 'value': 12});
-      await tester.pump();
-      expect(player.textureId, 12);
-      expect(player.videoRotationCorrection, 0);
-      expect(sizes, [const Size(1920, 1080)]);
-      // No awaited cancel: awaiting a lone broadcast cancel() stalls in the
-      // test's fake-async zone. dispose() closes the controller, which drops
-      // the subscription; production cancels via the shared Future.wait path.
-      unawaited(sub.cancel());
-    },
-  );
+  nativeTest('textureChanged resets a pre-swap rotation correction (#36)', (
+    tester,
+    player,
+  ) async {
+    final creation = player.create(
+      'https://example.invalid/swap-rotation.mp4',
+      '',
+    );
+    await tester.pump();
+    await _sendEvent({'playerId': 71, 'type': 'created', 'value': 9});
+    await tester.pump();
+    expect(await creation, 9);
+    // The size event landed before the SurfaceTexture swap, so it still
+    // carries the pre-swap correction for the rotated source.
+    await _sendEvent({
+      'playerId': 71,
+      'type': 'videoSize',
+      'width': 1920,
+      'height': 1080,
+      'rotationCorrection': 90,
+    });
+    await tester.pump();
+    expect(player.videoRotationCorrection, 90);
+    // The swap moves output to a SurfaceTexture, which applies the format
+    // rotation itself: the correction must drop to 0, or the texture gets
+    // rotated a second time and stretches up to fullscreen. The geometry
+    // re-emit is what refreshes the feed's rotation notifier.
+    final sizes = <Size>[];
+    final sub = player.videoSizeStream.listen(sizes.add);
+    await _sendEvent({'playerId': 71, 'type': 'textureChanged', 'value': 12});
+    await tester.pump();
+    expect(player.textureId, 12);
+    expect(player.videoRotationCorrection, 0);
+    expect(sizes, [const Size(1920, 1080)]);
+    // No awaited cancel: awaiting a lone broadcast cancel() stalls in the
+    // test's fake-async zone. dispose() closes the controller, which drops
+    // the subscription; production cancels via the shared Future.wait path.
+    unawaited(sub.cancel());
+  });
 
   nativeTest(
     'textureChanged arriving before the create reply wins over created',
@@ -504,10 +564,9 @@ void main() {
       await _sendEvent({'playerId': 71, 'type': 'created', 'value': 9});
       await tester.pump();
       expect(await creation, 9);
-      final arguments = calls
-          .firstWhere((call) => call.method == 'create')
-          .arguments
-          as Map<Object?, Object?>;
+      final arguments =
+          calls.firstWhere((call) => call.method == 'create').arguments
+              as Map<Object?, Object?>;
       expect(arguments['audioOnly'], true);
       expect(arguments['audioRateEngine'], 'builtIn');
     } finally {

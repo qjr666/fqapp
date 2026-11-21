@@ -11,11 +11,17 @@ import 'library_store.dart';
 import 'shelf_group_store.dart';
 import 'shelf_store.dart';
 
+enum AiExportStatus { notRequested, complete, compact, unavailable }
+
 class LibraryBackupService {
+  LibraryBackupService({AiBackupService? aiBackupService})
+    : _aiBackupService = aiBackupService ?? AiBackupService.instance;
+  final AiBackupService _aiBackupService;
   static const _channel = AppMethodChannel('fqapp/library_backup');
 
   AiBackupRestoreResult? lastAiRestore;
   String? lastAiExportNote;
+  AiExportStatus lastAiExportStatus = AiExportStatus.notRequested;
 
   /// Whether this build can show a system file picker.
   ///
@@ -71,19 +77,24 @@ class LibraryBackupService {
     final snapshot = await library.backupSnapshot();
     final shelf = shelfStore.records();
     lastAiExportNote = null;
+    lastAiExportStatus = AiExportStatus.notRequested;
     String? aiData;
     if (includeAi) {
       try {
-        aiData = await AiBackupService.instance.encode(
+        aiData = await _aiBackupService.encode(
           bookId: aiBookId,
           includeTrialDetails: !compactAi,
         );
+        lastAiExportStatus = compactAi
+            ? AiExportStatus.compact
+            : AiExportStatus.complete;
       } on FormatException {
         rethrow;
       } catch (error) {
         // The shelf/progress backup must still work when the encrypted AI box
         // is locked. This is reported in the export message, not hidden.
         aiData = null;
+        lastAiExportStatus = AiExportStatus.unavailable;
         lastAiExportNote = 'AI 数据暂不可用，本次备份未包含：$error';
       }
     }
@@ -111,13 +122,14 @@ class LibraryBackupService {
       if (!compactAi) {
         // Optional trial rows are the first thing to drop. Required feedback,
         // protections and prompts are never removed silently.
-        aiData = await AiBackupService.instance.encode(
+        aiData = await _aiBackupService.encode(
           bookId: aiBookId,
           includeTrialDetails: false,
         );
         backup = await build(aiData);
         try {
           backup.encode();
+          lastAiExportStatus = AiExportStatus.compact;
           lastAiExportNote = '备份超过 16 MB，已省略试验明细；反馈、保护和提示词仍完整。';
           return backup;
         } on FormatException {
@@ -133,13 +145,6 @@ class LibraryBackupService {
 
   Future<Set<String>> aiBookIds() =>
       AiBackupService.instance.bookIdsWithAssets();
-
-  Future<AiBackupRestoreResult?> restoreAi(LibraryBackup backup) async {
-    final ai = backup.aiData;
-    if (ai == null || ai.isEmpty) return null;
-    await AiReadingController.instance.init();
-    return AiBackupService.instance.decodeAndRestore(ai);
-  }
 
   Future<bool> export(LibraryBackup backup) async {
     if (!await pickerSupported()) {

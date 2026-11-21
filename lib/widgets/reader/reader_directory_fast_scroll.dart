@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
 import '../../models/media_item.dart';
@@ -271,6 +271,7 @@ class _ReaderDirectoryFastScrollState extends State<ReaderDirectoryFastScroll>
     ReaderThemePreset.parchment => const Color(0xCCBFB69F),
     ReaderThemePreset.dark => const Color(0xCC5E5E5E),
     ReaderThemePreset.eink => Colors.black,
+    ReaderThemePreset.mistBlue => const Color(0xCC9FB6CB),
   };
 
   Widget _overlay(BoxConstraints constraints, Widget handle) {

@@ -256,7 +256,7 @@ extension _AudioListeningLayout on _AudioPageState {
           duration: c._duration,
           preview: seekPreview,
           enabled: c._ready,
-          onChanged: (value) => c._seekPreview.value = value,
+          onChanged: c._previewSeek,
           onChangeEnd: (value) =>
               c._seekTo(Duration(milliseconds: value.round())),
           onBack15: c._ready
@@ -483,6 +483,8 @@ extension _AudioListeningLayout on _AudioPageState {
     for (final tone in [...c._ttsTones, ...c._narratorTones]) {
       if (tone.id == id && tone.title.isNotEmpty) return tone.title;
     }
+    final localVoice = c._restoredLocalVoice;
+    if (localVoice != null && localVoice.id == id) return localVoice.label;
     return '默认音色';
   }
 

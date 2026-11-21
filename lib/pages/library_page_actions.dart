@@ -4,7 +4,9 @@ part of 'library_page.dart';
 /// 移出书架 / 删除历史。原来都写在 `library_page.dart` 的状态类里，把那个
 /// 文件推过了行数预算，按职责挪到这里。
 mixin _LibraryPageActions on _LibraryPageStateBase {
-  ShelfTabScope get _scope => switch (_tab) {
+  ShelfTabScope get _scope => _scopeForTab(_tab);
+
+  ShelfTabScope _scopeForTab(int tab) => switch (tab) {
     1 => ShelfTabScope.history,
     2 => ShelfTabScope.collection,
     _ => ShelfTabScope.shelf,
@@ -17,8 +19,12 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
   /// 返回 null：此时必须降级成「全部」，否则持久化的组 id 在
   /// [ShelfGroupStore.matchesKey] 里永远匹配不到（未就绪时 `groupOfKey` 恒为
   /// `_unfiled`），书架 / 收藏 / 历史会整页为空（design D-M4）。
-  String get _category =>
-      ShelfGroupStore.instance.resolveCategory(_rawCategory) ??
+  String get _category => _categoryForTab(_tab);
+
+  String _categoryForTab(int tab) =>
+      ShelfGroupStore.instance.resolveCategory(
+        ShelfViewStore.instance.categoryOf(_scopeForTab(tab)),
+      ) ??
       ShelfCategory.all;
 
   /// 分类弹层的选中值：就绪时用解析后的分类（已删除的组回落到全部），
@@ -26,8 +32,10 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
   String get _categoryForSheet =>
       ShelfGroupStore.instance.resolveCategory(_rawCategory) ?? _rawCategory;
 
-  int get _activeFilters {
-    if (_tab == 1) return 0;
+  int get _activeFilters => _activeFiltersForTab(_tab);
+
+  int _activeFiltersForTab(int tab) {
+    if (tab == 1) return 0;
     final state = ShelfViewStore.instance.state;
     return (state.sort != ShelfSort.recentRead ? 1 : 0) +
         (state.filter != ShelfReadingFilter.all ? 1 : 0) +
@@ -203,15 +211,28 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
   }
 
   void _openSearch() {
-    Navigator.push(context, SearchRoute(builder: (_) => const SearchPage()));
+    Navigator.push(
+      context,
+      SearchRoute.open<void>(context, builder: (_) => const SearchPage()),
+    );
   }
 
   /// 优先用缓存续读；未命中时保留离线阅读与详情页加载入口。
   ///
-  /// 书旗条目第一行分流到自己的详情页：它的 bookId 是另一套命名空间，
-  /// 番茄的续读 / 缓存 / 更新检测都不能碰它（design D-M5）。
+  /// 书旗离线缓存使用独立命名空间；未命中时仍进书旗详情，不进入番茄续读。
   Future<void> _open(MediaItem item, {bool importedResume = false}) async {
     if (isShuqiItem(item)) {
+      if (await _openCached(item) || !mounted) return;
+      if (await openRecentBook(
+        context,
+        item,
+        cache: widget.cacheStore,
+        readerStore: widget.readerStore,
+        directoryLoader: widget.directoryLoader,
+      )) {
+        return;
+      }
+      if (!mounted) return;
       await openBookDetail(context, item, entry: BookOpenEntry.shelf);
       return;
     }
@@ -301,9 +322,9 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
     );
   }
 
-  /// 离线直读：只有番茄小说有章节缓存，且必须在无网时才抢在详情页前面。
+  /// 仅无网且来源对应的章节缓存可用时，才抢在联网详情页前面。
   Future<bool> _openCached(MediaItem item) async {
-    if (item.source != ShelfIdentity.fanqie) return false;
+    if (item.source != ShelfIdentity.fanqie && !isShuqiItem(item)) return false;
     final cache = widget.cacheStore ?? ChapterCacheStore.instance;
     final book = await cachedBookForOfflineOpen(
       item,
@@ -316,6 +337,7 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
       book: book,
       cache: cache,
       readerStore: widget.readerStore,
+      shelfItem: item,
     );
   }
 
@@ -333,16 +355,19 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
 
   /// 当前 tab 的可见条目：历史只按分类过滤、保持时间倒序；书架与收藏走
   /// 同一套排序 / 阅读状态 / 来源 / 分类投影（收藏先按 video/manju 过滤）。
-  List<_ShelfEntry> get _visibleEntries {
+  List<_ShelfEntry> get _visibleEntries => _visibleEntriesForTab(_tab);
+
+  /// 邻页预览只读取目标 tab 的投影，不提前切换当前索引或触发副作用。
+  List<_ShelfEntry> _visibleEntriesForTab(int tab) {
+    final category = _categoryForTab(tab);
     final view = ShelfViewStore.instance.state;
     final facts = ShelfFilterFacts(
       cachedContentKeys: _cachedContentKeys,
       cacheScanComplete: _cacheScanComplete,
     );
     final store = ShelfGroupStore.instance;
-    switch (_tab) {
+    switch (tab) {
       case 1:
-        final category = _category;
         return [
           for (final entry in _browseHistory)
             if (store.matchesKey(entry.contentKey, entry.author, category))
@@ -359,7 +384,7 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
           sort: view.sort,
           reading: view.filter,
           source: view.source,
-          category: _category,
+          category: category,
           facts: facts,
           categories: store,
         );
@@ -369,7 +394,7 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
           sort: view.sort,
           reading: view.filter,
           source: view.source,
-          category: _category,
+          category: category,
           facts: facts,
           categories: store,
         );
@@ -420,7 +445,9 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
 
   /// 非编辑态长按条目：触感反馈后进编辑态并选中该项。
   void _longPress(_ShelfEntry entry) {
-    HapticFeedback.mediumImpact();
+    if (HapticPreferences.instance.value) {
+      HapticFeedback.mediumImpact();
+    }
     _enterEdit(entry);
   }
 
@@ -539,16 +566,20 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
     });
     try {
       await ShelfStore.instance.removeKeys(keys);
+      if (localEntries.isNotEmpty) {
+        // Clean every removed identity before slow or unavailable file I/O.
+        try {
+          await ShelfGroupStore.instance.removeAssignments(
+            localEntries.map((entry) => entry.contentKey),
+          );
+        } catch (error, stack) {
+          AppLog.w('shelf', '清理本地书分组失败', error: error, stack: stack);
+        }
+      }
       for (final entry in localEntries) {
         try {
           await ImportedBookStore.instance.deleteBook(entry.item.id);
         } catch (_) {}
-        // D-M8: 分组仓库未就绪或写失败都不能阻断本地文件删除。
-        try {
-          await ShelfGroupStore.instance.removeAssignments([entry.contentKey]);
-        } catch (error, stack) {
-          AppLog.w('shelf', '清理本地书分组失败', error: error, stack: stack);
-        }
       }
     } catch (_) {
       if (mounted) {
@@ -615,7 +646,11 @@ mixin _LibraryPageActions on _LibraryPageStateBase {
     if (!confirmed || !mounted) return;
     final targets = [
       for (final entry in selected)
-        (contentId: entry.contentId, kind: entry.item.kind),
+        (
+          contentId: entry.contentId,
+          kind: entry.item.kind,
+          source: entry.item.source,
+        ),
     ];
     final removed = {for (final entry in selected) entry.selectionKey};
     // Same optimistic update as 移出书架: the rows leave the screen now, and a

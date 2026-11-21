@@ -26,6 +26,7 @@ class CachedEpisode {
     required this.index,
     required this.keyHex,
     required this.height,
+    this.qualityHeight = 0,
     required this.variantName,
     required this.bytes,
     required this.filePath,
@@ -41,7 +42,12 @@ class CachedEpisode {
   /// 该集该画质档的 16 字节内容密钥（hex），`spade_a` 的确定性派生，
   /// 不随会话变化。
   final String keyHex;
+
+  /// Raw decoded height retained for stream identity and diagnostics.
   final int height;
+
+  /// Quality tier as the decoded short edge. Zero means unknown.
+  final int qualityHeight;
   final String variantName;
 
   /// 加密字节数（完成时实测的文件大小）。
@@ -63,6 +69,7 @@ class CachedEpisode {
     'title': title,
     'index': index,
     'height': height,
+    'qualityHeight': qualityHeight,
     'variantName': variantName,
     'bytes': bytes,
     'filePath': filePath,
@@ -92,6 +99,7 @@ class CachedEpisode {
       index: raw['index'] is num ? (raw['index'] as num).toInt() : 0,
       keyHex: keyHex,
       height: raw['height'] is num ? (raw['height'] as num).toInt() : 0,
+      qualityHeight: _qualityHeightFromRecord(raw),
       variantName: raw['variantName']?.toString() ?? '',
       bytes: raw['bytes'] is num ? (raw['bytes'] as num).toInt() : 0,
       filePath: filePath,
@@ -102,15 +110,33 @@ class CachedEpisode {
 
   /// 离线回放的取流结果：主 url 是 `file://` 标记（原生播放器据此走
   /// 本地文件桥 + 同一把 key 解密），variants 只带下载时选定的那一档。
-  EpisodeSource toSource() => EpisodeSource('file://$filePath', keyHex, [
-    if (variantName.isNotEmpty)
-      EpisodeVariant(
-        name: variantName,
-        url: 'file://$filePath',
-        keyHex: keyHex,
-        height: height,
-      ),
-  ]);
+  EpisodeSource toSource() {
+    // Windows drive letters and separators must be encoded as a file URI;
+    // Android's local-file bridge expects the original, unescaped path.
+    final url = Platform.isWindows
+        ? Uri.file(filePath).toString()
+        : 'file://$filePath';
+    return EpisodeSource(url, keyHex, [
+      if (variantName.isNotEmpty)
+        EpisodeVariant(
+          name: variantName,
+          url: url,
+          keyHex: keyHex,
+          height: height,
+          qualityHeight: qualityHeight,
+        ),
+    ]);
+  }
+}
+
+int _qualityHeightFromRecord(Map<dynamic, dynamic> raw) {
+  final stored = raw['qualityHeight'];
+  if (stored is num && stored >= 0) return stored.toInt();
+  return legacyDramaQualityHeight(
+        rawHeight: raw['height'] is num ? (raw['height'] as num).toInt() : 0,
+        variantName: raw['variantName']?.toString() ?? '',
+      ) ??
+      0;
 }
 
 /// 一部剧的目录（剧名/封面/全集列表），下载启动时落库，管理页靠它自举，
@@ -253,6 +279,7 @@ class HiveDramaDownloadStore implements DramaDownloadStore {
 
   /// One-time marker: embedded-key migration (below) has run on this box.
   static const _keySplitMarker = '__key_split_v1';
+  static const _qualityHeightMarker = '__quality_height_v1';
 
   /// Encryption-key source. Production uses the shared secure-storage
   /// provider; tests inject an in-memory one. The box holds content keys,
@@ -290,6 +317,7 @@ class HiveDramaDownloadStore implements DramaDownloadStore {
     if (EncryptedHive.isBoxOpen(_hive, _boxName)) {
       final box = EncryptedHive.box<dynamic>(_hive, _boxName);
       await _migrateEmbeddedKeys(box);
+      await _migrateQualityHeights(box);
       return box;
     }
     final opening = _opening ??= _openBox();
@@ -308,6 +336,7 @@ class HiveDramaDownloadStore implements DramaDownloadStore {
       requireEncryption: true,
     );
     await _migrateEmbeddedKeys(box);
+    await _migrateQualityHeights(box);
     return box;
   }
 
@@ -345,6 +374,26 @@ class HiveDramaDownloadStore implements DramaDownloadStore {
       }
     }
     await box.put(_keySplitMarker, true);
+  }
+
+  Future<void> _migrateQualityHeights(Box<dynamic> box) async {
+    if (box.containsKey(_qualityHeightMarker)) return;
+    final updates = <dynamic, Map<String, dynamic>>{};
+    for (final key in box.keys) {
+      if (key is! String || !key.startsWith('episode:')) continue;
+      final raw = box.get(key);
+      if (raw is! Map) continue;
+      final stored = raw['qualityHeight'];
+      if (stored is num && stored >= 0) continue;
+      updates[key] = Map<String, dynamic>.from(raw)
+        ..['qualityHeight'] = _qualityHeightFromRecord(raw);
+    }
+    for (final entry in updates.entries) {
+      await box.put(entry.key, entry.value);
+    }
+    if (updates.isNotEmpty) await box.flush();
+    await box.put(_qualityHeightMarker, true);
+    await box.flush();
   }
 
   Future<T> _serialize<T>(Future<T> Function(Box<dynamic>) action) {

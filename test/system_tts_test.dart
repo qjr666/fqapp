@@ -1,7 +1,8 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/services/audio_preferences.dart';
@@ -9,6 +10,8 @@ import 'package:fqapp/services/chapter_text_formatter.dart';
 import 'package:fqapp/services/listening_session.dart';
 import 'package:fqapp/services/narration_sentence.dart';
 import 'package:fqapp/services/system_tts.dart';
+import 'package:fqapp/services/desktop_platform.dart';
+import 'package:fqapp/services/native_player.dart';
 import 'package:fqapp/services/text_replacement_store.dart';
 import 'package:fqapp/models/text_replacement_rule.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -24,6 +27,30 @@ void main() {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
   late List<MethodCall> calls;
   Completer<int>? initialization;
+
+  test(
+    'Linux volume clamps, persists and keeps other platform wire contracts',
+    () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      await SystemTts.initialize(await SystemTtsPreferences.load());
+      expect((calls.last.arguments as Map).containsKey('volume'), isFalse);
+      for (final value in [-1.0, 0.0, 0.5, 1.0, 2.0, double.nan]) {
+        final prefs = SystemTtsPreferences(volume: value);
+        await prefs.save();
+        final loaded = await SystemTtsPreferences.load();
+        expect(loaded.volume, prefs.safeVolume);
+        debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+        await SystemTts.initialize(loaded);
+        expect((calls.last.arguments as Map)['volume'], prefs.safeVolume);
+      }
+      for (final platform in [TargetPlatform.android, TargetPlatform.windows]) {
+        debugDefaultTargetPlatformOverride = platform;
+        await SystemTts.initialize(const SystemTtsPreferences());
+        expect((calls.last.arguments as Map).containsKey('volume'), isFalse);
+      }
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
@@ -41,6 +68,7 @@ void main() {
   });
 
   tearDown(() {
+    debugDefaultTargetPlatformOverride = null;
     messenger.setMockMethodCallHandler(_eventMethods, null);
     messenger.setMockMethodCallHandler(_methods, null);
     messenger.setMockMethodCallHandler(_playerMethods, null);
@@ -207,17 +235,17 @@ void main() {
       final text = '${List.filled(299, '甲').join()}😀乙';
       final playback = session(text: text);
       try {
-      playback.start();
-      await tester.pump();
-      // The next sentence is queued straight away, so the first utterance is
-      // the one at the head of the list.
-      final first = spoken().first.arguments as Map;
-      expect((first['text'] as String).length, 299);
-      await event({'type': 'done', 'id': first['id']});
-      await tester.pump();
-      final second = spoken().last.arguments as Map;
-      expect(second['text'], '😀乙');
-      expect('${first['text']}${second['text']}', text);
+        playback.start();
+        await tester.pump();
+        // The next sentence is queued straight away, so the first utterance is
+        // the one at the head of the list.
+        final first = spoken().first.arguments as Map;
+        expect((first['text'] as String).length, 299);
+        await event({'type': 'done', 'id': first['id']});
+        await tester.pump();
+        final second = spoken().last.arguments as Map;
+        expect(second['text'], '😀乙');
+        expect('${first['text']}${second['text']}', text);
       } finally {
         await playback.close();
         await tester.pump();
@@ -252,6 +280,92 @@ void main() {
         await tester.pump();
       }
     },
+  );
+
+  testWidgets(
+    'Linux visibility resumes only an automatically paused TTS session',
+    (tester) async {
+      await AudioPreferences.instance.setBackgroundPlayback(false);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      final playback = session();
+      try {
+        playback.start();
+        await tester.pump();
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.inactive,
+        );
+        await tester.pump();
+        expect(playback.wantPlay, isTrue);
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+        await tester.pump();
+        expect(playback.wantPlay, isFalse);
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await tester.pump();
+        expect(playback.wantPlay, isTrue);
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+        await tester.pump();
+        await playback.pause();
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await tester.pump();
+        expect(playback.wantPlay, isFalse);
+      } finally {
+        await playback.close();
+        await tester.pump();
+      }
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.linux),
+  );
+
+  testWidgets(
+    'Linux suspend reconnects TTS; owner replacement prevents revival',
+    (tester) async {
+      await AudioPreferences.instance.setBackgroundPlayback(true);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      final playback = session();
+      final system = DesktopSystemSession.instance;
+      try {
+        playback.start();
+        await tester.pump();
+        expect(playback.wantPlay, isTrue);
+        system.accept({'type': 'locked', 'value': true});
+        await tester.pump();
+        expect(playback.wantPlay, isTrue);
+        system.accept({'type': 'suspend', 'value': true});
+        await tester.pump();
+        expect(playback.wantPlay, isFalse);
+        final initializations = calls
+            .where((c) => c.method == 'initialize')
+            .length;
+        system.accept({'type': 'locked', 'value': false});
+        await tester.pump();
+        expect(playback.wantPlay, isFalse);
+        system.accept({'type': 'suspend', 'value': false});
+        await tester.pump();
+        expect(playback.wantPlay, isTrue);
+        expect(
+          calls.where((c) => c.method == 'initialize').length,
+          greaterThan(initializations),
+        );
+        system.accept({'type': 'suspend', 'value': true});
+        await tester.pump();
+        final other = NativePlayer.allocateRemoteOwner();
+        NativePlayer.setRemoteCommandHandler(owner: other);
+        system.accept({'type': 'suspend', 'value': false});
+        await tester.pump();
+        expect(playback.wantPlay, isFalse);
+        NativePlayer.clearRemoteCommandHandler(owner: other);
+      } finally {
+        await playback.close();
+        system.accept({'type': 'locked', 'value': false});
+        system.accept({'type': 'suspend', 'value': false});
+        await tester.pump();
+      }
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.linux),
   );
 
   testWidgets('a temporary focus loss resumes once the focus comes back', (
@@ -341,27 +455,27 @@ void main() {
   group('sentenceRangeAt', () {
     test('narrows to the sentence under the offset', () {
       const text = '第一句。第二句！第三句？';
-      expect(
-        sentenceRangeAt(text, 5, lower: 0, upper: text.length),
-        (start: 4, end: 8),
-      );
+      expect(sentenceRangeAt(text, 5, lower: 0, upper: text.length), (
+        start: 4,
+        end: 8,
+      ));
     });
 
     test('closing marks stay with the sentence they end', () {
       const text = '他说：「走。」然后就走了。';
       // Offsets: 0他 1说 2： 3「 4走 5。 6」 7然 …
-      expect(
-        sentenceRangeAt(text, 8, lower: 0, upper: text.length),
-        (start: 7, end: 13),
-      );
+      expect(sentenceRangeAt(text, 8, lower: 0, upper: text.length), (
+        start: 7,
+        end: 13,
+      ));
     });
 
     test('a paragraph break also ends a sentence', () {
       const text = '第一段\n第二段';
-      expect(
-        sentenceRangeAt(text, 5, lower: 0, upper: text.length),
-        (start: 4, end: 7),
-      );
+      expect(sentenceRangeAt(text, 5, lower: 0, upper: text.length), (
+        start: 4,
+        end: 7,
+      ));
     });
 
     test('the result never leaves the piece being spoken', () {
@@ -421,10 +535,10 @@ void main() {
       await tester.pump();
       // A sentence per utterance is what lets a voice without `onRangeStart`
       // wash one sentence: the engine can only report the slice it was given.
-      expect(
-        spoken().map((c) => (c.arguments as Map)['text']),
-        ['第一句。', '第二句。'],
-      );
+      expect(spoken().map((c) => (c.arguments as Map)['text']), [
+        '第一句。',
+        '第二句。',
+      ]);
       expect((spoken().first.arguments as Map)['queue'], isFalse);
       expect((spoken().last.arguments as Map)['queue'], isTrue);
       final first = spoken().first.arguments as Map;

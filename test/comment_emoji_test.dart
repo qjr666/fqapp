@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:fqapp/widgets/comment_emoji.dart';
@@ -71,6 +71,54 @@ void main() {
       expect(find.byType(Image), findsOneWidget);
       expect(find.text('[微笑]'), findsNothing);
       expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('rich text forwards maxLines and overflow', (tester) async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 40,
+              child: CommentEmojiText(
+                text: '[微笑]很长很长的一段话',
+                style: TextStyle(fontSize: 16),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final text = tester.widget<Text>(find.byType(Text));
+      expect(text.maxLines, 1);
+      expect(text.overflow, TextOverflow.ellipsis);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('plain fallback forwards maxLines and overflow', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 40,
+              child: CommentEmojiText(
+                text: '很长很长的一段话',
+                style: TextStyle(fontSize: 16),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+        ),
+      );
+
+      final text = tester.widget<Text>(find.text('很长很长的一段话'));
+      expect(text.maxLines, 1);
+      expect(text.overflow, TextOverflow.ellipsis);
     });
   });
 }

@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
 import '../../models/media_item.dart';
@@ -58,6 +58,7 @@ class ReadingNow {
         badge: '',
         ep: entry['ep']?.toString() ?? '',
         kind: entry['kind']?.toString() ?? 'book',
+        source: historySource(entry),
         seriesId: entry['seriesId']?.toString(),
         episodeId: entry['episodeId']?.toString(),
       ),

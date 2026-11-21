@@ -1,9 +1,10 @@
 import '../services/desktop_platform.dart';
+import '../services/linux_platform.dart';
 import '../widgets/desktop_chapter_sidebar.dart';
 import 'dart:async';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
 import '../models/audio_extra.dart';
@@ -23,7 +24,9 @@ import '../services/audio_playback_choice.dart';
 import '../services/audio_subtitle_synth.dart';
 import '../services/audio_time_point_lookup.dart';
 import '../services/audio_preferences.dart';
+import '../services/backend_transport.dart';
 import '../services/book_updates.dart';
+import '../services/boss_key_service.dart';
 import '../services/chapter_cache_store.dart';
 import '../services/chapter_text_formatter.dart';
 import '../services/episode_source_cache.dart';
@@ -53,6 +56,7 @@ import '../widgets/audio/audio_subtitle_scroller.dart';
 import '../widgets/audio/voice_settings_sheet.dart';
 import '../widgets/reader/reader_listen_capsule.dart';
 import '../widgets/chapter_cache_sheet.dart';
+import '../widgets/comment_emoji.dart';
 import '../widgets/comment_images.dart';
 import '../widgets/home/home_design.dart';
 import '../widgets/home/home_sheet.dart';
@@ -641,8 +645,13 @@ class _AudioPageState extends State<AudioPage> {
             isMultiTone: tone.isMultiTone,
           ),
     ];
-    if (options.isNotEmpty) return options;
+    // Keep a restored local voice visible even if discovery returns other tones.
+    final hasToneOptions = options.isNotEmpty;
     for (final voice in c._voices) {
+      if (hasToneOptions &&
+          (voice.id != c._toneId || voice.id != c._restoredLocalVoice?.id)) {
+        continue;
+      }
       if (!c._selectableTone(voice.id) || !ids.add(voice.id)) continue;
       options.add(VoiceOption(id: voice.id, title: voice.label));
     }
@@ -755,7 +764,10 @@ class _AudioPageState extends State<AudioPage> {
     final introSummary = detail?.abstract ?? '';
     final related = c._extras.related.isEmpty ? null : c._extras.related.first;
     // Windows 桌面端用独立版式；它只需要 tones，上面这些局部变量先算好并不吃亏。
-    if (isWindowsDesktop) return _desktopAudio(palette, chapter, tones);
+    if (isWindowsDesktop ||
+        (isLinuxDesktop && MediaQuery.sizeOf(context).width >= 700)) {
+      return _desktopAudio(palette, chapter, tones);
+    }
 
     // 官方整页底色/字色都取自封面（见 audio_page_theme.dart）；墨水屏固定
     // 纯黑白，不使用封面取色。
@@ -849,55 +861,70 @@ class _AudioPageState extends State<AudioPage> {
               ),
               SizedBox(
                 width: MediaQuery.sizeOf(context).width >= 1200 ? 360 : 280,
-                child: DefaultTabController(
-                  length: 2,
-                  child: Column(
-                    children: [
-                      const TabBar(
-                        tabs: [
-                          Tab(text: '章节目录'),
-                          Tab(text: '同步字幕'),
-                        ],
-                      ),
-                      Expanded(
-                        child: TabBarView(
-                          children: [
-                            DesktopChapterSidebar(
-                              chapters: c._chapters,
-                              currentIndex: c._index,
-                              onSelected: (index) =>
-                                  unawaited(c._openChapter(index)),
-                            ),
-                            ValueListenableBuilder<Duration>(
-                              valueListenable: c._position,
-                              builder: (context, position, _) {
-                                final track = c._subtitles;
-                                if (track.isEmpty) {
-                                  // 官方两种空态都走 `setStatusText`，文案统一。
-                                  return const Center(
-                                    child: Text(
-                                      '本章暂无同步字幕',
-                                      key: Key('audio-subtitle-page-empty'),
-                                    ),
-                                  );
-                                }
-                                // 高亮与自动滚动都在 `AudioSubtitleList`
-                                // 里：跟着朗读进度滚到当前句并标出它。
-                                return AudioSubtitleList(
-                                  track: track,
-                                  active: track.indexAt(position),
-                                  onSeek: c._ready
-                                      ? (startMs) => c._seekTo(
-                                          Duration(milliseconds: startMs),
-                                        )
-                                      : null,
-                                );
-                              },
-                            ),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: palette.surface,
+                    border: Border(left: BorderSide(color: palette.line)),
+                  ),
+                  child: DefaultTabController(
+                    length: 2,
+                    child: Column(
+                      children: [
+                        TabBar(
+                          labelColor: palette.ink,
+                          unselectedLabelColor: palette.muted,
+                          indicatorColor: palette.eink
+                              ? palette.ink
+                              : HomePalette.accent,
+                          dividerColor: palette.line,
+                          tabs: const [
+                            Tab(text: '章节目录'),
+                            Tab(text: '同步字幕'),
                           ],
                         ),
-                      ),
-                    ],
+                        Expanded(
+                          child: TabBarView(
+                            children: [
+                              DesktopChapterSidebar(
+                                width: double.infinity,
+                                showBorder: false,
+                                backgroundColor: palette.surface,
+                                chapters: c._chapters,
+                                currentIndex: c._index,
+                                onSelected: (index) =>
+                                    unawaited(c._openChapter(index)),
+                              ),
+                              ValueListenableBuilder<Duration>(
+                                valueListenable: c._position,
+                                builder: (context, position, _) {
+                                  final track = c._subtitles;
+                                  if (track.isEmpty) {
+                                    // 官方两种空态都走 `setStatusText`，文案统一。
+                                    return const Center(
+                                      child: Text(
+                                        '本章暂无同步字幕',
+                                        key: Key('audio-subtitle-page-empty'),
+                                      ),
+                                    );
+                                  }
+                                  // 高亮与自动滚动都在 `AudioSubtitleList`
+                                  // 里：跟着朗读进度滚到当前句并标出它。
+                                  return AudioSubtitleList(
+                                    track: track,
+                                    active: track.indexAt(position),
+                                    onSeek: c._ready
+                                        ? (startMs) => c._seekTo(
+                                            Duration(milliseconds: startMs),
+                                          )
+                                        : null,
+                                  );
+                                },
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -917,7 +944,7 @@ class _AudioPageState extends State<AudioPage> {
                     duration: c._duration,
                     preview: c._seekPreview.value,
                     enabled: c._ready,
-                    onChanged: (value) => c._seekPreview.value = value,
+                    onChanged: c._previewSeek,
                     onChangeEnd: (value) =>
                         c._seekTo(Duration(milliseconds: value.round())),
                     onBack15: c._ready
@@ -2226,8 +2253,8 @@ class _AudioCommentsSheetState extends State<_AudioCommentsSheet> {
         ),
         const SizedBox(height: 6),
         if (comment.text.isNotEmpty)
-          Text(
-            comment.text,
+          CommentEmojiText(
+            text: comment.text,
             style: TextStyle(color: palette.ink, fontSize: 13, height: 1.65),
           ),
         if (comment.imageUrls.isNotEmpty) ...[

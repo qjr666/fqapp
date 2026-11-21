@@ -19,8 +19,8 @@
 
 import 'dart:async';
 
-import 'package:flutter/cupertino.dart';
-import 'package:flutter/material.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../../services/app_style_tokens.dart';
 import '../settings/classic_settings_icons.dart';
@@ -102,27 +102,22 @@ class _GlassSettingMenuState<T> extends State<GlassSettingMenu<T>> {
 
   Future<void> _openClassic() async {
     if (_saving) return;
+    final scheme = Theme.of(context).colorScheme;
     final selected = await showDialog<T>(
       context: context,
       builder: (dialogContext) => SimpleDialog(
+        // The fill comes from `dialogTheme`; the row style matches
+        // `showAiChoiceDialog` so both classic pickers read as one control.
         title: Text(widget.label),
         children: [
-          RadioGroup<T>(
-            groupValue: widget.value,
-            onChanged: (value) {
-              if (value != null) Navigator.pop(dialogContext, value);
-            },
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                for (final option in widget.options.entries)
-                  RadioListTile<T>(
-                    value: option.key,
-                    title: Text(option.value),
-                  ),
-              ],
+          for (final option in widget.options.entries)
+            ListTile(
+              title: Text(option.value),
+              trailing: option.key == widget.value
+                  ? Icon(Icons.check, size: 18, color: scheme.onSurface)
+                  : null,
+              onTap: () => Navigator.pop(dialogContext, option.key),
             ),
-          ),
         ],
       ),
     );

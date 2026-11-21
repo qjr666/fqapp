@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../models/media_item.dart';
+import 'chapter_text_formatter.dart';
 
 /// Where a finished export landed, as the platform reported it.
 @immutable
@@ -15,13 +16,10 @@ class ExportTarget {
     this.hint,
   });
 
-  /// Path shown to the user. Either the shared Downloads entry or, on Android
-  /// 9 and older, the app's own external directory.
+  /// Path chosen in the desktop save dialog or reported by Android.
   final String path;
 
-  /// Whether [path] is the shared Downloads collection instead of app-private
-  /// storage. The completion message has to tell the two apart: a private file
-  /// is not where the file manager looks.
+  /// Whether [path] is user-accessible rather than app-private storage.
   final bool isPublic;
 
   /// Where the user picks the file up, in the platform's own words. iOS has
@@ -49,7 +47,7 @@ abstract class TxtSink {
   });
 }
 
-/// The system Downloads collection through the `fqapp/downloads` channel.
+/// Saves through `fqapp/downloads`: Android Downloads or a desktop save dialog.
 ///
 /// Android 10 (API 29) and newer insert into `MediaStore.Downloads`, which
 /// needs no storage permission; older devices fall back to the app's external
@@ -75,7 +73,7 @@ class PlatformTxtSink implements TxtSink {
     } on PlatformException catch (error) {
       throw ExportWriteException(error.message ?? '写入失败');
     } on MissingPluginException {
-      // Desktop and test hosts have no Android plugin: never report success.
+      // Hosts without a registered adapter must never report success.
       throw const ExportWriteException('当前平台不支持导出到 Downloads');
     }
     final path = result?['path'];
@@ -96,6 +94,7 @@ class PlatformTxtSink implements TxtSink {
 class BookTxtExportState {
   const BookTxtExportState({
     this.running = false,
+    this.writing = false,
     this.completed = 0,
     this.total = 0,
     this.failed = 0,
@@ -104,6 +103,9 @@ class BookTxtExportState {
   });
 
   final bool running;
+
+  /// The platform write has been submitted and cannot be cancelled.
+  final bool writing;
   final int completed;
   final int total;
 
@@ -119,17 +121,18 @@ class BookTxtExportState {
   final String? message;
 
   double get fraction => total == 0 ? 0 : completed / total;
+  bool get canCancel => running && !writing;
 }
 
-/// Whole-book TXT export: a fresh directory plus every chapter re-fetched from
-/// the network, assembled in the same shape the backend's `/api/download`
-/// serves (`# 标题` line, body, blank line).
+/// Whole-book TXT export: a fresh directory plus cached or fetched chapter
+/// bodies, assembled as a `# 标题` line, body and one blank line per chapter.
 ///
-/// Nothing is written until the last chapter is in hand: a cancelled or failed
-/// export must not leave a half book in Downloads that looks complete.
+/// Nothing is written until the last chapter is in hand. Cancellation is only
+/// available during fetching; once saving begins, the platform result wins.
 ///
-/// Chapter bodies are fetched through [chapterLoader], which production wires to
-/// `ApiClient.contentText` — the single request funnel CRIT-005 requires.
+/// Missing bodies are fetched through [chapterLoader], which production keeps
+/// behind ApiClient's request funnel. At most three chapters are prefetched;
+/// assembly and progress stay in directory order.
 class BookTxtExport extends ValueNotifier<BookTxtExportState> {
   BookTxtExport({
     required this.directoryLoader,
@@ -175,18 +178,38 @@ class BookTxtExport extends ValueNotifier<BookTxtExportState> {
     var completed = 0;
     var failed = 0;
     value = BookTxtExportState(running: true, total: chapters.length);
+    var nextChapter = 0;
+    final pending = <Future<String?>>[];
+    Future<String?> loadBody(Chapter chapter) async {
+      if (!_alive(job)) return null;
+      try {
+        final text = await chapterLoader(chapter).timeout(timeout);
+        if (!_alive(job)) return null;
+        return exportChapterBody(text, chapterTitle: chapter.title);
+      } catch (_) {
+        // Prefetched failures may never be awaited after cancellation.
+        return null;
+      }
+    }
+
+    void fillWindow() {
+      while (_alive(job) &&
+          nextChapter < chapters.length &&
+          pending.length < 3) {
+        pending.add(loadBody(chapters[nextChapter++]));
+      }
+    }
+
+    fillWindow();
     for (final chapter in chapters) {
       if (!_alive(job)) return;
+      final body = await pending.removeAt(0);
+      if (!_alive(job)) return;
       buffer.write('# ${chapter.title}\n');
-      try {
-        final body = (await chapterLoader(chapter).timeout(timeout)).trim();
-        if (!_alive(job)) return;
-        if (body.isNotEmpty) {
-          buffer.write(body);
-          buffer.write('\n');
-        }
-      } catch (_) {
-        if (!_alive(job)) return;
+      if (body != null) {
+        buffer.write(body);
+        buffer.write('\n');
+      } else {
         // One dead chapter must not cost the user the other 999.
         failed++;
       }
@@ -194,10 +217,12 @@ class BookTxtExport extends ValueNotifier<BookTxtExportState> {
       completed++;
       value = BookTxtExportState(
         running: true,
+        writing: completed == chapters.length,
         completed: completed,
         total: chapters.length,
         failed: failed,
       );
+      fillWindow();
     }
     if (!_alive(job)) return;
 
@@ -209,7 +234,7 @@ class BookTxtExport extends ValueNotifier<BookTxtExportState> {
       );
     } catch (_) {
       if (_alive(job)) {
-        value = const BookTxtExportState(message: '导出失败：写入 Downloads 失败，请重试');
+        value = const BookTxtExportState(message: '导出失败：文件写入失败，请重试');
       }
       return;
     }
@@ -223,9 +248,10 @@ class BookTxtExport extends ValueNotifier<BookTxtExportState> {
     );
   }
 
-  /// Stops the running export. Nothing was written yet, so nothing is left
-  /// behind in Downloads.
+  /// Stops fetching before any file is written. A submitted platform write
+  /// must finish and report its actual result.
   void cancel() {
+    if (_disposed || !value.canCancel) return;
     ++_job;
     final state = value;
     value = BookTxtExportState(
@@ -252,6 +278,37 @@ String _report(String title, ExportTarget target, int completed, int failed) {
   final missing = failed == 0 ? '' : '，$failed 章取文失败，已保留标题';
   return '已导出《$title》$completed 章$missing\n$where';
 }
+
+/// Produces the body placed below one chapter's exported `# title` line.
+///
+/// Cache and network input share this path so title removal and invisible
+/// separator cleanup have one owner. Invisible-only paragraphs are discarded
+/// before the title lookup, allowing captions and images to stay in place while
+/// a later body paragraph that repeats the title remains untouched.
+String? exportChapterBody(String text, {required String chapterTitle}) {
+  final source = ChapterContent.fromCacheText(text);
+  final blocks = <ChapterBlock>[
+    for (final block in source.blocks)
+      if (block is! ChapterParagraph || _hasExportText(block.text)) block,
+  ];
+  final normalized = ChapterContent(
+    blocks: blocks,
+    legacyText: _cleanExportText(source.legacyText),
+    illustrationsChecked: source.illustrationsChecked,
+    paragraphIdsChecked: source.paragraphIdsChecked,
+    timelineChecked: source.timelineChecked,
+  ).withoutLeadingTitle(chapterTitle);
+  final body = _cleanExportText(normalized.legacyText);
+  return body.isEmpty ? null : body;
+}
+
+String _cleanExportText(String text) =>
+    splitChapterParagraphs(text).where(_hasExportText).join('\n');
+
+bool _hasExportText(String text) =>
+    text.replaceAll(_exportBlankMarkers, '').isNotEmpty;
+
+final _exportBlankMarkers = RegExp(r'[\s\u200B\uFEFF]');
 
 /// `<书名>.txt`, folded into a name a Downloads entry accepts: separators and
 /// other reserved characters become `_`, control characters are dropped, and

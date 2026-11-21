@@ -640,9 +640,9 @@ void main() {
     expect(state.items.map((i) => i.id), ['first-1']);
   });
 
-  test('追加页的书拼进流区块，网格真的无限', () async {
-    // 区块管线只渲染 cells；分页响应不带区块，若新书只进 items，网格永远
-    // 停在首页那批卡。追加页必须合入 385 流区块（cellsForView）。
+  test('连续追加页在全部旧流之后形成唯一尾块，不复制也不前置', () async {
+    // 真实 385 把书卡放在 339 children 里；flatten 先取 items。若追加页写进
+    // 原 385.items，新书会跑到旧书前，多流时还会被复制到每一段。
     var page = 0;
     final provider = NotifierProvider<HomeNotifier, HomeState>(
       () => HomeNotifier(
@@ -651,22 +651,69 @@ void main() {
               page += 1;
               if (page == 1) {
                 return HomepagePage(
-                  items: [_item('first-1'), _item('first-2')],
-                  cells: const [
+                  items: [
+                    _item('first-a1'),
+                    _item('first-a2'),
+                    _item('first-b1'),
+                    _item('first-b2'),
+                  ],
+                  cells: [
                     HomeCell(
                       showType: 384,
-                      name: '猜你喜欢',
+                      name: '流 A',
                       id: '',
-                      style: {},
+                      style: const {},
                       items: [],
                       children: [
                         HomeCell(
                           showType: 385,
                           name: '',
                           id: '',
-                          style: {},
+                          style: const {},
                           items: [],
-                          children: [],
+                          children: [
+                            HomeCell(
+                              showType: 339,
+                              name: '',
+                              id: '',
+                              style: const {},
+                              items: [_item('first-a1')],
+                              children: const [],
+                            ),
+                            HomeCell(
+                              showType: 339,
+                              name: '',
+                              id: '',
+                              style: const {},
+                              items: [_item('first-a2')],
+                              children: const [],
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                    HomeCell(
+                      showType: 385,
+                      name: '流 B',
+                      id: '',
+                      style: const {},
+                      items: [],
+                      children: [
+                        HomeCell(
+                          showType: 339,
+                          name: '',
+                          id: '',
+                          style: const {},
+                          items: [_item('first-b1')],
+                          children: const [],
+                        ),
+                        HomeCell(
+                          showType: 339,
+                          name: '',
+                          id: '',
+                          style: const {},
+                          items: [_item('first-b2')],
+                          children: const [],
                         ),
                       ],
                     ),
@@ -676,8 +723,15 @@ void main() {
                 );
               }
               // 续页：只有 items，没有 cells。
+              if (page == 2) {
+                return HomepagePage(
+                  items: [_item('next-1'), _item('next-2')],
+                  nextOffset: 20,
+                  sessionId: null,
+                );
+              }
               return HomepagePage(
-                items: [_item('next-1'), _item('next-2')],
+                items: [_item('next-3'), _item('next-4')],
                 nextOffset: null,
                 sessionId: null,
               );
@@ -690,25 +744,58 @@ void main() {
     await container.read(provider.notifier).load();
 
     final firstCells = container.read(provider).cells;
-    expect(firstCells.single.showType, 384);
-    expect(
-      firstCells.single.children.single.items.map((i) => i.id),
-      isEmpty,
-    );
+    expect(firstCells.expand((cell) => cell.flatten()).map((item) => item.id), [
+      'first-a1',
+      'first-a2',
+      'first-b1',
+      'first-b2',
+    ]);
 
     await container.read(provider.notifier).loadMore();
+    await container.read(provider.notifier).loadMore();
 
-    // 追加页的书出现在流区块的渲染列表里。
+    // 原始两段保持原样，连续追加页只在末尾出现一次。
     final merged = container.read(provider).cells;
+    expect(merged.map((cell) => cell.showType), [384, 385, 385]);
+    expect(merged.expand((cell) => cell.flatten()).map((item) => item.id), [
+      'first-a1',
+      'first-a2',
+      'first-b1',
+      'first-b2',
+      'next-1',
+      'next-2',
+      'next-3',
+      'next-4',
+    ]);
     expect(
-      merged.single.children.single.items.map((i) => i.id),
-      ['next-1', 'next-2'],
+      merged[0].children.single.children
+          .expand((cell) => cell.flatten())
+          .map((item) => item.id),
+      ['first-a1', 'first-a2'],
     );
+    expect(
+      merged[1].children
+          .expand((cell) => cell.flatten())
+          .map((item) => item.id),
+      ['first-b1', 'first-b2'],
+    );
+    expect(merged.last.items.map((item) => item.id), [
+      'next-1',
+      'next-2',
+      'next-3',
+      'next-4',
+    ]);
     // items 也照常追加（旧管线/去重语义不变）。
-    expect(
-      container.read(provider).items.map((i) => i.id),
-      ['first-1', 'first-2', 'next-1', 'next-2'],
-    );
+    expect(container.read(provider).items.map((i) => i.id), [
+      'first-a1',
+      'first-a2',
+      'first-b1',
+      'first-b2',
+      'next-1',
+      'next-2',
+      'next-3',
+      'next-4',
+    ]);
   });
 
   test('the combined feed keeps novels when recommendations fail', () async {
@@ -1086,6 +1173,169 @@ void main() {
         tabType: 8,
       ));
     });
+  });
+
+  test('被取消的加载下次进入会回源', () async {
+    var calls = 0;
+    final pending = <Completer<HomepagePage>>[];
+    final provider = NotifierProvider<HomeNotifier, HomeState>(
+      () => HomeNotifier(
+        homepageLoader: ({int tabType = 2, int offset = 0, String? sessionId}) {
+          calls++;
+          final completer = Completer<HomepagePage>();
+          pending.add(completer);
+          return completer.future;
+        },
+        searchLoader: (query, {int page = 1}) async => [],
+        mangaSearchLoader: ({int offset = 0}) async => [],
+        manjuSearchLoader: ({int offset = 0}) async => [],
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(provider.notifier);
+
+    final tabIndex = HomeNotifier.tabs.indexOf('短剧');
+    notifier.selectTab(tabIndex);
+    await _flushMicrotasks();
+    expect(calls, 1);
+
+    // 请求还在飞就切走：响应随后落地，但因为代际已变会被丢弃。
+    notifier.selectTab(0);
+    await _flushMicrotasks();
+    pending.first.complete(
+      const HomepagePage(items: [], nextOffset: null, sessionId: null),
+    );
+    await _flushMicrotasks();
+
+    // 切回来必须回源，不能拿快照当「已加载」。
+    final before = calls;
+    notifier.selectTab(tabIndex);
+    await _flushMicrotasks();
+    expect(calls, before + 1);
+  });
+
+  test('取消加载后 stale 不影响续页：翻页仍按自己的 offset 走', () async {
+    final offsets = <int>[];
+    final pending = <Completer<HomepagePage>>[];
+    HomepagePage page({required List<MediaItem> items, int? nextOffset}) =>
+        HomepagePage(items: items, nextOffset: nextOffset, sessionId: null);
+    final provider = NotifierProvider<HomeNotifier, HomeState>(
+      () => HomeNotifier(
+        homepageLoader: ({int tabType = 2, int offset = 0, String? sessionId}) {
+          offsets.add(offset);
+          final completer = Completer<HomepagePage>();
+          pending.add(completer);
+          return completer.future;
+        },
+        searchLoader: (query, {int page = 1}) async => [],
+        mangaSearchLoader: ({int offset = 0}) async => [],
+        manjuSearchLoader: ({int offset = 0}) async => [],
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(provider.notifier);
+    final tabIndex = HomeNotifier.tabs.indexOf('短剧');
+
+    // 1) 首次进入，请求在飞时切走 → 被取消，标记 stale。
+    notifier.selectTab(tabIndex);
+    await _flushMicrotasks();
+    notifier.selectTab(0);
+    await _flushMicrotasks();
+    pending[1].complete(page(items: [_item('tab0')], nextOffset: null));
+    await _flushMicrotasks();
+
+    // 2) 切回：stale 触发回源。
+    notifier.selectTab(tabIndex);
+    await _flushMicrotasks();
+    expect(offsets.last, 0);
+    pending.last.complete(page(items: [_item('a')], nextOffset: 10));
+    await _flushMicrotasks();
+
+    // 3) 续页照常按 nextOffset 走，不会被 stale / hasMore 卡住。
+    //    这里不 await：翻页请求还挂在 completer 上。
+    final before = offsets.length;
+    unawaited(notifier.loadMore());
+    await _flushMicrotasks();
+    expect(offsets.length, before + 1);
+    expect(offsets.last, 10);
+  });
+
+  test('重复进出同一分类时 cellsTabIndex 不变（body 复用的前提）', () async {
+    var calls = 0;
+    final provider = NotifierProvider<HomeNotifier, HomeState>(
+      () => HomeNotifier(
+        homepageLoader:
+            ({int tabType = 2, int offset = 0, String? sessionId}) async {
+              calls++;
+              return HomepagePage(
+                items: [_item('a'), _item('b')],
+                nextOffset: null,
+                sessionId: null,
+              );
+            },
+        searchLoader: (query, {int page = 1}) async => [],
+        mangaSearchLoader: ({int offset = 0}) async => [],
+        manjuSearchLoader: ({int offset = 0}) async => [],
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(provider.notifier);
+    final tabIndex = HomeNotifier.tabs.indexOf('短剧');
+
+    await _loadTab(notifier, tabIndex);
+    final cellsTabIndex = container.read(provider).cellsTabIndex;
+
+    await _loadTab(notifier, 0);
+    final beforeReturn = calls;
+    await _loadTab(notifier, tabIndex);
+
+    // 页面 `_bodyFor` 的 key 含 cellsTabIndex：它必须跟着分类走、且切回不重拉。
+    expect(container.read(provider).cellsTabIndex, cellsTabIndex);
+    expect(calls, beforeReturn, reason: '切回不该再请求一次');
+  });
+
+  test('加载成功但为空的分类，再次进入不重拉也不闪回骨架', () async {
+    var calls = 0;
+    final provider = NotifierProvider<HomeNotifier, HomeState>(
+      () => HomeNotifier(
+        homepageLoader:
+            ({int tabType = 2, int offset = 0, String? sessionId}) async {
+              calls++;
+              return const HomepagePage(
+                items: [],
+                nextOffset: null,
+                sessionId: null,
+              );
+            },
+        searchLoader: (query, {int page = 1}) async => [],
+        mangaSearchLoader: ({int offset = 0}) async => [],
+        manjuSearchLoader: ({int offset = 0}) async => [],
+      ),
+    );
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    final notifier = container.read(provider.notifier);
+
+    // 第一次进入：请求一次，成功但没有任何条目。
+    final tabIndex = HomeNotifier.tabs.indexOf('短剧');
+    await _loadTab(notifier, tabIndex);
+    expect(calls, 1);
+    expect(container.read(provider).items, isEmpty);
+    expect(container.read(provider).isLoading, isFalse);
+
+    // 切走再回来：旧判据 `items.isEmpty` 会清空重拉，新判据不拉。
+    await _loadTab(notifier, 0);
+    final before = calls;
+    await _loadTab(notifier, tabIndex);
+    expect(calls, before, reason: '成功加载过的空分类不该再请求一次');
+    expect(
+      container.read(provider).isLoading,
+      isFalse,
+      reason: '不该被重置成 loading 让空态闪回骨架',
+    );
   });
 }
 

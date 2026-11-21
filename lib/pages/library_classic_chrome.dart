@@ -3,10 +3,12 @@ part of 'library_page.dart';
 /// Restored from the pre-archive shelf chrome (f329399). Only action wiring and
 /// the compact access to newer filters/groups differ from the original UI.
 mixin _LibraryClassicChrome on _LibraryShelfViews {
-  bool get _classicHasFilters =>
-      _activeFilters > 0 ||
-      _category != ShelfCategory.all ||
-      (_tab == 2 && _collectionFilter != null);
+  bool get _classicHasFilters => _classicHasFiltersForTab(_tab);
+
+  bool _classicHasFiltersForTab(int tab) =>
+      _activeFiltersForTab(tab) > 0 ||
+      _categoryForTab(tab) != ShelfCategory.all ||
+      (tab == 2 && _collectionFilter != null);
 
   void _setClassicLayout(BookshelfLayout layout) {
     unawaited(
@@ -28,36 +30,77 @@ mixin _LibraryClassicChrome on _LibraryShelfViews {
           // can scroll the tabs without pushing search/more off screen.
           child: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
-            child: Row(
-              key: const Key('library-tabs'),
+            child: Stack(
               children: [
-                for (var index = 0; index < _tabTitles.length; index++) ...[
-                  if (index > 0) const SizedBox(width: 20),
-                  _ClassicTabButton(
-                    label: _tabTitles[index],
-                    selected: _tab == index,
-                    palette: palette,
-                    onTap: () => _selectTab(index),
-                  ),
-                ],
+                Row(
+                  key: const Key('library-tabs'),
+                  children: [
+                    for (var index = 0; index < _tabTitles.length; index++) ...[
+                      if (index > 0) const SizedBox(width: 20),
+                      _ClassicTabButton(
+                        key: _classicTabKeys[index],
+                        label: _tabTitles[index],
+                        selected: _tab == index,
+                        palette: palette,
+                        width: _classicTabWidth(index),
+                        onTap: () => _selectTab(index),
+                      ),
+                    ],
+                  ],
+                ),
+                // The underline is drawn once for the row, so it slides
+                // between the tabs while a finger is down. It listens to the
+                // swipe progress, so it follows the finger frame by frame.
+                ValueListenableBuilder<double>(
+                  valueListenable: _tabProgress,
+                  builder: (context, progress, _) {
+                    final position = _classicFloatingPosition(progress);
+                    final indicatorWidth = _classicIndicatorWidth(position);
+                    final left = _classicUnderlineLeftForPosition(
+                      position,
+                      indicatorWidth,
+                    );
+                    if (left == null) return const SizedBox.shrink();
+                    // While a finger is down the underline tracks the content
+                    // exactly; an implicit animation here would lag behind the
+                    // gesture and then visibly catch up (a hop) at the end.
+                    return AnimatedPositioned(
+                      key: const Key('classic-tab-underline'),
+                      left: left,
+                      bottom: 0,
+                      width: indicatorWidth,
+                      height: 3,
+                      duration: progress == 0
+                          ? _classicUnderlineDuration
+                          : Duration.zero,
+                      curve: Curves.easeOutCubic,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: HomePalette.accent,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    );
+                  },
+                ),
               ],
             ),
           ),
         ),
-        Tooltip(
-          message: '搜索',
-          child: IconButton(
+        if (!(isWindowsDesktop && DesktopShellScope.hasFrameOf(context))) ...[
+          IconButton(
             key: const Key('library-search-button'),
+            tooltip: '搜索',
             onPressed: _openSearch,
             style: IconButton.styleFrom(
               foregroundColor: palette.ink,
               padding: const EdgeInsets.all(8),
-              minimumSize: const Size(38, 38),
+              minimumSize: const Size(48, 48),
             ),
             icon: const Icon(LucideIcons.search, size: 21),
           ),
-        ),
-        const SizedBox(width: 6),
+          const SizedBox(width: 6),
+        ],
         PopupMenuButton<_ClassicMenuAction>(
           key: const Key('library-more-button'),
           tooltip: '更多',
@@ -96,12 +139,18 @@ mixin _LibraryClassicChrome on _LibraryShelfViews {
                 ),
           ],
           child: Padding(
-            padding: const EdgeInsets.only(
-              right: ShelfTokens.screenPadding,
-              left: 6,
-              bottom: 2,
+            padding: const EdgeInsets.only(right: ShelfTokens.screenPadding),
+            // 48×48 matches the M3 IconButton the search button actually
+            // renders as; with the end-aligned row this keeps both glyph
+            // centers on the same baseline (a shorter box would sink the
+            // dots below it).
+            child: SizedBox(
+              width: 48,
+              height: 48,
+              child: Center(
+                child: Icon(LucideIcons.ellipsis, size: 22, color: palette.ink),
+              ),
             ),
-            child: Icon(LucideIcons.ellipsis, size: 22, color: palette.ink),
           ),
         ),
       ],
@@ -136,111 +185,182 @@ mixin _LibraryClassicChrome on _LibraryShelfViews {
     }
   }
 
-  Widget _classicToolbar(HomePalette palette) => Padding(
+  /// L2 工具栏：左「今日已读」胶囊，中间分组筛选胶囊（书架 tab），右侧版式
+  /// 分段。分组胶囊把 `_category` 写成胶囊文案，也是分组入口（点开现有分类
+  /// 弹层，选择 / 新建 / 重命名 / 删除都在那里）。窄屏或大字号固定两行：
+  /// 统计独占第一行，分组与版式共享第二行；宽屏恢复单行。
+  Widget _classicToolbar(HomePalette palette, int tab) => Padding(
     padding: const EdgeInsets.fromLTRB(
       ShelfTokens.screenPadding,
       ShelfTokens.spaceXS,
       ShelfTokens.screenPadding,
       ShelfTokens.spaceS,
     ),
-    child: Row(
-      children: [
-        Expanded(
-          child: SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: _tab == 2
-                ? Row(
-                    children: [
-                      for (final (value, label) in const [
-                        (null, '全部'),
-                        ('video', '短剧'),
-                        ('manju', '漫剧'),
-                      ]) ...[
-                        if (value != null) const SizedBox(width: 8),
-                        HomeChip(
-                          key: Key(
-                            'library-collection-filter-${value ?? 'all'}',
-                          ),
-                          label: label,
-                          selected: _collectionFilter == value,
-                          onTap: () =>
-                              setState(() => _collectionFilter = value),
-                        ),
-                      ],
-                    ],
-                  )
-                : Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 5,
-                    ),
-                    decoration: BoxDecoration(
-                      color: palette.soft,
-                      borderRadius: BorderRadius.circular(
-                        ShelfTokens.radiusChip,
-                      ),
-                      border: palette.eink
-                          ? Border.all(color: palette.line)
-                          : null,
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          LucideIcons.clock,
-                          size: ShelfTokens.iconInline,
-                          color: palette.muted,
-                        ),
-                        const SizedBox(width: 5),
-                        Text(
-                          '今日已读$_todayMinutes分钟',
-                          style: TextStyle(
-                            fontSize: ShelfTokens.subtitle,
-                            fontWeight: FontWeight.w500,
-                            color: palette.ink,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-          ),
-        ),
-        const SizedBox(width: 8),
-        _ClassicLayoutSegments(
+    child: LayoutBuilder(
+      builder: (context, constraints) {
+        final stacked =
+            constraints.maxWidth < 480 ||
+            MediaQuery.textScalerOf(context).scale(1) > 1.4;
+        final collectionFilters = Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final (value, label) in const [
+              (null, '全部'),
+              ('video', '短剧'),
+              ('manju', '漫剧'),
+            ])
+              HomeChip(
+                key: Key('library-collection-filter-${value ?? 'all'}'),
+                label: label,
+                selected: _collectionFilter == value,
+                onTap: () => setState(() => _collectionFilter = value),
+              ),
+          ],
+        );
+        final shelfFilters = Row(
+          children: [
+            _classicTodayPill(palette),
+            Expanded(
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: _classicGroupChip(palette, tab),
+              ),
+            ),
+          ],
+        );
+        final layouts = _ClassicLayoutSegments(
           current: _classicLayout.value,
           palette: palette,
           onChanged: _setClassicLayout,
+        );
+        if (!stacked) {
+          return Row(
+            children: [
+              Expanded(child: tab == 0 ? shelfFilters : collectionFilters),
+              const SizedBox(width: 8),
+              layouts,
+            ],
+          );
+        }
+        if (tab == 0) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Align(
+                alignment: Alignment.centerLeft,
+                child: _classicTodayPill(palette),
+              ),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Flexible(
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: _classicGroupChip(palette, tab),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  layouts,
+                ],
+              ),
+            ],
+          );
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            collectionFilters,
+            const SizedBox(height: 4),
+            Align(alignment: Alignment.centerRight, child: layouts),
+          ],
+        );
+      },
+    ),
+  );
+
+  Widget _classicTodayPill(HomePalette palette) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+    decoration: BoxDecoration(
+      color: palette.soft,
+      borderRadius: BorderRadius.circular(ShelfTokens.radiusChip),
+      border: palette.eink ? Border.all(color: palette.line) : null,
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          LucideIcons.clock,
+          size: ShelfTokens.iconInline,
+          color: palette.muted,
+        ),
+        const SizedBox(width: 5),
+        Text(
+          '今日已读$_todayMinutes分钟',
+          style: TextStyle(
+            fontSize: ShelfTokens.subtitle,
+            fontWeight: FontWeight.w500,
+            color: palette.ink,
+          ),
         ),
       ],
     ),
   );
 
+  /// 分组胶囊的宽度上限：长分组名只省略，不把工具栏推出去换行。
+  Widget _classicGroupChip(HomePalette palette, int tab) {
+    final category = _categoryForTab(tab);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 148),
+      child: _ClassicGroupChip(
+        key: const Key('shelf-group-chip'),
+        label: ShelfGroupStore.instance.nameOf(category),
+        active: category != ShelfCategory.all,
+        palette: palette,
+        onTap: () => unawaited(_openCategorySheet()),
+      ),
+    );
+  }
+
   /// No permanent archive toolbar. Applied filters must nevertheless never be
   /// invisible, including a category selected while the archive was active.
-  Widget _classicFilterStatus(HomePalette palette) => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: ShelfTokens.screenPadding),
-    child: Row(
-      key: const Key('classic-shelf-active-filters'),
-      children: [
-        Icon(Icons.filter_list, size: 13, color: palette.muted),
-        const SizedBox(width: 5),
-        Expanded(
-          child: Text(
-            '已筛选${_category == ShelfCategory.all ? '' : ' · ${ShelfGroupStore.instance.nameOf(_category)}'}',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: ShelfTokens.subtitle,
-              color: palette.muted,
+  Widget _classicFilterStatus(HomePalette palette, int tab) => SizedBox(
+    // 定高等于 M3 TextButton 默认 40：与 [ShelfTokens.filterStatusHeight]
+    // 互为约定，空态锚点按它补偿。
+    height: ShelfTokens.filterStatusHeight,
+    child: Padding(
+      padding: const EdgeInsets.symmetric(
+        horizontal: ShelfTokens.screenPadding,
+      ),
+      // 辅助功能大字号（iOS 可达 ~3x）下 TextButton 标签固有高度
+      // （14 × 3 × 1.43 ≈ 60）会超过 40 定高向行外溢出；钳制 1.3 倍
+      // （≈26 < 40）保住定高契约，与 dock 入口的钳制做法一致。
+      child: MediaQuery.withClampedTextScaling(
+        maxScaleFactor: 1.3,
+        child: Row(
+          key: const Key('classic-shelf-active-filters'),
+          children: [
+            Icon(Icons.filter_list, size: 13, color: palette.muted),
+            const SizedBox(width: 5),
+            Expanded(
+              child: Text(
+                '已筛选${_categoryForTab(tab) == ShelfCategory.all ? '' : ' · ${ShelfGroupStore.instance.nameOf(_categoryForTab(tab))}'}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: ShelfTokens.subtitle,
+                  color: palette.muted,
+                ),
+              ),
             ),
-          ),
+            TextButton(
+              key: const Key('classic-shelf-clear-filters'),
+              onPressed: _clearFilters,
+              child: const Text('清除筛选'),
+            ),
+          ],
         ),
-        TextButton(
-          key: const Key('classic-shelf-clear-filters'),
-          onPressed: _clearFilters,
-          child: const Text('清除筛选'),
-        ),
-      ],
+      ),
     ),
   );
 

@@ -1,14 +1,18 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/cached_books_page.dart';
+import 'package:fqapp/services/app_theme_style.dart';
 import 'package:fqapp/services/book_txt_export.dart';
 import 'package:fqapp/services/chapter_cache_store.dart';
+import 'package:fqapp/services/chapter_text_formatter.dart';
+import 'package:fqapp/widgets/wenku/wenku_ui.dart';
 
+import 'support/app_ui_host.dart';
 import 'support/fakes.dart';
 
 void main() {
@@ -24,22 +28,51 @@ void main() {
       bookId: 'book-1',
       chapterId: '1',
       title: '第一章',
-      text: '缓存正文',
+      text: ChapterContent(
+        blocks: const [
+          ChapterImage(url: 'https://images.test/cover'),
+          ChapterParagraph('图注', isImageCaption: true),
+          ChapterParagraph('\u200B \u200B \u200B'),
+          ChapterParagraph('第一章'),
+          ChapterParagraph('第一章'),
+          ChapterParagraph('缓存正文'),
+          ChapterParagraph('字面 <tag> &amp;'),
+          ChapterParagraph('\u200B \u200B \u200B'),
+        ],
+      ).toCacheText(),
     );
     return cache;
   }
 
-  testWidgets('导出整本写进系统下载目录并回报路径', (tester) async {
+  testWidgets('导出复用缓存并补取最新目录缺章，写进系统下载目录', (tester) async {
     SharedPreferences.setMockInitialValues({});
     final cache = await cachedBook();
+    await cache.saveBook(
+      CachedBook(id: 'book-1', title: '测试书', chapters: [first, second]),
+    );
+    await cache.write(
+      bookId: 'book-1',
+      chapterId: '2',
+      title: '第二章',
+      text: ChapterContent(
+        blocks: const [
+          ChapterParagraph('第二章'),
+          ChapterParagraph('\u200B \u200B \u200B'),
+        ],
+      ).toCacheText(),
+    );
     final sink = _RecordingSink();
+    final requested = <String>[];
     await tester.pumpWidget(
       MaterialApp(
         home: CachedBooksPage(
           cacheStore: cache,
           readerStore: MemoryReaderStore(),
           exportDirectoryLoader: (bookId) async => [first, second],
-          exportChapterLoader: (chapter) async => '正文${chapter.itemId}',
+          exportChapterLoader: (chapter) async {
+            requested.add(chapter.itemId);
+            return '第二章\n\n正文${chapter.itemId}\n　\n';
+          },
           exportSink: sink,
         ),
       ),
@@ -50,7 +83,13 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(sink.calls.single.fileName, '测试书.txt');
-    expect(sink.calls.single.text, '# 第一章\n正文1\n\n# 第二章\n正文2\n\n');
+    expect(
+      sink.calls.single.text,
+      '# 第一章\n图注\n第一章\n缓存正文\n字面 <tag> &amp;\n\n'
+      '# 第二章\n正文2\n\n',
+    );
+    expect(requested, ['2']);
+    expect(await cache.cachedChapterIds('book-1'), {'1', '2'});
     expect(find.textContaining('已导出《测试书》2 章'), findsOneWidget);
     expect(find.textContaining('/sdcard/Download/测试书.txt'), findsOneWidget);
     // 行内其余操作没有被这次改动挤掉。
@@ -83,7 +122,7 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 20));
 
-    expect(find.text('导出 0/2 章'), findsOneWidget);
+    expect(find.text('导出 1/2 章'), findsOneWidget);
     expect(find.byTooltip('取消导出'), findsOneWidget);
 
     await tester.tap(exportButton);
@@ -94,8 +133,8 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(sink.calls, isEmpty);
-    expect(find.text('导出 0/2 章'), findsNothing);
-    expect(find.byTooltip('导出 TXT 到系统「下载」'), findsOneWidget);
+    expect(find.text('导出 1/2 章'), findsNothing);
+    expect(find.byTooltip('导出 TXT 文件'), findsOneWidget);
   });
 
   testWidgets('上游取不到目录时报告失败而不是写出空书', (tester) async {
@@ -121,6 +160,175 @@ void main() {
     expect(sink.calls, isEmpty);
     expect(find.textContaining('目录获取失败'), findsOneWidget);
   });
+
+  testWidgets('经典主题导出入口仍写整本并保留行内操作', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final cache = await cachedBook();
+    final sink = _RecordingSink();
+    final styleStore = AppThemeStyleStore()..value = AppThemeStyle.classic;
+    addTearDown(styleStore.dispose);
+    await tester.pumpWidget(
+      AppUiHost(
+        store: styleStore,
+        home: CachedBooksPage(
+          cacheStore: cache,
+          readerStore: MemoryReaderStore(),
+          exportDirectoryLoader: (bookId) async => [first, second],
+          exportChapterLoader: (chapter) async => '正文${chapter.itemId}',
+          exportSink: sink,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(ClassicFeaturePage), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('cached_book_export_book-1')));
+    await tester.pumpAndSettle();
+
+    expect(sink.calls.single.fileName, '测试书.txt');
+    expect(find.textContaining('已导出《测试书》2 章'), findsOneWidget);
+    expect(find.byTooltip('删除《测试书》缓存'), findsOneWidget);
+  });
+
+  testWidgets('导出中切换主题保留进度、取消与页面 State', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final cache = await cachedBook();
+    final sink = _RecordingSink();
+    final gate = Completer<void>();
+    final styleStore = AppThemeStyleStore()..value = AppThemeStyle.archive;
+    addTearDown(styleStore.dispose);
+    await tester.pumpWidget(
+      AppUiHost(
+        store: styleStore,
+        home: CachedBooksPage(
+          cacheStore: cache,
+          readerStore: MemoryReaderStore(),
+          exportDirectoryLoader: (bookId) async => [first, second],
+          exportChapterLoader: (chapter) async {
+            await gate.future;
+            return '正文${chapter.itemId}';
+          },
+          exportSink: sink,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final state = tester.state(find.byType(CachedBooksPage));
+
+    await tester.tap(find.byKey(const Key('cached_book_export_book-1')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+    expect(find.text('导出 1/2 章'), findsOneWidget);
+
+    await styleStore.select(AppThemeStyle.classic);
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ClassicFeaturePage), findsOneWidget);
+    expect(tester.state(find.byType(CachedBooksPage)), same(state));
+    expect(find.text('导出 1/2 章'), findsOneWidget);
+    expect(find.byTooltip('取消导出'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('cached_book_export_book-1')));
+    await tester.pump();
+    expect(find.textContaining('已取消导出'), findsOneWidget);
+    gate.complete();
+    await tester.pumpAndSettle();
+    expect(sink.calls, isEmpty);
+  });
+
+  testWidgets('40 条缓存导出中切主题：按同一本书恢复且不重启导出', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    await tester.binding.setSurfaceSize(const Size(800, 600));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final cache = _StubCacheStore();
+    for (var index = 0; index < 40; index++) {
+      final id = 'book-$index';
+      await cache.saveBook(
+        CachedBook(id: id, title: 'Book ${index + 1}', chapters: [first]),
+      );
+      await cache.write(bookId: id, chapterId: '1', title: '第一章', text: '缓存正文');
+    }
+    final sink = _RecordingSink();
+    final gate = Completer<void>();
+    var directoryCalls = 0;
+    final styleStore = AppThemeStyleStore()..value = AppThemeStyle.archive;
+    addTearDown(styleStore.dispose);
+    await tester.pumpWidget(
+      AppUiHost(
+        store: styleStore,
+        home: CachedBooksPage(
+          cacheStore: cache,
+          readerStore: MemoryReaderStore(),
+          exportDirectoryLoader: (bookId) async {
+            directoryCalls++;
+            return [first, second];
+          },
+          exportChapterLoader: (chapter) async {
+            await gate.future;
+            return '正文${chapter.itemId}';
+          },
+          exportSink: sink,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final list = find.byKey(const ValueKey('cached-books-scroll'));
+    final scrollable = find
+        .descendant(of: list, matching: find.byType(Scrollable))
+        .first;
+    final position = tester.state<ScrollableState>(scrollable).position;
+    position.jumpTo(1300);
+    await tester.pump();
+
+    final pageState = tester.state(find.byType(CachedBooksPage));
+    final anchor = _firstVisibleExportBook(tester, list);
+    expect(anchor, isNotNull);
+    await tester.tap(find.byKey(Key('cached_book_export_${anchor!.id}')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+    expect(directoryCalls, 1);
+    expect(find.text('导出 1/2 章'), findsOneWidget);
+
+    // 进度行改变了行高，切换前重新取一次锚点。
+    final before = _firstVisibleExportBook(tester, list);
+    await styleStore.select(AppThemeStyle.classic);
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ClassicFeaturePage), findsOneWidget);
+    expect(tester.state(find.byType(CachedBooksPage)), same(pageState));
+    expect(directoryCalls, 1);
+    expect(find.text('导出 1/2 章'), findsOneWidget);
+    expect(find.byTooltip('取消导出'), findsOneWidget);
+    final after = _firstVisibleExportBook(tester, list);
+    expect(after, isNotNull);
+    expect(after!.id, before!.id);
+    expect(after.offset, closeTo(before.offset, 1.0));
+
+    await tester.tap(find.byKey(Key('cached_book_export_${before.id}')));
+    await tester.pump();
+    gate.complete();
+    await tester.pumpAndSettle();
+    expect(sink.calls, isEmpty);
+  });
+}
+
+({String id, double offset})? _firstVisibleExportBook(
+  WidgetTester tester,
+  Finder list,
+) {
+  final viewport = tester.getRect(list);
+  final contentTop = viewport.top + kToolbarHeight;
+  for (var index = 0; index < 40; index++) {
+    final finder = find.text('Book ${index + 1}');
+    if (finder.evaluate().isEmpty) continue;
+    final rect = tester.getRect(finder);
+    if (rect.bottom <= contentTop + 0.5) continue;
+    if (rect.top < contentTop - 0.5) continue;
+    if (rect.bottom > viewport.bottom + 0.5) continue;
+    return (id: 'book-$index', offset: contentTop - rect.top);
+  }
+  return null;
 }
 
 class _RecordingSink implements TxtSink {

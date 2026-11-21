@@ -1,13 +1,16 @@
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive_ce/hive.dart';
 
 import 'package:fqapp/models/media_item.dart';
+import 'package:fqapp/models/shuqi_book.dart';
 import 'package:fqapp/pages/library_page.dart';
+import 'package:fqapp/pages/reader_page.dart';
 import 'package:fqapp/pages/shuqi_detail_page.dart';
 import 'package:fqapp/services/chapter_cache_store.dart';
+import 'package:fqapp/services/connectivity_status.dart';
 import 'package:fqapp/services/library_store.dart';
 import 'package:fqapp/services/shelf_store.dart';
 import 'package:fqapp/services/shelf_view_store.dart';
@@ -90,7 +93,93 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
-  testWidgets('番茄历史进度不会串到同 id 书旗条目', (tester) async {
+  testWidgets('离线书旗从书架直读来源缓存并保留原书架元数据', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(400, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final item = _item('123', title: '书架书旗书', source: 'shuqi').copyWith(
+      author: '书旗原作者',
+      badge: '完结',
+      intro: '书架保存的简介',
+      categories: ['仙侠'],
+    );
+    await tester.runAsync(() => ShelfStore.instance.add(item));
+    final cache = MemoryChapterCache();
+    final chapter = Chapter(itemId: '10', title: '书旗第一章', volumeName: '');
+    await cache.saveBook(
+      CachedBook(id: 'shuqi:123', title: '旧缓存标题', chapters: [chapter]),
+    );
+    await cache.write(
+      bookId: 'shuqi:123',
+      chapterId: '10',
+      title: chapter.title,
+      text: '只属于书旗的离线正文。',
+    );
+    // A raw ID collision must neither supply the chapter nor its progress.
+    await cache.saveBook(
+      CachedBook(
+        id: '123',
+        title: '同号番茄缓存',
+        chapters: [Chapter(itemId: '99', title: '番茄章', volumeName: '')],
+      ),
+    );
+    await cache.write(
+      bookId: '123',
+      chapterId: '99',
+      title: '番茄章',
+      text: '番茄正文',
+    );
+    final history = _CountingReaderStore()
+      ..entries['123'] = {
+        'id': '123',
+        'kind': 'book',
+        'chapterId': '99',
+        'episode': 5,
+      }
+      ..entries['shuqi:123'] = {
+        'id': 'shuqi:123',
+        'bookId': 'shuqi:123',
+        'contentId': '123',
+        'source': 'shuqi',
+        'kind': 'book',
+        'chapterId': '10',
+        'episode': 0,
+      };
+    var directoryCalls = 0;
+    await tester.pumpWidget(
+      _app(
+        cache: cache,
+        readerStore: history,
+        connectivity: () async => (online: false, metered: false),
+        directoryLoader: (_) async {
+          directoryCalls++;
+          throw StateError('书旗离线入口不得取番茄目录');
+        },
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('shelf-book-shuqi/book:123')));
+    await tester.pumpAndSettle();
+
+    final reader = tester.widget<ReaderPage>(find.byType(ReaderPage));
+    expect(reader.bookId, 'shuqi:123');
+    expect(reader.title, item.title);
+    expect(reader.chapters.single.itemId, '10');
+    expect(reader.startIndex, 0);
+    expect(reader.localOnly, isTrue);
+    expect(reader.shelfItem!.toJson(), item.toJson());
+    expect(reader.readerStore, same(history));
+    expect(find.byType(ShuqiDetailPage, skipOffstage: false), findsNothing);
+    expect(directoryCalls, 0);
+    expect(history.reads, greaterThan(0));
+    expect(history.entries['123']!['chapterId'], '99');
+    expect(history.entries['shuqi:123']!['source'], shuqiSourceId);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+    expect(history.readSeconds, 0, reason: '书旗进度保存，但仍不计入阅读时长');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('番茄与书旗历史进度按来源隔离', (tester) async {
     await tester.binding.setSurfaceSize(const Size(400, 800));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.runAsync(() async {
@@ -107,6 +196,18 @@ void main() {
         'progress': 0.5,
         'time': DateTime.now().millisecondsSinceEpoch,
       });
+      await LibraryStore.instance.addHistory({
+        'id': 'shuqi:123',
+        'bookId': 'shuqi:123',
+        'contentId': '123',
+        'source': 'shuqi',
+        'kind': 'book',
+        'title': '书旗书',
+        'episode': 1,
+        'chapterCount': 10,
+        'progress': 0.2,
+        'time': DateTime.now().millisecondsSinceEpoch - 1,
+      });
     });
     await tester.pumpWidget(_app());
     await tester.pumpAndSettle();
@@ -118,8 +219,9 @@ void main() {
       find.byKey(const ValueKey('shelf-book-shuqi/book:123')),
     );
     expect(fanqie.progress, '第5章 · 共10章');
-    expect(shuqi.progress, isNull);
+    expect(shuqi.progress, '第2章 · 共10章');
     expect(find.text('第5章 · 共10章'), findsOneWidget);
+    expect(find.text('第2章 · 共10章'), findsOneWidget);
   });
 
   testWidgets('更新检测只处理番茄书，书旗条目不会出现更新角标', (tester) async {
@@ -221,8 +323,71 @@ void main() {
   });
 }
 
-Widget _app({ChapterCache? cache}) =>
-    MaterialApp(home: LibraryPage(cacheStore: cache));
+Widget _app({
+  ChapterCache? cache,
+  ReaderStore? readerStore,
+  Future<ConnectivityView> Function()? connectivity,
+  Future<List<Chapter>> Function(String)? directoryLoader,
+}) => MaterialApp(
+  home: LibraryPage(
+    cacheStore: cache,
+    readerStore: readerStore,
+    connectivity: connectivity,
+    directoryLoader: directoryLoader,
+  ),
+);
+
+class _CountingReaderStore extends MemoryReaderStore {
+  final Map<String, Map<String, dynamic>> entries = {};
+  int reads = 0;
+  int writes = 0;
+  double readSeconds = 0;
+
+  @override
+  Future<Map<String, dynamic>?> historyEntry(String id) async {
+    reads++;
+    final entry = entries[id];
+    return entry == null ? null : Map<String, dynamic>.from(entry);
+  }
+
+  @override
+  Future<void> addHistory(Map<String, dynamic> entry) async {
+    writes++;
+    entries[entry['id'].toString()] = Map<String, dynamic>.from(entry);
+  }
+
+  @override
+  Future<void> updateProgress(
+    String id,
+    int episode,
+    double progress, {
+    String? chapterId,
+    double? position,
+    double? maxScroll,
+  }) async {
+    writes++;
+    entries[id] = {
+      ...?entries[id],
+      'id': id,
+      'episode': episode,
+      'progress': progress,
+      'chapterId': ?chapterId,
+      'position': ?position,
+      'maxScroll': ?maxScroll,
+    };
+  }
+
+  @override
+  Future<void> accumulateReadTime(
+    String bookId,
+    String kind,
+    double seconds, {
+    DateTime? at,
+  }) async {
+    writes++;
+    readSeconds += seconds;
+  }
+}
 
 /// A `ChapterCacheStore` whose catalogue summary is already in memory, so the
 /// page's scan completes inside the widget test's fake-async zone.

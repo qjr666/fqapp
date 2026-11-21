@@ -3,6 +3,7 @@ import 'package:hive_ce/hive.dart';
 
 import '../models/media_item.dart';
 import '../models/shelf_identity.dart';
+import '../models/shuqi_book.dart';
 import 'encrypted_hive.dart';
 
 /// One 加入书架 record.
@@ -64,8 +65,56 @@ class ShelfStore {
 
   Future<void> init() async {
     if (_openBox != null) return;
-    _box = await EncryptedHive.openBox<dynamic>(Hive, boxName);
+    final box = await EncryptedHive.openBox<dynamic>(Hive, boxName);
+    await _migrateShuqiReaderEntries(box);
+    _box = box;
     _revision.value++;
+  }
+
+  Future<void> _migrateShuqiReaderEntries(Box<dynamic> box) async {
+    final readerId = RegExp(r'^shuqi:([0-9]+)$');
+    final additions = <String, dynamic>{};
+    final oldKeys = <String>[];
+    for (final key in box.keys) {
+      final raw = box.get(key);
+      if (key is! String || raw is! Map || raw['kind'] != 'book') continue;
+      final id = raw['id'];
+      if (id is! String || key != keyFor('book', id)) continue;
+      final bookId = readerId.firstMatch(id)?.group(1);
+      if (bookId == null || !ShelfIdentity.isValidContentId(bookId)) continue;
+      if ((raw['source'] != null && raw['source'] != ShelfIdentity.fanqie) ||
+          raw['seriesId'] != null ||
+          raw['episodeId'] != null) {
+        continue;
+      }
+      final target = keyFor('book', bookId, source: shuqiSourceId);
+      if (box.containsKey(target)) {
+        final existing = box.get(target);
+        final item = existing is Map
+            ? _itemFrom(existing, storageKey: target)
+            : null;
+        if (item == null ||
+            item.id != bookId ||
+            item.kind != 'book' ||
+            !isShuqiItem(item) ||
+            item.seriesId != null ||
+            item.episodeId != null) {
+          continue;
+        }
+      } else {
+        additions[target] = {...raw, 'id': bookId, 'source': shuqiSourceId};
+      }
+      oldKeys.add(key);
+    }
+    if (oldKeys.isNotEmpty) {
+      // Older readers saved their session ID as a fanqie shelf entry (#270).
+      // Keep addedAt and any canonical record; flush before removing old keys
+      // so an interrupted migration can retry without losing the book.
+      if (additions.isNotEmpty) await box.putAll(additions);
+      await box.flush();
+      await box.deleteAll(oldKeys);
+    }
+    await box.flush();
   }
 
   bool contains(String kind, String id, {String source = 'fanqie'}) {
@@ -73,8 +122,7 @@ class ShelfStore {
     return value is Map;
   }
 
-  bool containsItem(MediaItem item) =>
-      _openBox?.containsKey(keyOf(item)) ?? false;
+  bool containsItem(MediaItem item) => _openBox?.get(keyOf(item)) is Map;
 
   /// Newest first. Callers that need the official ordering (置顶 → 最近阅读)
   /// sort further; this is only the storage order.
@@ -90,9 +138,7 @@ class ShelfStore {
       // heal its source instead of being read as a 番茄 book.
       final item = _itemFrom(raw, storageKey: key.toString());
       if (item == null) continue;
-      records.add(
-        ShelfRecord(item: item, addedAt: _addedAt(raw) ?? DateTime(1970)),
-      );
+      records.add(ShelfRecord(item: item, addedAt: _addedAt(raw)));
     }
     records.sort((a, b) => b.addedAt.compareTo(a.addedAt));
     return records;
@@ -104,7 +150,7 @@ class ShelfStore {
     final box = _openBox;
     if (box == null) return false;
     final key = keyOf(item);
-    if (box.containsKey(key)) {
+    if (box.get(key) is Map) {
       await box.delete(key);
       _revision.value++;
       return false;
@@ -160,7 +206,7 @@ class ShelfStore {
     if (box == null) throw StateError('书架尚未初始化');
     final missing = {
       for (final record in records)
-        if (!box.containsKey(keyOf(record.item)))
+        if (box.get(keyOf(record.item)) is! Map)
           keyOf(record.item): _recordOf(record.item, record.addedAt),
     };
     if (missing.isEmpty) {
@@ -207,6 +253,34 @@ class ShelfStore {
     return changed;
   }
 
+  /// One in-memory Hive batch: a user toggle after this starts wins naturally.
+  /// Null placeholders hide removed entries without an await/delete race.
+  Future<bool> applySyncedRecords({
+    required List<ShelfRecord> incoming,
+    required bool Function(List<ShelfRecord>) acceptsCurrent,
+  }) async {
+    final box = _openBox;
+    if (box == null) throw StateError('书架尚未初始化');
+    final current = records();
+    if (!acceptsCurrent(current)) return false;
+    final writes = <String, dynamic>{
+      for (final record in incoming)
+        if (record.item.source == ShelfIdentity.fanqie)
+          keyOf(record.item): _recordOf(record.item, record.addedAt),
+    };
+    for (final record in current) {
+      if (record.item.source != ShelfIdentity.fanqie ||
+          (record.item.seriesId ?? record.item.id).startsWith('local_')) {
+        continue;
+      }
+      writes.putIfAbsent(keyOf(record.item), () => null);
+    }
+    await box.putAll(writes);
+    await box.flush();
+    _revision.value++;
+    return true;
+  }
+
   static Map<String, dynamic> _recordOf(MediaItem item, DateTime addedAt) => {
     'id': item.id,
     'kind': item.kind,
@@ -226,11 +300,16 @@ class ShelfStore {
     'addedAt': addedAt.millisecondsSinceEpoch,
   };
 
-  static DateTime? _addedAt(Map<dynamic, dynamic> raw) {
+  static DateTime _addedAt(Map<dynamic, dynamic> raw) {
     final value = raw['addedAt'];
-    return value is num && value > 0
+    // The backup contract uses epoch 0 for an unknown collection time.
+    const maxMilliseconds = 8640000000000000;
+    return value is num &&
+            value.isFinite &&
+            value >= 0 &&
+            value <= maxMilliseconds
         ? DateTime.fromMillisecondsSinceEpoch(value.toInt())
-        : null;
+        : DateTime.fromMillisecondsSinceEpoch(0);
   }
 
   /// A broken record must not take the whole shelf down with it: unknown shapes

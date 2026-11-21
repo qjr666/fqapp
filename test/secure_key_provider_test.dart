@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/services/secure_key_provider.dart';
 
@@ -8,6 +10,15 @@ import 'package:fqapp/services/secure_key_provider.dart';
 /// forever — a wedged Keystore, or an unmocked platform channel in widget
 /// tests, both present as a Future that never completes.
 void main() {
+  test('Linux never replaces a malformed persisted key', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final storage = InMemorySecureKeyStorage();
+    await storage.write(SecureKeyProvider.hiveBoxKeyName, 'malformed');
+    expect(await SecureKeyProvider(storage: storage).getOrCreateKey(), isNull);
+    expect(await storage.read(SecureKeyProvider.hiveBoxKeyName), 'malformed');
+  });
+
   test('a never-resolving read degrades to null after the timeout', () async {
     final provider = SecureKeyProvider(
       storage: _HangingStorage(),
@@ -18,17 +29,20 @@ void main() {
     expect(stopwatch.elapsedMilliseconds, lessThan(5000));
   });
 
-  test('a failed load is cached: the next lookup returns null at once', () async {
-    final provider = SecureKeyProvider(
-      storage: _HangingStorage(),
-      storageTimeout: const Duration(milliseconds: 100),
-    );
-    expect(await provider.getOrCreateKey(), isNull);
-    final stopwatch = Stopwatch()..start();
-    expect(await provider.getOrCreateKey(), isNull);
-    // Would take another full timeout if the failure were not cached.
-    expect(stopwatch.elapsedMilliseconds, lessThan(50));
-  });
+  test(
+    'a failed load is cached: the next lookup returns null at once',
+    () async {
+      final provider = SecureKeyProvider(
+        storage: _HangingStorage(),
+        storageTimeout: const Duration(milliseconds: 100),
+      );
+      expect(await provider.getOrCreateKey(), isNull);
+      final stopwatch = Stopwatch()..start();
+      expect(await provider.getOrCreateKey(), isNull);
+      // Would take another full timeout if the failure were not cached.
+      expect(stopwatch.elapsedMilliseconds, lessThan(50));
+    },
+  );
 
   test('a throwing store degrades to null', () async {
     final provider = SecureKeyProvider(
@@ -63,8 +77,7 @@ class _HangingStorage implements SecureKeyStorage {
   Future<String?> read(String key) => Completer<String?>().future;
 
   @override
-  Future<void> write(String key, String value) =>
-      Completer<void>().future;
+  Future<void> write(String key, String value) => Completer<void>().future;
 
   @override
   Future<void> delete(String key) => Completer<void>().future;

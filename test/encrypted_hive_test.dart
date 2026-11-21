@@ -1,6 +1,8 @@
 import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
+
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive_ce/hive.dart';
@@ -27,6 +29,52 @@ void main() {
     await dir.delete(recursive: true);
   });
 
+  test('Linux refuses plaintext fallback when key storage fails', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    await storage.write(SecureKeyProvider.hiveBoxKeyName, 'malformed');
+    await expectLater(
+      EncryptedHive.openBox(Hive, 'no_key', keys: keys),
+      throwsStateError,
+    );
+    await expectLater(
+      EncryptedHive.openLazyBox(Hive, 'no_key_lazy', keys: keys),
+      throwsStateError,
+    );
+    expect(dir.listSync().whereType<File>(), isEmpty);
+  });
+
+  test('Linux wrong key preserves eager and lazy ciphertext', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    for (final lazy in [false, true]) {
+      final name = lazy ? 'linux_lazy' : 'linux_eager';
+      if (lazy) {
+        final box = await EncryptedHive.openLazyBox<String>(
+          Hive,
+          name,
+          keys: keys,
+        );
+        await box.put('sentinel', 'private content');
+        await box.close();
+      } else {
+        final box = await EncryptedHive.openBox<String>(Hive, name, keys: keys);
+        await box.put('sentinel', 'private content');
+        await box.close();
+      }
+      final file = File('${dir.path}/${name}_enc.hive');
+      final original = file.readAsBytesSync();
+      final wrong = SecureKeyProvider(storage: InMemorySecureKeyStorage());
+      await expectLater(
+        lazy
+            ? EncryptedHive.openLazyBox<String>(Hive, name, keys: wrong)
+            : EncryptedHive.openBox<String>(Hive, name, keys: wrong),
+        throwsA(isA<HiveError>()),
+      );
+      expect(file.readAsBytesSync(), original);
+    }
+  });
+
   test('encrypted box does not leave plaintext on disk', () async {
     const sentinel = 'SECRET-CHAPTER-TEXT-7f3a9c';
     final box = await EncryptedHive.openBox<dynamic>(
@@ -37,15 +85,8 @@ void main() {
     await box.put('k1', {'text': sentinel});
     await box.close();
 
-    final files = dir
-        .listSync()
-        .whereType<File>()
-        .map((f) => f.path)
-        .toList();
-    expect(
-      files.any((p) => p.endsWith('chapter_cache_v1_enc.hive')),
-      isTrue,
-    );
+    final files = dir.listSync().whereType<File>().map((f) => f.path).toList();
+    expect(files.any((p) => p.endsWith('chapter_cache_v1_enc.hive')), isTrue);
     for (final path in files) {
       final bytes = File(path).readAsBytesSync();
       expect(
@@ -70,11 +111,7 @@ void main() {
     await legacy.put('b', {'title': 'Book B'});
     await legacy.close();
 
-    final box = await EncryptedHive.openBox<dynamic>(
-      Hive,
-      'shelf',
-      keys: keys,
-    );
+    final box = await EncryptedHive.openBox<dynamic>(Hive, 'shelf', keys: keys);
     expect((box.get('a') as Map)['title'], 'Book A');
     expect((box.get('b') as Map)['title'], 'Book B');
     expect(await Hive.boxExists('shelf'), isFalse);
@@ -96,29 +133,19 @@ void main() {
     await partial.put('a', {'title': 'Book A'});
     await partial.close();
 
-    final box = await EncryptedHive.openBox<dynamic>(
-      Hive,
-      'shelf',
-      keys: keys,
-    );
+    final box = await EncryptedHive.openBox<dynamic>(Hive, 'shelf', keys: keys);
     expect((box.get('a') as Map)['title'], 'Book A');
     expect((box.get('b') as Map)['title'], 'Book B');
     expect(await Hive.boxExists('shelf'), isFalse);
   });
 
   test('lost key treats the encrypted box as empty', () async {
-    final box = await EncryptedHive.openBox<dynamic>(
-      Hive,
-      'shelf',
-      keys: keys,
-    );
+    final box = await EncryptedHive.openBox<dynamic>(Hive, 'shelf', keys: keys);
     await box.put('a', {'title': 'Book A'});
     await box.close();
 
     // Fresh secure storage => fresh key that cannot open the old box.
-    final lostKeys = SecureKeyProvider(
-      storage: InMemorySecureKeyStorage(),
-    );
+    final lostKeys = SecureKeyProvider(storage: InMemorySecureKeyStorage());
     final reopened = await EncryptedHive.openBox<dynamic>(
       Hive,
       'shelf',
@@ -129,11 +156,7 @@ void main() {
   });
 
   test('lost key keeps the unreadable box and opens a fresh one', () async {
-    final box = await EncryptedHive.openBox<dynamic>(
-      Hive,
-      'shelf',
-      keys: keys,
-    );
+    final box = await EncryptedHive.openBox<dynamic>(Hive, 'shelf', keys: keys);
     await box.put('a', {'title': 'Book A'});
     await box.close();
     final original = File('${dir.path}/shelf_enc.hive');
@@ -143,9 +166,7 @@ void main() {
     // A transient Keystore hiccup hands back a key that cannot open the box.
     // Its ciphertext must survive: renamed out of Hive's lookup names, never
     // deleted, with a fresh empty box taking its place.
-    final lostKeys = SecureKeyProvider(
-      storage: InMemorySecureKeyStorage(),
-    );
+    final lostKeys = SecureKeyProvider(storage: InMemorySecureKeyStorage());
     final reopened = await EncryptedHive.openBox<dynamic>(
       Hive,
       'shelf',

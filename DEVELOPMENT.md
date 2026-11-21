@@ -1,4 +1,4 @@
-# fqapp 开发者文档
+# novel-sound 开发者文档
 
 面向构建、修改和调试本项目的开发者。用户使用说明见 [README.md](README.md)。
 
@@ -11,11 +11,13 @@
 - [架构总览](#架构总览)
 - [项目结构](#项目结构)
 - [注释与公开依据](#注释与公开依据)
+- [代码格式](#代码格式)
 - [构建环境](#构建环境)
 - [构建 APK](#构建-apk)
 - [安卓 release 签名](#安卓-release-签名)
 - [测试](#测试)
 - [Android 原生核心集成](#android-原生核心集成)
+- [本机密钥库（SecureKeyStorage）](#本机密钥库securekeystorage)
 - [API 对接说明](#api-对接说明)
 - [数据模型](#数据模型)
 - [页面说明](#页面说明)
@@ -85,7 +87,7 @@ Android WebView 由用户本人完成官方手机号登录和人机验证。Cook
 ## 项目结构
 
 ```
-fqapp/
+novel-sound/
 ├── lib/                             # Flutter UI、模型和本地状态
 │   ├── main.dart                    # AppBootstrap + RootShell
 │   ├── models/                      # 数据模型与响应解析
@@ -147,14 +149,30 @@ fqapp/
 
 ---
 
+## 代码格式
+
+统一入口为 `scripts/format_all.ps1` / `scripts/format_all.sh`，首阶段覆盖 Dart、
+手写 Rust 与已有 JavaScript 脚本。首次运行 `npm ci --ignore-scripts` 安装锁定的
+Prettier；工具版本、排除范围、按改动格式化及 CI 策略见
+[脚本说明](scripts/README.md#统一代码格式)。
+
+```powershell
+.\scripts\format_all.ps1 -Since origin/master
+.\scripts\format_all.ps1 -Check -Since origin/master
+```
+
+Linux/macOS 对应 `bash scripts/format_all.sh --since origin/master`，加 `--check`
+只检查；省略改动范围则处理全部支持的源码。
+
 ## 构建环境
 
 ### 环境要求
 
 | 工具 | 版本 | 用途 |
 |---|---|---|
-| Flutter | 3.44.6 (stable) | 构建 App |
-| Dart SDK | 3.12+ | 随 Flutter |
+| Flutter | 3.50.0 (stable) | 构建 App |
+| Dart SDK | 3.14.0 | 随 Flutter |
+| Android 构建工具链 | Gradle 9.5.0 / AGP 9.3.3 / Kotlin 2.4.20 | 构建 APK |
 | Rust | stable (cargo/rustc) | 编译原生核心 `fqapi_core` |
 | flutter_rust_bridge | 2.13.0 | 生成 Flutter/Rust 绑定 |
 | Android SDK | 36 (platform) + Build-Tools | 编译 APK |
@@ -162,6 +180,10 @@ fqapp/
 | Android NDK | 28.2.13676358 | 交叉编译 Rust ARM64 核心与 C 流式解密库 |
 | CMake | 3.22.1 | Android 构建自动编译 C 库 |
 | Visual Studio | 2022（「使用 C++ 的桌面开发」工作负载） | 仅构建 Windows 桌面端（可选） |
+
+> Flutter 3.50 已把 Material 与 Cupertino 拆到 `material_ui` / `cupertino_ui`。
+> 首方 Dart 源码统一导入这两个包；`package:flutter/material.dart` 和
+> `package:flutter/cupertino.dart` 已弃用，会让静态分析失败。
 
 > Windows 下构建注意：Kotlin 增量编译在部分环境会报 `Could not close incremental caches`，已在 `android/gradle.properties` 中关闭（`kotlin.incremental=false`）。
 
@@ -216,15 +238,20 @@ Rust 核心库由 `scripts/build_rust_backend.*` 生成；C 库由下一步 APK 
 ### 3. 构建 APK
 
 ```powershell
-cd fqapp
+cd novel-sound
 flutter pub get
-# 当前 Rust 核心只提供 arm64-v8a，构建时显式指定目标 ABI
+# 演示只出 arm64 调试包；正式出包是双 ABI 分包，见下方说明
 flutter build apk --debug --target-platform android-arm64
 flutter build apk --release --target-platform android-arm64
 ```
 
-生成的 APK 仅支持 `arm64-v8a`；如果要支持 32 位或 x86 设备，需要先为
-对应 ABI 交叉编译并打包 `libfqapi_core.so` 和 `libshortplay_crypto.so`，同时调整 ABI 配置。
+镜像环境（`PUB_HOSTED_URL` 指向 pub.flutter-io.cn 等）下，上面每条命令都会隐式执行 `pub get`
+并把 `pubspec.lock` 的全部 `url:` 改写成镜像地址；本地 Flutter 版本与生成该锁的版本不一致时，
+还会顺带移动几十个包的版本。提交前核对 `git diff pubspec.lock`，必要时 `git checkout -- pubspec.lock`。
+
+Rust 核心按 `arm64-v8a` 与 `armeabi-v7a` 两个 ABI 产出（`scripts/build_rust_backend.sh` /
+`.ps1` 的 `aarch64-linux-android` + `armv7-linux-androideabi`），CI 因此用
+`--target-platform android-arm,android-arm64 --split-per-abi` 出两个分包；x86/x86_64 设备不提供。
 
 > **release 构建不要加 `--no-pub`**：`integration_test` 在 `dev_dependencies` 里，`flutter test` 会把
 > 它写进 Android 插件注册表；随后用 `--no-pub` 构建 release，Gradle 会报
@@ -233,12 +260,12 @@ flutter build apk --release --target-platform android-arm64
 
 ### GitHub Actions 云端编译
 
-打开 [Actions → Android APK](https://github.com/ch6vip/fqapp/actions/workflows/android-apk.yml)，
+打开 [Actions → Android APK](https://github.com/ch6vip/novel-sound/actions/workflows/android-apk.yml)，
 点击 **Run workflow** 即可从源码构建。`master` 上的应用、原生库及构建配置变更也会自动触发。
 运行成功后，在该次运行的 **Artifacts** 中下载 `fqapp-arm64-运行编号`；其中包含
 `app-release.apk`、SHA-256、签名与 16 KiB 对齐报告、源码版本和工具版本，产物保留 14 天。
 
-[工作流](.github/workflows/android-apk.yml) 固定 Flutter `3.44.6`、Rust 工具链与
+[工作流](.github/workflows/android-apk.yml) 固定 Flutter `3.50.0`、Rust 工具链与
 flutter_rust_bridge `2.13.0`、JDK 17、NDK `28.2.13676358` 和 CMake `3.22.1`。
 Rust 核心与 C 解密库都会在 runner 上编译。CI 设置 `FQAPP_USE_MAVEN_MIRRORS=false`
 使用官方 Maven 源；本地构建默认仍使用国内镜像。
@@ -302,14 +329,13 @@ maven { url = uri("https://maven.aliyun.com/repository/public") }
 
 ### Gradle 发行版镜像
 
-若 `services.gradle.org` 下载慢，手动放入 `%USERPROFILE%\.gradle\wrapper\dists\gradle-9.1.0-all\<hash>\gradle-9.1.0-all.zip`（从腾讯云镜像 `https://mirrors.cloud.tencent.com/gradle/gradle-9.1.0-all.zip` 下载）。
+若 `services.gradle.org` 下载慢，手动放入 `%USERPROFILE%\.gradle\wrapper\dists\gradle-9.5.0-all\<hash>\gradle-9.5.0-all.zip`（从腾讯云镜像 `https://mirrors.cloud.tencent.com/gradle/gradle-9.5.0-all.zip` 下载）。
 
 ### 常见构建问题
 
 | 问题 | 解决 |
 |---|---|
 | `Could not close incremental caches` | 已在 `gradle.properties` 关闭 Kotlin 增量编译 |
-| 构建偶发 `IllegalStateException: The settings are not yet available for build` | Gradle 9.1.0 配置缓存推广处理器（`ConfigurationCachePromoHandler`）的偶发 bug，重跑即可恢复，无需修改配置（详见下方「已知问题与调试」） |
 | `Unable to locate Android SDK` | `flutter config --android-sdk C:\android-sdk` |
 | `Flutter requires Android SDK 36` | `sdkmanager "platforms;android-36"` |
 | maven.google.com 超时 | 已配置阿里云镜像 |
@@ -387,6 +413,72 @@ keyPassword=<密钥口令>
 
 ## 测试
 
+### 多端同步与旧 WebDAV 迁移
+
+「备份与导入 → WebDAV 同步」现在只提供安全迁移说明，再进入「多端同步」设置。
+旧版按云端覆盖本机的服务已移除，升级启动和迁移失败都不会恢复旧流程。
+原有地址和账号只读预填；重新连接 HTTPS WebDAV、选择目录并预览合并结果后，
+才能保存启用。预览后本机记录或云端版本变化时必须重新预览，取消或失败不覆盖本机进度。
+
+当前多端同步范围仅包含番茄收藏、阅读播放记录和已看剧集。各设备使用同一目录；
+WebDAV 维护公开备份 `fqapp-sync.json` 和条件写入合并日志
+`fqapp-webdav-state.json`。较新的进度按记录时间合并，包括主动回到前面章节后的新进度；
+本机独有收藏会参与合并。已观察的删除通过日志传播，空白新设备不推断删除。
+原 WebDAV 文件中的书旗、分组和 AI 数据会保留，不参与多端同步，也不会自动恢复到本机。
+本地 TXT/EPUB、正文、视频、缓存、外观和登录凭据不参与同步。
+
+成功启用后，启动、返回应用、收藏和进度变化会触发同步；前台 WebDAV 每两分钟检查，
+离线失败保留本机记录并重试，系统终止或挂起期间不保证执行。应用合并结果时重新核对
+本机快照，期间的本机编辑继续参与后续合并。已有 WebDAV 公开文件或合并日志消失时停止
+自动重建。服务器需支持强 ETag 和 `If-Match` / `If-None-Match` 条件写入；并发冲突重新
+读取后合并。重定向不携带认证信息自动跟随，HTTP 明文 WebDAV 不受支持。
+同步内容仍经过便携备份的字段白名单和大小校验。
+
+FTP/FTPS 和 SMB 当前在 Android 提供。FTP/FTPS 的服务器根目录不能用作同步目录，
+SMB 必须选择共享内的子目录；地址本身已包含有效子目录时可直接选择。
+WebDAV 可选择当前根目录，云盘需选择或创建实际子目录。凭证只保存在设备安全存储中，
+云端文件含阅读数据，应使用私人目录。
+
+便携备份允许未知收藏时间 `addedAt: 0`；本机旧收藏的缺失或损坏时间统一规范化为 epoch 0，
+读书架和比较同步快照使用同一结果。外部备份的负数、越界或错误类型时间仍严格拒绝。
+阅读设置中正文「字号」只改变正文，独立「标题字号」保持原值并单独保存。
+
+```bash
+flutter test --no-pub test/webdav_sync_test.dart test/webdav_sync_page_test.dart
+```
+
+#### 2026-11-10 PR #300 后续修复与验证
+
+- `library_shelf_groups_test.dart` 的本地删除用例只把固定 50 ms 等待改为分类仓库
+  提交事件，原断言与超时不变，没有新用例或跳过项。VM 在书架删除后、分类清理前
+  暂停可以重现旧断言提前执行；新等待在额外暂停 1200 ms 后仍等到真实提交。
+- 在 Flutter 主机进程中通过 VM 调试调用生产 `WebDavClient` / `WebDavSyncService`，
+  连接仅监听 `127.0.0.1` 的临时 HTTPS WebDAV 服务，使用临时凭证和构造数据，
+  没有访问用户云盘。记录了真实 GET 200、带 ETag 的 PUT 204 和 MKCOL 201。
+- 删除 `book:shared-id` 后，服务端与本机仍保留 `watched[shared-id].episodeA=123`；
+  在应用云端前暂停并提交书架/历史删除，恢复后两端均无被删除条目；切换配置时
+  暂停旧 GET，释放后 0.4 秒内新目录收到 GET，无需等待两分钟轮询。
+- 云端同时包含 `book:clash` / `video:clash` 时明确拒绝，未发 PUT、原云端两项
+  仍在。安全拒绝不是跨类型同 ID 恢复能力。含空格、中文和 `%` 的目录实际逐级
+  MKCOL/PUT 成功；Dart 3.13.7 的 `Uri.replace(path:)` 保留有效百分号编码，未复现
+  审核中的二次编码猜测，因此没有改写该客户端路径逻辑。
+- 五个直接改动 Dart 文件静态分析无诊断；四个既有 WebDAV/书架文件共 69 项完成。
+  一次并行构建下的完整 Dart 运行出现主机内存不足、套件连接断开和 pending timer，
+  已停止，不能报告为完整门禁通过；保留原 CI 检查，不延长超时或跳过失败。
+- MuMu 6.8.8.0、Android 12、实例 0、`127.0.0.1:16385` 覆盖安装正式签名
+  arm64 release `1.0.201+206`，最终 APK SHA-256 为
+  `bbfb439fa8c4aadd62e3fcf16f29d11a6e11bdf8f59c4e2103ca6db28e00e126`。
+  冷启动、备份与导入 → WebDAV 同步、空地址拒绝保存均实际操作；页面使用现有
+  `featurePadding` 后，正文不再被悬浮标题栏遮挡。番茄账号读取/登录管理入口仍在。
+  升级前后导出书架 0、历史 3、已看 0，逐字段相同；AI 解压后仅导出时间变化。
+- 首次 `pub get` 在 Windows 符号链接阶段中断，缺失的 Android 插件注册文件曾让
+  本机调试/profile/release 包在 JNI 初始化时崩溃。重新完整生成插件注册并以
+  `flutter build apk --release --target-platform android-arm64 --split-per-abi`
+  构建后启动正常；这些生成物不提交，也未为此修改生产 JNI 代码。主机的真实
+  HTTPS 同步调用不等于 Android/Windows 多设备云盘验收；后者仍未执行。
+
+阅读器「背景」新增“雾蓝”（`#D8E4F0`）；选择会随本机阅读设置保存，不改变全局主题。
+
 代码规模仅作为审查参考：不设置固定的文件/函数行数上限，不维护“只准缩不准涨”的预算。是否拆分取决于职责、复杂度与可读性，不为凑行数机械拆分。`bash scripts/check_line_budget.sh` 只输出源码体量信息，不因文件过长而失败；CI 中该步骤也不阻塞构建。静态分析、构建及功能验证不因此放宽。
 
 ### MuMu 模拟器功能验证
@@ -419,13 +511,12 @@ $serial = '127.0.0.1:16384' # 仅为已验证示例，必须按本次 info 输�
 
 官方参考：[ADB 连接说明](https://mumu.163.com/help/20240807/40912_1073151.html)、[MuMuManager 命令行说明](https://mumu.163.com/help/20240726/35047_1170006.html)。
 
-**本地 Flutter 工具链一致性**：`pubspec.lock` 与 CI（`FLUTTER_VERSION: '3.47.9'`）已升到 3.47.9，`.dart_tool/package_config.json` 也指向 `E:\ctf-aaa\.toolchains\flutter-3.47.9`；PATH 上的 `C:\Users\ch6vip\flutter\bin` 仍是 3.44.6 / Dart 3.12.2。混用会让 `flutter test` 报 `petitparser` 语言版本 3.13 过高及 `ui.HitTest*` 类型缺失；切到 3.47.9 后若出现 `Invalid kernel binary format version (expected 138, found 130)`，是 `.dart_tool/hooks_runner` 里旧 SDK 编译的 `hook.dill`，删除该生成目录即可，不必改动源码。
+**本地 Flutter 工具链一致性**：`pubspec.lock` 与 CI 使用 Flutter 3.50.0 / Dart 3.14.0；`pubspec.yaml` 保留 Dart 3.12.2 的兼容下限，使升级工具链不会顺带提高包语言版本。PATH 上的 `C:\Users\ch6vip\flutter\bin` 使用同一 Flutter 版本。切换 SDK 后若出现 kernel 版本冲突，删除 `.dart_tool/hooks_runner` 中旧 SDK 生成的缓存即可，不必修改源码。
 
 会话级临时指定（不修改全局 PATH）：
 
 ```powershell
-$env:PATH = 'E:\ctf-aaa\.toolchains\flutter-3.47.9\flutter\bin;' + $env:PATH
-Remove-Item -Recurse -Force .dart_tool\hooks_runner  # 仅在出现 kernel 版本冲突时
+flutter --version
 flutter analyze --no-pub
 bash scripts/test_quick.sh home
 ```
@@ -475,7 +566,103 @@ bash scripts/test_quick.sh home
 
 验证结束恢复 `wm size` 为 720x1280、`font_scale` 为未设置、首页「推荐榜」NO.001 / 共 16 本，保留安装的新包与原应用数据；未卸载、清空数据或改装调试包。
 
+#### 2026-11-10 #300 公共 CI 修复记录
+
+#300 run `42583363579` 的首页续读失败来自 `SecureKeyProvider -> EncryptedHive -> ReaderUnderlineStore` 遗留的 10 秒虚拟计时器；安全存储失败的 30 秒真实时间冷却到期后可以复现，随后划线单例队列还会阻塞下一用例。用户授权仅修正这份现有书架测试的环境：显式模拟安全存储不可用、逐项重置缓存，不初始化与书架导航无关的划线存储，退出恢复原状态。原导航断言保留，不新增用例、不修改生产超时或重试策略。在同源代码上整份 41 项诊断完成；VM 断点延迟到失败时间已过去 77 秒后，三个续读用例仍顺序完成。
+
+同步 #301 的生产路径修复：本地书成功移出后先批量移除分类归属，再删除文件；普通非本地书仍保留分类。MuMu 实例 `0` / Android 12 / `127.0.0.1:16385` 已在公共修复包 `a9e68a0d9188d4eac6922914d733cc1e9c9a7121d80bfe185a31168ebfa3d49d` 验证导入 TXT、分配分类、移出、撤销恢复同一 ID 后显示未分类。结束书架 0、历史 3、已看 0，历史逐字段未变；临时书、分类与输入文件已清理。该包来自 #306，不包含本分支 AI 改动，不能作为本分支其他功能验收。
+
+为避免新一轮 PR 合并检查引入主线启动超时，同步 `origin/master` 的 `16ee87b`，保留原 AI 改动并给新增振动通道加 2 秒失败降级；没有把本 PR 合并回主线、改工作流或增加依赖。本分支原 head 为 `9450d290d22f6e6820f2627b9db7c80705a44f15`；远端结果只认本次推送后的新 head。静态检查、诊断运行与已有公共 MuMu 验证分别记录，不以测试完成代替用户路径。证据保存在仓库外 `%TEMP%\fqapp-ci-repair-20261110`，不提交用户备份。
+
+#### 2026-11-10 #301 公共 CI 修复记录
+
+#301 run `42600437041` 的本地书分类残留对应删除顺序：旧路径等文件删除返回后才移除分类归属。成功移出书架后现改为先批量清理本地书归属，再逐本删除文件；归属失败记录日志且不阻止后续文件清理，非本地书移出仍保留分类。旧用例短等待在本机普通运行中未稳定复现，不以单次诊断运行推断因果。
+
+MuMu 实例 `0` / Android 12 / `127.0.0.1:16385` 已在公共修复包 `a9e68a0d9188d4eac6922914d733cc1e9c9a7121d80bfe185a31168ebfa3d49d` 验证导入 TXT、分配分类、移出、撤销恢复同一 ID 后显示未分类。结束书架 0、历史 3、已看 0，历史逐字段未变；临时书、分类与输入文件已清理。该包来自 #306，不包含本分支 Rust 身份配置改动，不能作为本分支其他功能验收。
+
+用户同时授权 #300 的定向测试隔离，故同步现有 `library_shelf_test.dart` 的环境修复：安全存储通道显式不可用并逐项重置，书架导航用例不初始化无关的划线存储，退出恢复原状态；不新增用例或更改生产安全存储策略。同源代码整份 41 项诊断完成，VM 断点等待超过 30 秒冷却后三个续读用例也能顺序完成。为避免新一轮合并检查引入启动超时，同步 `origin/master` 的 `16ee87b` 并给新增振动通道加 2 秒失败降级；保留 Rust 身份配置，不把本 PR 合并回主线、不改工作流或增加依赖。原 head 为 `696eca30e75fab1767fe48b4ec7686a6ce8fc777`，远程 CI 只认推送后新 head。证据保存在仓库外 `%TEMP%\fqapp-ci-repair-20261110`，不提交用户备份。
+
+#### 2026-11-10 Android 振动反馈开关（#303）
+
+基于 `c29b279`，在“设置 → 外观”增加默认开启的“振动反馈”；经典与档案主题共用 `haptics_enabled`，冷启动在交互页面挂载前读取。统一触感组件和书架/播放手势的直接调用都读取该偏好，Android 的 activity decor view 同时拦住 Flutter 控件自带的长按振动；不改系统振动或键盘设置。iOS 暂不显示此开关。
+
+本次由 MuMuManager 查询得到实例 `0` / Android 12 / `127.0.0.1:16385`，720x1280、字体比例 1.0、x86_64 经 ARM 转译运行 arm64 release。Flutter 3.47.9 / Dart 3.13.7，应用版本保持 `1.0.201+206`（arm64 split versionCode `2206`）；安装后设备侧 APK SHA-256 与本地产物一致：`c7778e081a31757ba4909475450e0009db3b0bee30c114b47e3546958bdc1132`。
+
+| 真实路径 | 观察结果 |
+|---|---|
+| 升级后进入档案主题的外观设置 | 开关默认开启，语义树 `checked=true`；按钮操作在 `dumpsys vibrator_manager` 中产生本应用的 `TEXTURE_TICK` 记录 |
+| 关闭后返回、重新进入外观、打开/关闭主题模式菜单 | 开关显示关闭，操作前后本应用的振动记录完全一致，没有新增 |
+| 关闭后强制停止进程并冷启动，再进入外观 | 语义树仍为 `checked=false`；启动及后续导航没有新增本应用振动记录 |
+| 从档案切换为经典主题，再长按书架中的浏览历史条目 | 两主题共用关闭状态；长按正常进入“已选择 1 本”，没有新增振动记录，随后退出编辑未删除数据 |
+| 经典主题重新开启后重复同一长按 | 正常进入编辑，系统服务新增本应用 `CLICK` 记录（15:12:23.158）；切回档案后按钮恢复 `TEXTURE_TICK` |
+| 点击设置行关闭再开启，随后冷启动 | 整行点击也生效；重启后的开关为 `checked=true` |
+
+补充检查：受影响的 10 个 Dart 文件定向分析无诊断；使用 `build_rust_backend.ps1 -SkipCodegen` 构建 ARM64/ARMv7 核心，随后 `flutter build apk --release --target-platform android-arm,android-arm64 --split-per-abi` 成功；arm64 APK 的正式签名校验成功且与原安装包一致。未新增、修改或运行测试。
+
+结束时恢复档案主题、跟随系统、沉浸式播放布局和振动开启，返回首页并保留新包；系统 `haptic_feedback_enabled` / `sound_effects_enabled` 均保持 1，分辨率和字体比例不变。未卸载、清空数据或改装调试包。截图、语义树、振动记录、日志与原包备份位于仓库外 `%TEMP%\fqapp-haptics-20261110`。
+
+这些记录证明界面、持久化与 Android 振动请求开关，不证明实体振动马达的触感或噪声；ARMv7 仅构建，未在设备上运行；视频倍速与听书定位的具体播放路径未实操。最终进程的 logcat 未见匹配的崩溃或振动通道初始化错误。iOS 构建与物理设备性能未验证。
+
 ### 分层跑测试
+
+#### 经典阅读器：书旗自动缓存与来源契约（PR #348）
+
+书旗正文阅读与全文搜索保留自动加密章节缓存，缓存键使用 `shuqi:<原始数字 ID>`，与番茄相同数字 ID 隔离。这是对下文 #270「不写章节缓存」历史行为的有意调整。#377 起本机历史也使用相同作用域，保存章节和章内文本位置；目录主动选章按所选章节打开，详情「继续阅读」、书架、浏览历史及首页续读恢复上次位置。历史以 `source=shuqi`、原始数字 `contentId` 关联书架，运行时 `id/bookId` 保留 `shuqi:` 前缀。书旗仍不写阅读时长，也不开放番茄的评论、音视频、手动下载和分享入口。`ReaderPage.localOnly` 表示禁用这些番茄在线能力，不再代表禁止全部磁盘缓存，来源必须独立判断。本地 TXT/EPUB 导入书仍读本地文件，不进入远程章节缓存。
+
+缓存管理必须保留来源：书旗缓存可查看、删除和重开；重开使用 `source=shuqi` 和原始数字书架 ID，缺章及导出只允许使用书旗加载器，禁止把 `shuqi:` ID 交给番茄目录、正文、详情、作者或链接分享。已有目录结构不增加新身份格式；书架仍遵守 #270 的 `ShelfIdentity` 规则。自动缓存沿用既有容量、淘汰与加密策略，缓存缺失不伪装为已有完整下载。
+
+便携备份中的书旗进度使用原始数字 `id/bookId` 与 `source=shuqi`，恢复时重建运行时作用域。含书旗历史时备份格式为 v3（AI 分段可选），旧客户端会在写入前拒绝此格式，避免把书旗进度误当番茄进度；纯番茄历史继续使用原有 v1/v2。历史去重、删除和现有同步合并均按来源、类型及内容 ID 区分，不新增上游写入能力。
+
+全文搜索在显示文本上逐章串行扫描；已有缓存跳过网络，未缓存请求至少间隔 300ms，可停止或改词取消后续工作。摘要上限仅限制展示，不截断扫描或总匹配统计。经典 AI 入口按有效章节视图显示；档案 AI 策略另行处理。书籍面板保留下滑、遮罩和系统返回关闭，不另设可见关闭按钮。
+
+#### 2026-11-10 书旗书架来源修复（#270）
+
+基于主线 `16ee87b` 独立处理，不包含 #304 的只读边界改动。书旗详情进入阅读器时传入 `ShuqiBook.toMediaItem()`，阅读菜单加入本机书架使用 `source=shuqi` 和原始数字 ID，不再把阅读会话 ID `shuqi:<id>` 当作番茄书籍。当时书旗不写阅读历史、阅读时长或章节缓存；当前历史与缓存行为见上节 #348/#377，阅读时长边界保持不变。
+
+`ShelfStore` 初始化时只迁移符合旧阅读器输出形状的 `shelf_v1:book:shuqi:<数字 ID>` 记录：保留全部元数据及 `addedAt`，写入 `shelf_v1:shuqi/book:<数字 ID>` 并落盘后才删除旧键；已有有效目标记录不覆盖，无法确定身份的记录不改。旧错误键不符合分组标识校验，不能经现有分组入口产生有效归属；本次不扩大分组或备份协议的接受范围，也不保留双读别名。
+
+MuMuManager 确认实例 `0` / Android 12 / `127.0.0.1:16385`，x86_64 经 ARM 转译运行正式签名 arm64 split release，版本保持 `1.0.201+206` / versionCode `2206`。首轮验证包 SHA-256 为 `fd53fd36e6bfec96749ef05c249152f631de661fd7c8a5f8ce009e3c185d349a`；审查后收紧已有目标记录的身份校验，重建最终包 SHA-256 为 `7d428147423d68b2ca86495c939592447416f84697e7394ea55b0620e47cb27c`。两次覆盖安装后设备侧均核对一致。未改动 Rust，原生库复用与当前主线源码相同的已构建产物。
+
+| 真实路径 | 观察结果 |
+|---|---|
+| 旧包搜索书旗 → 打开正文 → 阅读菜单加入书架 → 从书架打开 | 样本 `9136773` 误进番茄详情，显示 `shuqi:9136773`，详情加载失败 |
+| 保留错误条目覆盖升级 → 书架打开 | 同一本书仍为 1 条，正确显示书旗详情、1493 章目录及首章正文；菜单识别为“已在书架” |
+| 终止进程、重新启动并从书架打开 | 条目仍存在且进入书旗详情；MuMu 的启动命令有一次需再次前置任务，不以命令返回值代替界面验收 |
+| 阅读菜单移出 → 再加入 → 书架重新打开 | 仍只有 1 条，可正常打开，作者字段随新条目保存 |
+| 应用内导出迁移后备份 | `id=9136773`、`source=shuqi`、原加入时间保留；旧包误排除的 1 条变为正常导出，未放宽备份校验 |
+| 保留正确条目、旧包再次加入同书 → 覆盖最终包 | 旧包确实产生 2 条；最终包收敛为 1 条并可打开正文，前后导出的正确条目逐字段一致（含作者和加入时间），旧错误项不再被备份排除 |
+| 仅移除本轮临时书籍后再次导出 | 书架恢复 0、历史 3、已看 0；历史、已看及分组与本轮操作前导出一致 |
+
+辅助检查：两个改动 Dart 文件格式化无变化、定向分析及 `flutter analyze --no-pub lib` 无诊断，`flutter build apk --release --target-platform android-arm64 --split-per-abi` 成功。未新增、修改或运行测试；KGP 插件未来兼容警告（#205）仍存在。
+
+截图、UI XML、应用导出及构建日志保存在仓库外 `%TEMP%\fqapp-issue270-20261110`，不上传用户数据。未卸载或清空数据。迁移目标已存在的分支已走实际旧包/新包升级路径；损坏记录和落盘中断未进行故障注入。Windows、ARMv7 及 Xiaomi/HyperOS 真机未验证。
+
+#### 2026-11-10 CI 失败定位与生产路径修复（#306 / #301）
+
+本轮基于 #306 的 `78be475`，没有修改工作流、依赖或版本。初轮不改冻结测试；用户随后明确授权提交推送，并只对 #300 异步隔离和 #304 失效契约作定向例外，不新增测试。两个生产改动：
+
+- `HapticPreferences._applyPlatform` 给可选的 Android 振动通道调用增加 2 秒响应上限，超时返回失败，启动按既有可选初始化策略继续；不把平台未应用当作成功，也不阻止后续加载重试。#306 的 run `42802056525` 和主线 run `42778150152` 均有 7 项启动等待超时。Dart VM 断点确认书架与分组已经就绪，未完成的是 `HapticPreferences._loading` 内无回复的 `setEnabled` 调用，不是主题值解析。
+- `LibraryPage._removeFromShelf` 在书架删除成功后，先批量清理本地导入书的分类归属，再逐本删除文件；目录解析或文件删除不能挡住前面的归属清理。归属清理失败仍记录日志并继续文件清理，普通非本地书移出仍保留分类。该顺序对应 #301 run `42600437041` 的本地书分类残留；旧用例的短等待在本机普通运行中未稳定复现，不能仅凭诊断运行认定修复。
+
+MuMu 实例 `0` / Android 12 / `127.0.0.1:16385`，720x1280、字体比例 1.0，x86_64 经 ARM 转译运行正式签名 arm64 split release。Flutter 3.47.9 / Dart 3.13.7，版本保持 `1.0.201+206` / versionCode `2206`。最终 APK SHA-256 为 `a9e68a0d9188d4eac6922914d733cc1e9c9a7121d80bfe185a31168ebfa3d49d`，覆盖安装后设备侧一致；Rust 未改，复用已有同源原生库。
+
+| 真实路径 | 观察结果 |
+|---|---|
+| 旧包关闭振动反馈，保留数据覆盖升级 | 首页正常进入，外观页仍显示关闭 |
+| 开启振动反馈，终止进程后冷启动 | 首页正常进入，外观页仍显示开启 |
+| 导入临时 TXT，建分类并分配，再移出书架 | 界面从 1 本变为 0 本；操作前分类弹层确认临时分类已选中 |
+| 移出后在撤销窗口恢复同一条目，再检查分类 | 弹层选中“未分类”，不是重新导入的新 ID；撤销只恢复书架记录，本轮不声称已删除的 TXT 正文也被恢复 |
+| 删除本轮条目及临时分类，再导出备份 | 书架 0、历史 3、已看 0；书架、历史、已看和可导出分组与操作前一致，AI 资产解压后仅导出时间变化 |
+
+已清理临时导入文件，恢复档案主题、系统外观、沉浸式布局与振动开启，返回首页。最终进程日志未见匹配的崩溃、ANR、未处理 Flutter 或 Hive 错误。没有卸载、清空数据或操作实体手机；MuMu 不证明物理马达触感。通道永不回复及文件 I/O 挂起未在设备上注入故障。
+
+辅助检查：固定工具链下两个 Dart 文件格式化无变化，完整 `flutter analyze --no-pub` 无诊断，arm64 release 构建成功。只运行既有冻结用例作定位：改动后 7 项启动等待不再超时，相关初始化和书架分类诊断未报错；这些结果不代替上表的实际用户路径。KGP 未来兼容警告（#205）仍在。证据仅保存在仓库外 `%TEMP%\fqapp-ci-repair-20261110`，原始备份和日志不上传。
+
+定向隔离与其他分支：
+
+- #300 run `42583363579` 的 `dart-gate` 在 30 分钟取消。首次失败是 `library_shelf_test.dart` 的首页缓存续读用例结束时仍有 10 秒虚拟计时器，堆栈为 `SecureKeyProvider -> EncryptedHive -> ReaderUnderlineStore`，随后用例持续超时。相关代码与当前相同。在 VM 断点等待安全存储失败的 30 秒冷却到期后继续，复现了相同断言；继续定位还确认划线存储单例队列会残留上一用例的虚拟时钟任务。只改该现有测试文件的环境：安全存储通道明确模拟不可用并逐项重置，书架导航用例不初始化无关的划线存储，退出恢复原状态；原有导航断言全部保留。没有修改生产安全存储超时、冷却或重试。改后整份 41 项诊断完成；同一 VM 断点等待到失败时间已过去 77 秒后，首页续读、书架续读、关闭直读三个用例也顺序完成。
+- #304 的只读契约修正在该 PR 独立工作树处理，不带入本分支；公共生产修复和 #300 隔离同步过去。账号/上游写入旧测试按用户例外授权收窄或移除，保留公开读取及本机来源限制，不恢复废弃接口，也不跳过门禁。
+- APK 和完整静态分析已验证；远程 CI 以各 PR 推送后对应新 head 的实际状态为准，不能沿用旧 run 或本地诊断结果。Windows、ARMv7 与物理设备未在本机复验。
 
 测试按「秒级模块 → 收尾全量 → CI 兜底」三层跑，日常迭代不要每次都付全量的成本：
 
@@ -500,6 +687,60 @@ bash scripts/test_quick.sh home
 2. 首次启动时用示例初始化 `device_pool.json`；以后保留后端注册并保存的实际设备池。
 3. 从 Flutter 资源清单枚举并部署 `assets/filters/` 下的文件（含清单中的嵌套文件）到 `backend/filters/`。内容变更时替换旧资源。
 4. 运行时资源不含任何可执行后端二进制；Rust 核心以 `libfqapi_core.so` 随 APK 打包，在进程内加载。
+
+`config.json` 里还有一个可选的 `upstream` 段（`version_name`、`version_code`、
+`manifest_version_code`、`update_version_code`、`user_agent`）：**设备注册**用的 UA 与版本号从
+这里读，UA 支持 `{manifest_version_code}`（别名 `{version_code}`，两者取同一个值）、
+`{os_version}`、`{device_type}` 三个占位符。字段留空即用改动前硬编码的值，所以不写这一段
+行为完全不变。
+
+范围只说一次，免得误解：**这一段只作用于设备注册的第一步 `device_register`**。同一流程里
+`activate_premium` 仍写死 `version_code=61532&version_name=6.1.5.32`，`register_key` 写死
+`version_code=6.1.5.32` 且 UA 是光秃秃的 `com.dragon.read`，`sdk_version` 与 `package` 也是常量；
+正文 / 目录 / 搜索 / 短剧端点的查询串（`rust/src/endpoints/*.rs`）与通用请求的 UA
+（`rust/src/upstream/client.rs` 的 `DEFAULT_USER_AGENT`）同理。上游要动这些仍然得改代码。
+
+类型上：数字、布尔、`null` 都会被转成字符串（`null` 视作留空，走默认值）；数字写成 `71332`
+或 `"71332"` 等价，整数值的浮点写法（`71332.0`、`1e3`）也等价于 `71332`，真正的分数
+（`7.1`）保留小数。
+
+形状上：**整段必须是 JSON 对象**。数组、字符串、数字都会让 `Config::load` 失败、后端起不来
+——这一点不是多余的：serde 默认会把结构体按位置从数组反序列化，`"upstream": [1, 2]` 会被读成
+`version_name = "1"`、`version_code = "2"`，一个看起来合法、实则完全错误的身份会被悄悄发给
+上游。整段写成 `null` 视作「未配置」，等同于不写这一段。
+
+**段内的字段名也必须写对**：多写或拼错一个字段名（例如 `useragent` 而不是 `user_agent`）
+同样是配置错误，会让 `Config::load` 失败。否则拼错的字段会被静默忽略——UA 保持内置模板，
+改配置的人只会看到「改了没效果」，而没有任何报错提示。
+
+**`version_name` 和 `version_code` 必须一起写**：只写其中一个同样是配置错误（理由见下）。
+
+一致性上：三个 `*_version_code` 是同一个上游版本的不同视图。**显式填的字段一定生效，没填的
+跟随 `version_code`**（而不是退回内置默认值），所以只改一个 `version_code` 时，注册头里的
+manifest / update code 会一起跟着走，不会出现新旧版本号并存的设备身份；四个字段都没填才回到
+改动前的硬编码值。
+
+`version_name`（`7.1.3.32`）和 `version_code`（`71332`）是同一个版本的两种写法，但**两者之间
+没有可推导的规则**——去掉点号对多数版本成立（`6.5.1.32` → `65132`），对少数不成立
+（`15.8.0` → `150800`，不是 `1580`）。所以后端**不做任何推导**，也**不接受只填一个**：
+只写 `version_name` 或只写 `version_code`，和数组、拼错的字段名一样，是**配置错误**，
+`Config::load` 失败、后端起不来。
+
+这样处理而不是「警告一下继续跑」，有两个原因：一是猜出来的版本号是一个看起来对、实则错的上游
+身份，比直接报错更糟；二是桌面构建不安装 logger（`log` 宏是 no-op），警告在 Windows 上根本
+看不见，而配置错误在所有平台上都能报出来。**要改版本，四个字段一起改。**
+
+注意两点：`config.json` 是随包发布的资源，`BackendService._deploy` 每次启动都用包内副本覆盖
+`files/backend/config/config.json`，所以手改设备上的那份不生效；身份参数在后端每次启动时重新
+读取（`stop()`+`start()` 也会重读），但要换配置仍需重新打包并重启 App。
+关于设备池：每个设备在注册时**记下当时的 `version_code`**（`device_pool.json` 的
+`registered_version_code`）。后端启动时，**用别的版本号注册的设备会被退役**——不会把一个
+声称了旧版本的设备发出去。退役的设备会在需要时重新注册。
+
+一个例外，也是有意的：**这个字段是后加的**，所以在这之前写入的设备池文件里没有它。那些设备
+**不会被清空**——一次 App 升级不应该把整个设备池掏空、对着上游来一轮集中注册。它们会随着
+使用逐个被替换掉。
+
 
 ### 废弃的 HTML 插件资产（#252）
 
@@ -547,6 +788,57 @@ loopback HTTP 适配器只绑定 `127.0.0.1`，`/health`、`/api/v1/*` 与 `/src
 
 ---
 
+## 本机密钥库（SecureKeyStorage）
+
+Hive 主密钥与设备池密钥不再经过 `flutter_secure_storage`，改由应用自己的
+`SecureKeyStorage`（`lib/services/secure_key_storage.dart`）按平台落到系统级密钥库。
+这样做的直接原因是 `flutter_secure_storage_windows 3.1.2` 把 `win32` 钉在 5.x，
+挡住了 `wakelock_plus` / `package_info_plus` 的 Built-in Kotlin 版本（#205）。
+
+| 平台 | 实现 | 位置 |
+|---|---|---|
+| Android | AndroidKeyStore 内的 AES-256-GCM 密钥，密文存 `shared_prefs/fqapp_secure_keys.xml`；条目名作为 AAD | `android/app/src/main/kotlin/com/fqapp/fqapp/SecureKeyPlugin.kt` |
+| iOS | Keychain 通用密码项，`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` | `ios/Runner/AppDelegate.swift`（`SecureKeyBridge`） |
+| Windows | DPAPI（`CryptProtectData`，当前用户范围）保护的文件 `secure_keys.dpapi` | `lib/services/windows_dpapi_key_store.dart` |
+| Linux | libsecret（Secret Service）单个 JSON 条目，调用在独立 isolate 中执行 | `lib/services/linux_libsecret_key_store.dart` |
+
+失败语义与原来一致，且更严格：**“没有密钥”与“读不到密钥”必须分开**。
+
+- 只有平台回答“条目不存在”时才允许新建密钥；
+- Keystore/DPAPI/libsecret 报错一律抛给 `SecureKeyProvider`，由它失败关闭
+  （`EncryptedHive` 会拒绝明文回落或隔离箱文件，绝不静默覆盖）；
+- Windows 先写 `.tmp`、把旧文件轮换成 `.bak` 再改名，崩溃后仍能读到上一份密钥；
+- Linux 会先 `secret_service_get_sync(OPEN_SESSION | LOAD_COLLECTIONS)` 预热，
+  避免冷 keyring 首次查询误报“不存在”而另建密钥。
+
+### 迁移与回滚
+
+`defaultSecureKeyStorage()` 返回 `MigratingSecureKeyStorage`：读时先查本机密钥库，
+缺失才读旧 `flutter_secure_storage` 并回写；写时两边都写。因此：
+
+- 升级到本方案后，旧密钥在首次读取时自动搬家，书库/历史/WebDAV/AI 凭据保持可用；
+- 回滚到旧 APK 仍能读到同一把密钥（旧存储里有双写副本）；
+- 迁移成功会写一条 `keys` 标签的运行日志（“已将 … 迁移到本机密钥库”），
+  可在“设置 → 服务 → 运行日志”搜索 `keys` 核对。
+
+### 第二阶段：移除 `flutter_secure_storage`（未做，等一轮发布后）
+
+迁移完成后，旧包只剩“导入源”作用。满足下列条件即可删除：
+
+1. 线上版本全部经过一次含本方案的启动（本机密钥库已写入，日志可核对）；
+2. 删除 `lib/services/secure_key_storage.dart` 中的 `FlutterSecureKeyStorage`、
+   `MigratingSecureKeyStorage` 的 legacy 分支，以及 `pubspec.yaml` 的
+   `flutter_secure_storage` 依赖；
+3. `flutter pub upgrade`：`win32` 不再被钉住，`wakelock_plus` ≥1.8、
+   `package_info_plus` ≥10.1 自动落地；
+4. 之后才具备删除 `android/gradle.properties` 中 `android.builtInKotlin=false`
+   的前提（仍需先处理 `flutter_tts` 的 KGP，见 #205）。
+
+> macOS / Fuchsia 在本仓库没有 runner，也没有原生后端；这两个平台保持旧存储
+> （`defaultSecureKeyStorage()` 会回退），删除依赖后它们不再受支持。
+
+---
+
 ## API 对接说明
 
 App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `rust/src/endpoints/`），首页推荐使用
@@ -556,6 +848,8 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/v1/recommend/homepage?tab_type=&offset=&session_id=` | 首页分类推荐及游标分页 |
+| GET | `/api/v1/recommend/ugc-stories?offset=&session_id=` | 首页短篇专栏，使用官方 UGC 推荐流及响应游标 |
+| GET | `/api/v1/novels/{postId}` | 短篇可读状态、关联书籍与章节及截断信息；帖子 ID 与书籍 ID 分开使用 |
 | GET | `/api/v1/search?query=&tab_type=&offset=&count=10` | 搜索页按分类请求：综合 `1`、小说 `3`（上游标题书籍）、短剧/漫剧 `11`、漫画 `8`、听书 `2`，使用返回的游标；评分门槛仅筛选客户端已加载结果，不改变请求参数与游标 |
 | GET | `/api/v1/books/{id}/detail` | 按作品 ID 精确查询名称、封面和类型；详情不可用时使用同一路径的 `/directory` 中的 `book_info`。详情页的全部富元数据（分类/完结状态/字数/在读人数/评分/标签/作者等级/榜单）都取自这一份响应，不额外发请求 |
 | GET | `/api/v1/series/{id}` | 短剧／漫剧系列详情：标题、简介、集数、播放量、分类，以及**演员表**（`data.video_data.celebrities`，含 `nickname`/`role_name`/`avatar`）。也可经 `/api/v1/videos/{id}/detail` 访问。阅读类接口不含演员字段 |
@@ -576,7 +870,6 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 | GET | `/api/content?source=番茄&item_id=&tab=` | 正文（小说/漫画/听书/短剧分发） |
 | GET | `/api/content?source=番茄&item_id=&tab=短剧&mode=stream` | 短剧和漫剧视频流地址与内容密钥 |
 | GET | `/api/resolve?url=` | 分享链接解析 |
-| GET | `/api/download?source=番茄&book_id=` | 整本 TXT 下载 |
 | GET | `/health` | 健康检查（返回设备池数量） |
 
 **响应信封**：客户端接受 `code=200`（Web 桥接）或 `code=0`（上游兼容接口）的成功响应；
@@ -588,6 +881,7 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 再按条目实际 `kind` 筛选。综合保留全部作品；短剧、漫剧、漫画、听书分别只展示 `video`、`manju`、`manga`、`audio`。
 每个分类独立保存结果、错误和 `next_offset`，空页或重复页有前进游标时可继续加载，失败重试保留原偏移量。
 旧桥接的 `normalizeSearchTabs` 会将综合结果复制到空分类，且按页码换算偏移量，因此搜索页直接使用 v1 接口。
+首页听书推荐流不可用或耗尽时，同样使用 `tab_type=2` 的 v1 搜索，仅保留听书条目并沿用返回的 `next_offset`；首页“全部”降级来源的听书搜索也使用这一规则。兜底实际取到内容或可前进游标后继续分页，推荐流和搜索均失败时保留原内容并显示重试。
 
 **漫剧与漫画参数不同**：首页的漫剧为 `24`、看剧为 `8`、漫画为 `9`；搜索的视频为 `11`、漫画为 `8`、听书为 `2`。
 当前漫剧搜索复用视频 tab，漫剧详情和目录继续使用桥接参数 `tab=短剧`，目录对应 `/api/v1/manga/videos/{series_id}`。
@@ -627,10 +921,12 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 ## 页面说明
 
 ### 首页（`home_page.dart`）
-- 提供推荐、小说、短剧、漫剧、漫画和听书分类；搜索行与分类条固定在顶部，只有下方内容参与横滑切类、竖向滚动和下拉刷新
+- 提供推荐、小说、短剧、漫剧、漫画、听书和短篇分类；搜索行与分类条固定在顶部，只有下方内容参与横滑切类、竖向滚动和下拉刷新
 - 分类选中项使用浅背景与短下划线；各项预留选中字号的宽度，切换时不挤动相邻标签，墨水屏改用描边
 - 切分类只把内容区复位到顶部；横滑时预览相邻分类最近显示的内容，未访问的分类显示骨架，窗口宽度或字号变化后重新生成预览；首次进入后再切分类使用轻量加载态
 - 优先调用真实 `/api/v1/recommend/homepage`，推荐接口不可用时回退搜索结果
+- 底部加载的新作品按去重顺序追加在全部首屏作品之后，原始排行榜与卡片区块保持顺序；多个卡片流共用一个分页尾块。首页网格（包括短剧分类）冷启动先显示快照，再以最新首屏替换；只有独立短剧播放页使用续播点追加首屏，滑动位置在两秒防抖后保存。旧版错序区块快照回退到已有作品列表，联网后重写正确布局，不需要清空应用数据
+- 短篇使用独立 UGC 推荐流，按响应的 `next_offset` / `session_id` 分页并按帖子 ID 去重；追加失败重试保留原游标，刷新失败保留已有内容并重试首屏。连续三页没有新增内容时停止自动追页，显示“继续加载短篇”；切走取消请求，已加载内容保留。点击先确认可读范围，截断内容明确提示试读及未返回字数，再进入现有的关联书籍详情或官方阅读；摘要与截断正文不写入标准章节缓存
 - 推荐页的漫剧与小说都取各自的专属推荐流（`tab_type=24` / `2`），短剧、漫画、听书取搜索结果；
   漫剧的推荐流没有翻页游标，后续页仍由漫剧搜索承接
 - 漫剧首屏使用专属推荐，后续按视频搜索的实际游标加载；筛选后空页或重复页仍可继续，来源耗尽后停止请求
@@ -681,7 +977,7 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 - 书评的「回复 N」可展开回复（点击时懒加载，失败只在该条下提示，不影响列表）
 - 作者行整行可点进入作者主页（核心无关注端点，因此不提供假的关注按钮）
 - 底部：听书 / 下载 / 阅读（播放、续看）三键；听书与下载仅小说显示
-- 听书直接进入听书页并接续已保存的进度；下载一次点击即缓存整本（从续读位置起，进度显示在底栏，缓存中再点一次停止）。下载的章节不受缓存上限约束，也不会被自动清理
+- 听书直接进入听书页并接续已保存的进度；下载一次点击即缓存整本（从目录开头检查缺章，复用已有缓存，进度显示在底栏，缓存中再点一次停止）。下载的章节不受缓存上限约束，也不会被自动清理
 - 按内容类型打开小说阅读器、短剧/漫剧播放器、听书播放器或漫画阅读器
 - 续读/续听优先按已保存的章节 ID 定位，目录更新后仍能找到原章节
 - 富元数据直接取自同一份详情响应，不额外发请求；书评请求失败只隐藏该区块，不影响整页
@@ -699,6 +995,7 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 - 当前阅读页也显示本书的播放错误提示，包括未安装系统 TTS 引擎；全局浮窗隐藏不再吞掉这些错误。提示沿用会话级去重，页面被遮挡、离开或当前会话已切到别书时不借阅读页弹出
 - 阅读设置 → 更多设置 → 显示提供独立的“系统状态栏”和“底部导航栏”开关。底部导航栏默认关闭，保持旧版沉浸效果；开启后由 Android 显示当前系统导航方式的小白条或导航键，不切换系统导航模式。偏好经 `reader_show_system_navigation_bar` 保存，随阅读会话在恢复焦点时重应用；离开阅读或会话结束时仍还原进入前的系统栏状态（#258）
 - 从 #223 仅迁移非正文页隐藏播放/同步按钮、上游时间点优先高亮和后台起播异常返回失败；时间点的原文偏移经正文替换映射转换后再高亮。保留字幕兜底、双击跳读、高亮颜色/下划线与手动翻页不停播。#224 的别名复用、音色切换、阅读菜单内原地音色面板和重复打开保护沿用当前实现，不恢复旧胶囊或旧测试
+- 字幕与时间点的瞬态请求失败保留错误，由播放控制器有限重试；真人时间点缺少原著章节映射时回落到关联时间点，明确无轨道直接结束，换章或关闭会话取消旧请求。轨道与就绪状态同步发布，一集音频跨原著多章时按当前时间点更新章节映射，恢复数据不重新开启用户已关闭的跟随
 - “看”的关联查询与点击后的打开请求分别持有取消句柄；收起菜单、离开当前阅读路由、切章、进入后台或修改相关设置会使旧打开请求失效，旧请求的清理不会覆盖新请求。关联查询不因收起菜单丢失
 - 阅读菜单右侧的“看”入口通过 `/api/v1/books/{id}/video-match` 查询本书关联剧，后端按官方 V2 的 `VideoTimePointReqType.MatchMotionComic=2` 调用只读 `/reading/reader/video/timepoint/`。无关联、本地书或用户关闭展示时不显示；请求失败不打断正文，下次打开菜单可重试
 - “看”按钮使用官方 `g6h` 的 56dp 主题图；有效封面加载后可展开一次引导，墨水屏和系统减少动画模式不展开。设置 → 更多设置 → 改编剧可分别关闭入口和阅读章节同步；按真实 `NovelToVideoMap` 的剧/集 ID 定位，缺失映射则使用已有观看记录或首集，不伪造进度
@@ -786,6 +1083,180 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 （`catalog` 形态竖屏、feed 卡片、通用播放器）视频设置里保留一行入口（行尾当前档，
 点开同一个弹层）；分屏紧凑条已有当前档，不再重复给入口。
 
+取流响应的 `variants[].width` / `height` 是原始像素尺寸，
+`variants[].quality_height` 是画质短边，播放选档、下载上限与自动缓存共用后者。
+竖屏 `720×1280` 对应 `720P`，下载上限 `720` 会选择这一档。缺少短边元数据时
+保持画质未知；默认流的画质可在解码宽、高都已知后取短边，不能单凭像素高度推断。
+旧下载偏好一次迁到 `drama_download_max_quality_height`，成功写入后移除旧键；
+已有缓存与断点记录保留文件、原始高度和流身份，并优先从原档位名称恢复短边。
+
+后端短剧取址保留单一的 v5 播放门，以最终 gzip 字节同时生成签名和请求体；
+stream 与整集下载共用这一次模型解析。HTTP 401/403 仍按设备鉴权失败轮换，
+429/5xx、传输错误以及 v5 的 HTTP 200 解压后空响应体在同设备上做有限退避，
+原始空实体与有效 gzip 解出空内容都属于该空响应体；共用最多两次重试和调用方
+总超时，不嵌套额外重试，也不因此退休设备。非空 JSON
+中的空模型或业务拒绝仍交由端点判断，不当作空响应体重试。模型自己的列表会与同次请求可用的 `fallback_api`
+响应合并，清晰度短边与 `bytevc2` 拒绝门保持不变。规范化响应的
+`source_trace_id` 可关联 Rust 的 `stream trace` 与 Dart 的 `player-quality`
+日志；旧格式原始响应仍完整透传，诊断不记录播放地址或内容密钥。
+同一播放地址只展示一档，拒绝的别名不占用后续真实流的档位名称。
+
+gzip 解压读取全部成员并保持输出上限；空首成员不会再遮住后续正文。损坏、
+截断或超过上限的后续成员不能被静默丢弃。HTTP 解压失败时仍保留损坏原文供
+解析器拒绝，不当作有效空 gzip 重试；密文解压路径仍报错，不以部分正文当成功响应。
+
+取流用途通过本地参数 `_playback_purpose` 传给 Rust，只接受 `foreground`、
+`prefetch`、`other`，缺省或未知值归为 `other`。地址缓存的真实发起调用显式
+传入预取标记；下载器归为 `other`。ApiClient 在请求合并键形成之后才给实际
+发送 URI 添加用途，因此同一集的前台与预取仍能共享请求，Rust 用途代表发送
+发起者，加入者可由 Dart 的 `queue=shared` 区分。该参数不进入上游 URL、
+gzip 请求体或签名，也不增加逐调用唯一参数。
+
+V5 诊断沿用 `source_trace_id` 作为 `request`，逐次记录用途、尝试序号、同次
+运行可比较的匿名设备代号和取流并发数（包含设备等待及重试退避，取消时释放）。
+HTTP 日志记录最终状态、版本、重定向次数及方法、编码类别、Content-Length、
+原始实体字节／块数、解压后字节数、收头／收体／解压耗时及解压结果；发送体
+只记长度与签名 stub 匹配布尔值。重定向仍由默认 `limited(10)` 策略决定。
+日志不含地址、查询、正文、签名或真实设备身份，可以区分空实体、有效空 gzip
+及损坏 gzip；仍需真实请求证据才能判定现网原因。
+
+推荐流内联播放器失败时，在清除当前集身份之前作废该集的地址缓存与当前档位
+快照，点击重试会重新取流，不再重开两分钟缓存内的失败地址。新播放器仍等旧
+解码器释放完成；未出首帧的失败不覆盖已有续播记录。定向回归覆盖空响应恢复、
+重试耗尽、网络/空响应共用预算、非空 JSON 和普通接口不受影响，以及失效地址
+重取、释放等待与续播点保留。
+
+2026-11-19 在独立播放修复工作区（基线 `18161a89`）验证：6 个受影响 Flutter
+测试文件共 103 项、Rust `upstream_retry` 10 项和 `video_codec_gate` 9 项通过，
+Flutter 静态分析与针对这些 Rust 目标的 clippy 通过。新增空响应及失败地址缓存
+回归在修改前实际失败，修改后通过。应用版本保持基线的 `1.0.205+210`，未改
+Rust 签名算法、生成绑定或依赖锁。
+
+首次恢复逻辑验证使用 MuMu 6.8.8.0 / Android 12 / 实例 `1`，x86_64 经 ARM
+转译，实际界面 1600×900 横屏；保留数据安装 arm64 split release
+（versionCode `2210`）。该恢复逻辑包 SHA-256 为
+`9bb58d6b8c8e2e44db52b8e8f6a156c1eac5637b8a3947719a211c6e8860d37c`，
+签名、ABI、ELF/ZIP 16 KiB 对齐及安装后哈希检查通过。原 `1.0.204` 包在推荐
+流复现空模型取流失败；最新基线 CI 包已采用 v5，但也观察到零字节响应，手动
+重试后能播放。因此本次只补充恢复逻辑，不把旧包问题统称为解码失败。
+
+修复包实际观察到《弃爱从商：我功成名就不负少年时》的推荐播放、选集 2/3、
+后续自动连播及后台返回；《重生1988，从做倒爷开始起家》的推荐播放也有连续
+视频画面。安装时间之后的 5 条全页加载诊断都以首帧结束，其中分别包含在线、
+预热与离线来源，不能把这些全算成在线成功。日志中仍有上游持续零字节响应在
+三次尝试后耗尽；当前观察页面仍正常播放，但未证明所有失败请求都是后台预取，
+也未证明所有作品和网络条件都稳定。未观察到应用崩溃或原生 Playback error。
+本轮未验证实际听感、硬件解码、16 KiB 页设备、所有窗口尺寸或长时间压力场景。
+
+验证结束返回首页，保留修复包与应用数据，显示/字体/旋转设置与测试前一致；
+未清空日志、缓存或设备池。原始截图、日志、包校验和导出证据保留在仓库外。
+这次设备证据不归属日志 PR 或主工作区其他未提交修改。
+
+2026-11-19 晚间在同一独立工作区补充多成员 gzip 修复和 V5 安全诊断后，
+重建 Android Rust 双 ABI 与 arm64 split release，版本仍为 `1.0.205+210`
+（versionCode `2210`）。本轮留存于仓库外证据目录的验证包 SHA-256 为
+`766fed10f3441bb2730b335390f1233d1a942aa028793f2bd64eed36dd027134`，
+签名、ABI、ELF/ZIP 16 KiB 对齐及安装后哈希核对通过。修改的是既有 gzip、
+恢复与本地用途断言；本轮没有新增测试文件或测试函数。受影响 Flutter 用例、
+Rust gzip/重试/视频契约用例和静态检查通过；没有运行完整本地套件或本轮 CI。
+
+MuMuManager 本轮查得实例 `1` / Android 12 / `127.0.0.1:16416`，仍为
+x86_64 经 ARM 转译。实际路径为首页短剧推荐 →《退役归来，这个保镖不好惹》
+详情 → 开始观看 → 第 1 集。前台请求 `request=1` 在线取得 24,904 字节模型、
+5 档可播放画质；同次 `player-quality trace=1` 记录与第 1 集加载记录的时序、
+attempt 一致。持久化 `player-load` 显示 `source=network`、`outcome=firstFrame`，
+取址 5,260ms、首帧总耗时 8,014ms、发出播放后到首帧 2,481ms。
+相隔 5 秒的截图显示视频内容继续变化；采样窗口未见 FATAL EXCEPTION 或原生
+Playback error。该在线首帧样本不能与早前预热、离线样本合并计算在线成功率。
+
+本轮最终采样为 12 次逻辑 V5 调用、26 次 HTTP 尝试，其中 21 次空实体尝试，
+7 次逻辑调用耗尽同设备的三次尝试。26 次均为 HTTP/1.1 200、无 Content-Encoding、
+无重定向、最终方法 POST，且发送体 `stub_matches=true`。空尝试明确记录
+`content_len=0 raw_bytes=0 raw_chunks=0 body_len=0 gzip=false`，因此这份实际
+样本的失败是远端响应链返回的空 HTTP 实体；多成员 gzip 遗漏和 POST 重定向
+改写均不能解释这些样本。尚不能判断空实体来自业务服务、网关或其他中间层。
+
+按逻辑调用计，foreground 1 次成功、prefetch 1 次失败、other 10 次（4 成功、
+6 失败）。本次 7 个空失败均来自后台用途，但前台只有 1 次样本，不能外推为
+前台不受影响。匿名设备代号 D1/D5 共 5 次尝试均非空，D2/D3/D4 共 21 次尝试
+均为空；这是运行内关联，同设备重试不是独立样本，不能据此判定鉴权失败或
+永久退休设备。源码存在旧设备空 `cdid` 使用兼容值的路径，但安全日志没有
+对应标记，尚未证明该路径与失败相关。共享版本/UA 常量及其与服务端设备
+历史的交互仍缺对照证据，不根据这次关联改动签名身份或设备轮换契约。
+
+原计划最多旁观 6 次逻辑取流，播放期间既有自动缓存/下载任务额外发起请求，
+实测达到 12 次后已立即停止应用，阻止继续采样。随后只重启应用导出已有
+应用 + 核心持久日志，重启进程没有 V5 HTTP 请求；未清空应用数据、日志、缓存
+或设备池。结束返回首页，保留本轮包，字体/显示/旋转与开始前一致，移除本轮
+临时 UI dump，并将原先关闭的 MuMu 实例恢复关闭。
+
+本轮证据位于仓库外
+`%TEMP%\fqapp-v5-gzip-device-62009432559c4093a2549134d0bfa2d2`，安全汇总见
+`stopped-final-safe-traces.txt`、`exported-app-core-safe-metrics.json` 与 `report.md`；
+原始导出和 logcat 仅本机保留。现网空响应根因、长时间稳定性、实际听感、
+硬件解码和实体手机仍未验证，本轮不能交付为“V5 空响应已完全修复”。
+
+2026-11-20 使用应用已启动的本地只读 API 单独验证前台取流，不打开播放器界面：
+一次 `mode=stream` 请求返回本地 HTTP 500，内部连续三次收到上游 HTTP/1.1 200
+空实体（`content_len=0 raw_bytes=0 body_len=0`），三次均为同一匿名设备，签名
+stub 与发送体匹配；第三次后按预算停止，没有 fallback、下载、设备替换或注册。
+这确认空响应重试路径在真实上游链路按预期执行，但该请求仍未取得非空模型，不能
+据此判定空响应根因。实例结束时恢复关闭并移除临时端口转发。安全日志与报告
+保留在仓库外 `%TEMP%\fqapp-direct-api-20261120`。
+
+2026-11-20 播放门兜底(移植 `N3urda/hongguoTV` 的 `streamLadderWithCompatibility`):
+v5 空实体不再在同一身份上重试,改为按播放门顺序切换。`rust/src/upstream/playback_routes.rs`
+维护 4 条门的进程级健康度:v5 玩家门加 3 个 `video_tab` 域名(签名 GET,与 v5 同一
+身份、同一设备 pin,响应按 `data.video_model_data.<id>.video_model` 重写成取流器已
+支持的 `data.<id>.video_model` 形状);空实体停 30 秒,其他失败停 5 秒,成功清零并
+优先。所有门都被空实体停用时,前台请求可做一次身份轮换:先用池内其他已注册设备
+(`get_excluding`),池里只剩失败设备时再走 `replace_failed` 重注册;轮换受 30 秒
+冷却(注册失败 5 秒)、连续 2 轮全空门槛、单请求一次上限约束,剩余预算不足 1.5 秒
+不轮换。预取不探冷却门、不轮换、不注册。单请求最多 6 次尝试。
+
+与参考实现的差异(有意保留):我们的匿名身份来自上限 20 台的共享设备池,不像参考
+实现可以无限重注册,所以「空就换身份」降级为「带冷却的一次轮换」,不让空响应
+啃光设备池;参考实现的单集播放协议 route(不同签名栈、我们从未验证)没有搬;
+`hl`/`lf` 两个域名只在主打空后兜底,失败只计冷却不再重试。诊断沿用不带内容的
+格式,新增 `event=door route=v5|tab-b|tab-hl|tab-lf result=ok|empty|failed`、
+`event=rotate result=ok|unavailable|deadline`、`event=final result=empty attempts=
+empty_rounds= rotations=`,仍不记录地址、查询、正文、签名或真实设备身份。
+
+定向验证:Rust `playback_recovery` 6 项(兜底同身份、非空 v5 不兜底、业务拒绝不算
+可播、全空一次轮换且有界、预取不探冷却门、冷却门下次被跳过),`upstream_retry` 8 项
+(空实体单次返回且带设备身份,503 仍同设备重试),`video_codec_gate` 9 项、
+`mock_upstream_contract` 9 项、`playback_routes` 单元 7 项通过;`flutter analyze` 与
+针对这些目标的 clippy 通过。未跑完整本地套件与 CI,未改版本、FRB 生成、Dart 与
+签名算法。**尚未验证**:现网是否接受我们用通用签名打的 `video_tab` GET、`hl`/`lf`
+域名是否可达、空实体是否真的按身份相关——这三项必须靠设备采样,不能由单元测试
+或本次改动声称解决。
+
+2026-11-20 同一包的设备采样(8 次 UI 切集、18 次逻辑请求、22 次门尝试)把上述三项
+测出了结果:`video_tab` 三域名 **6/6 均为 HTTP 200 + 0 字节且耗时 72–139 ms**,
+属验签阶段短路(我们用的是通用请求签名 argus/ladon 的 aid 1967 档,而这扇门属于
+播放器族),因此该门现状不可用;v5 正常时返回 24,308–24,632 B、五档,空实体仅 81/86 ms。
+同时发现空实体是**单次请求级**而非身份级:同一次轮换后的身份在 15.1 s 与 20–34 s
+都拿到模型,39.87 s 却是空实体——两次空实体之后约 250–300 ms v5 就自行恢复。
+据此增加同门重探:空实体后等 250 ms 用**同一身份**再打一次同一扇门,仅前台、每请求
+一次、且剩余预算不足 1 s 时不做;重探仍空才让该门进入 30 秒冷却。已被冷却钉住的
+门被主动探测时不再重探,避免把一次探测变成两次。定向回归新增同门重探成功(两次
+请求、同一身份、不换门)、后台空实体不重探、预取零请求与冷却期不二次轮换。
+
+据此把 `video_tab` 门改成播放器族签名的 GET 形态:与 v5 同一套 Medusa/Helios/Khronos
+信封(`sign/v5.rs::sign_playback_v5_get`),同一身份包(aid 8662 / novelread / 74332),
+空 body 的摘要参与分支选择,不带 `Content-Type`/`Content-Encoding`/`x-ss-stub` ——
+带 body 头却没有 body 正是通用签名那版被判 200+0 的形态。`hl`/`lf` 两个域名一并删除
+(采样里毫无收益,只增加延迟),兜底门只剩 `api5-normal-sinfonlineb` 一个域名,
+诊断代号统一为 `tab-b`。该门是否真的可用仍需下一轮设备采样验证:只有出现
+`event=door route=tab-b result=ok` 才算这扇门成立。
+
+2026-11-15 在 MuMu 6.8.8 / Android 12 / 实例 0 的实际上游路径中，横屏和竖屏
+样本均显示 1080P、720P、540P、480P、360P，Rust 与 Dart 同次请求记录的档位数一致。
+下载上限 720 的文件实际为横屏 1280×720、竖屏 720×1280，重开均从离线文件出首帧；
+旧偏好 1280 迁为 720，已有 68 个缓存文件逐文件哈希保持一致。实际 dispatcher 的
+本地响应对照确认已返回模型在取消后保留、成功 fallback 只请求一次，以及同 URL
+不同档位只保留一行。MuMu 使用 ARM 转译，这些结果不证明真机解码性能。
+
 **横屏「下一集」卡**（`video_player_chrome.dart` 的 `_nextEpisodeCard`）：
 
 - **16:9 为理想比例**；封面按「3 倍卡高」铺进去并上移一个卡高，窗口里只露出封面中间 **1/3**。
@@ -818,6 +1289,7 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 - 顶部模式切换始终占据同一位置，暂无可用音色或切源期间禁用对应项；切源保持页面身份与当前作品的背景色相，不因音频书 ID 或暂时为空的附加信息重建整页。播放仍切换真实目标书和章节 ID，已知的真人／智能类型不依赖附加信息加载完成
 - 字幕、加载、错误重试和连播倒计时共用固定槽位，字幕与槽位随系统字号等比例增大，状态变化不推移进度与控制行；小屏可竖向滚动。当前句高亮并显示上下文，真人模式保留有时间轴时展开原著全文的入口
 - 边听边读入口在两种模式下保持位置；智能朗读打开字幕，真人讲书按时间轴打开原著对应章节，无字幕或原著映射时禁用并说明原因
+- 字幕和时间点的瞬态失败先有限重试三次；耗尽后只在实际播放中每 30 秒尝试恢复当前章，合法空轨与确定性错误结束重试。暂停、章末、换章、挂起或关闭取消恢复请求；成功同步更新原著章节映射，保留用户关闭的跟随，非空服务端字幕替换本地估算字幕
 - 操作行：语速 / 加入书架 / 下载 / 书评 / 更多
 - `-15s` 进度条 `+15s` 与 `时:分/总时长`；控制行：目录 / 上一章 / 播放暂停 / 下一章 / 定时
 - 两种模式通过同一紧凑声音行打开音色面板，保留多角色对话、智能音色与真人版本；同书切换音色保留播放位置，跨书版本沿用目标目录的章节匹配与历史恢复
@@ -891,6 +1363,47 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 
 ### 2. 调试技巧
 
+#### 应用内日志结构
+
+`lib/services/app_log.dart` 保留 `AppLog.d/i/w/e`、捕获安装、内存缓冲及
+`startPersistence/flush` 调用方式。具体职责放在 `lib/services/logging/`：
+
+- `log_models.dart`：条目、级别、来源与筛选条件，不依赖页面或平台 I/O。
+- `log_codec.dart`：捕获、历史回读、核心读取及文本导出的统一脱敏与多行解析。
+- `log_file_store.dart`：UTF-8 文件轮换、启动期间条目排队、串行 flush 与关闭。
+- `log_viewer_controller.dart`：筛选、冻结/跟随、条目身份复用、轮询与生命周期代次。
+- `log_export.dart`：不可变导出快照；区分核心文件不可读与空文件。
+- `rust_log_source.dart`：宿主注入的核心读取；无时区后缀的旧核心时间戳按 UTC
+  解析，显式 `Z`/偏移保持原语义，应用日志仍按本地时间解析。
+
+`LogViewerPage` 负责页面、滚动、弹层和剪贴板/TXT/分享操作，经典与档案主题
+共用状态。日志格式、文件路径和清空当前视图的语义不变，不删除已有日志文件。
+历史回读不重复写入，历史及核心条目在显示/导出前脱敏；不改写旧文件，也不改变
+Rust 日志生产端的格式或平台启用范围。
+
+定向回归：
+
+```bash
+flutter test --no-pub test/app_log_test.dart test/log_file_store_test.dart test/log_codec_test.dart test/log_viewer_controller_test.dart test/log_viewer_page_test.dart test/log_viewer_eink_test.dart
+```
+
+2026-11-19 使用 MuMu 6.8.8.0 / Android 12 实例 `1` 验证 arm64 release，
+x86_64 经 ARM 转译，实际界面为 1600×900 横屏。测试包为原开发工作区的
+`1.0.204+209`（split versionCode `2209`），SHA-256 为
+`ed744748e81b7a138998a87d23e40c2ba8dead688fa3ffc2661414621fed087b`；
+保留数据升级，签名、ABI、ELF/ZIP 16 KiB 对齐及安装后哈希检查通过。
+该设备证据只归属此包，不代表之后从更新的 `master` 整理出的 PR 集成版本已做
+设备验收，也不归属为工作区其他业务修改的验收。
+
+实际观察：来源切换、级别/关键词筛选、详情展开、轮询时保留展开状态、冻结/
+恢复跟随、TXT 筛选/全部/合并导出、后台返回和经典/档案主题均正常。重启前
+94 条应用日志全部回读，无遗漏或重复回写；重启后新增 6 条属于新会话。
+实测发现核心无时区后缀 UTC 被当作本地时间，导致近期筛选误排除新日志；上述
+解析层修正后重建并复测通过。复制仅验证成功回显，未核对外部剪贴板全文；
+分享显示无可处理应用，不计为成功发送。未清空数据，临时主题和系统设置已恢复，
+原始截图、日志和导出文本保留在仓库外。未见应用崩溃或 ANR；模拟器结果不代表
+真机性能、硬件兼容性或 16 KiB 页设备验证，也未覆盖所有敏感日志输入。
+
 沿用 MuMu 工作流中已确认的 `$adb` 和 `$serial`。`run-as` 仅适用于可调试构建，默认 release 包不可据此读取私有日志；可改看应用内诊断及 `logcat`，不要为取日志清空数据或改装调试包。
 
 ```powershell
@@ -911,26 +1424,7 @@ curl http://127.0.0.1:18080/health
 ### 3. 设备池过期
 若 content/full 解密乱码，删除 `files/backend/config/device_pool.json` 重启 App 即可自动重注册。
 
-### 4. 构建偶发 `The settings are not yet available for build`
-
-**现象**：`flutter build` / `gradlew` 偶发报
-`IllegalStateException: The settings are not yet available for build`，
-但重跑即恢复（daemon 日志显示失败后紧接着的 daemon 几秒内成功）。
-
-**根因**（已定位到 Gradle 9.1.0 字节码）：调用链为
-`ConfigurationCachePromoHandler.beforeComplete()` →
-`runWithoutBuildDefinition()` → `ResolvedBuildLayout.isBuildDefinitionMissing()` →
-`DefaultGradle.getSettings()`。`getSettings()` 在 settings 尚未 attach 时直接抛异常；
-该处理器是 Gradle 9.1.0 新增的「配置缓存推广」功能（构建结束时打印
-`Consider enabling configuration cache`），在复合构建（`settings.gradle.kts` 中
-`includeBuild(flutter_tools)` + 子工程 `:gradle`）首次初始化的时序里偶发踩中此状态。
-
-**结论**：这是 Gradle 9.1.0 自身缺陷，非项目代码问题，且无法稳定复现。
-
-**处理**：无需修改代码/配置；偶发时重跑即可。若想彻底规避，可升级 Gradle
-补丁版本（9.1.x / 9.2，需先确认与 AGP 9.0.1 兼容）。
-
-> 注意：`Daemon compilation failed`（Kotlin 2.3.20，见
+> 注意：`Daemon compilation failed`（Kotlin 2.4.20，见
 > `android/.kotlin/errors/*.log`）是另一独立问题 —— Kotlin 编译守护进程崩溃，
 > 已通过 `gradle.properties` 的 `kotlin.incremental=false` 与
 > `kotlin.compiler.execution.strategy=in-process` 规避，勿因 AGP 9 弃用警告而删除这些配置。
@@ -955,13 +1449,30 @@ curl http://127.0.0.1:18080/health
 - [ ] 16 KB 页 Android 设备上的加密播放与生命周期验证
 - [x] 漫画原生阅读页、章节目录、单图重试与进度恢复
 - [x] 听书前台播放、目录、倍速和进度恢复
-- [x] 小说章节下载/离线缓存
+- [x] 小说章节下载/离线缓存（最多预取 3 章正文，按目录顺序发布和写盘；复用可读缓存，在写盘前重查驱逐及阅读器刷新结果，停止后丢弃在途返回）
 - [x] 发现类入口：搜索联想词与热搜、作者主页、排行榜、书评回复、章节试读预览
 - [x] Release 签名配置与 R8 混淆
-- [x] 整本 TXT 导出（离线缓存页每行「导出 TXT」→ 系统「下载」；重取最新目录与每章正文，按后端 `/api/download` 同形组装）
-- [ ] **按职责整理 `lib/widgets/video_player_chrome.dart`**：修改相关功能时，评估横屏顶栏/底栏、
-      「下一集」卡、右侧面板、抽屉与手势是否适合独立到 `lib/widgets/player/`；仅在减少耦合或
-      提高可读性时拆分，不设目标行数，不为体量统计额外重构。
+- [x] 整本 TXT 导出（离线缓存页每行「导出 TXT」→ 系统「下载」；重取最新目录，复用所属来源的可读缓存，仅补取缺章，最多预取 3 章并按目录顺序组装。每章只保留一个首标题，段落换行归一化，丢弃仅由空白、零宽空格和 BOM 组成的段落，章节间保留一个空行；正文后续引用同名标题仍保留。缓存可读判断与导出正文使用同一规则，只有标题和不可见空白的缓存会补取正文。取文时可取消且不写文件；进入「正在保存文件」后等待系统回报成功或失败，期间不能取消或返回。旧 Web UI 的 `/api/download` 已删除）
+- [ ] **按职责整理 `lib/widgets/video_player_chrome.dart`**（实测 5004 行，其中
+      `_VideoPlayerChromeState` 一个类占 4580 行（311–4890），`part` 只切出一份 22 行的横屏进度条）。
+      拆的是**职责**不是行数：每一块都改成「传值 + 回调」的无状态 widget，留在同一个 State
+      里的只有播放器接线。按「改动收益 ÷ 风险」排序，一次只搬一块，搬完跑相关套件。
+
+      下表的行数是**定义体的实测跨度**（从声明行到方法体结束，命名参数列表与嵌套
+      括号不计入），可用 `python` 扫一遍括号配平复核：
+
+      | 顺序 | 目标文件 | 搬什么（实测方法体行数） | 依赖 |
+      |---|---|---|---|
+      | 1 | `lib/widgets/player/next_episode_card.dart` | `_nextEpisodeCard`（152） | 只读 `widget.*` 与已算好的尺寸 |
+      | 2 | `lib/widgets/player/split_layout.dart` | `_buildSplit`（195）、`_splitDivider`（53） | 布局几何，不含播放状态；`_splitCollapsed` 是一对 1 行 getter / 7 行 setter，跟着布局走 |
+      | 3 | `lib/widgets/player/side_panels.dart` | `_showSideSettings`（38）、`_sheetSwitch`（21） | 面板选择/档位，需回调上抛；`_rateChipLabel` 只是 1 行的顶层文案函数 |
+      | 4 | `lib/widgets/player/gesture_hud.dart` | `_gestureHudOverlay`（72）、`_applyGestureLevel`（35）、`_GestureHudState`/`_GestureKind` | 亮度/音量归一化，纯展示 + 回调 |
+      | 5 | `lib/widgets/player/landscape_bar.dart` | `_landscapeBar`（132）、`_topBar`（75）、`_lockButton`（56）、`_landscapeTitle`（38）、`_landText`（25） | 顶/底栏与锁定钮，读多写少 |
+      | 6 | `lib/widgets/player/info_panels.dart` | `_information`（75）、`_catalogBar`（69）、`_originalBookCard`（60） | 剧集信息与原著卡，纯展示 |
+      | 7（最后） | 原地保留 | `_scheduleHide`（38）、`_positionVideo`（36）、`_listenToPosition`（17）、`_ensurePagerOnCurrent`（14） | 播放器接线：位置流、分页、自动隐藏定时器，跨块共享状态，收益最低 |
+
+      判定标准：搬完后 **该类不再直接读被搬块的私有字段**，且对应测试（`player_*`、
+      `video_player_chrome_test`、`playlet_*`）不改断言即通过。达不到就是没降耦合，应回退。
 
 
 ## 正文替换（#120）
@@ -975,3 +1486,176 @@ ChapterContent 原文、legacyText、缓存和导入文件保持原语义。Read
 阅读器首次加载、预取补图/时间轴刷新及规则变化共用转换服务，以章节、原文版本和 generation 拒绝迟到结果；规则与刷新并发时以最新原文重新生成。原始标题去除只执行一次，避免正文被替换成标题后再次被误删。系统 TTS 首章与后续章节均从原文转换，固定同一会话快照；规则保存时关闭旧会话并清理高亮，需重新启动。真人录音不变。
 
 验证：运行 flutter analyze --no-pub 与 flutter test；重点套件为 text_replacement_*、reader_text_replacement、reader_paragraph_actions、reader_chapter_layout、reader_pagination、reader_illustrations、offline_reader 和 system_tts。Android/Windows 的构建与真机超时终止行为仍须在对应环境验收；Linux 主机单测不代表设备或 AOT 验收完成。
+
+### AI 测试台
+
+设置 → 阅读 → AI 阅读优化 → 高级 → AI 测试台。主页面使用全局提供商与模型，
+可输入样例正文、编辑本次行为提示词及切换本次去屏蔽词选项；这些编辑不修改全局设置。
+请求沿用正文上传授权、预算、用量账本与前台服务，显示流式进度、耗时、Token 用量、
+正文预览、修改详情和模型原始响应。测试结果不写入正式章节缓存，不自动重试。
+停止或退出测试台会取消请求，进入提示词编辑、请求预览或 JSON 校验子页时保留测试。
+结果保留所属请求快照，输入或配置变化后标记为上次结果。
+
+「查看请求」展示 System、User 和输出格式。输出协议优先于用户行为提示词，
+用户行为提示词优先于去屏蔽词等可选功能；JSON Schema 字段说明与 JSON 文本协议共用契约。
+「更多工具 → JSON 校验」可离线检查原文与模型响应，或带入已完成请求的原文和响应。
+WebDAV 配置与诊断由数据同步功能负责。
+
+## Linux / Arch x86_64（实验性运行基础）
+
+支持 Linux runner、bundle 内 Rust 核心、阅读/书架及 TXT/EPUB 本地导入。
+听书播放和系统朗读/桌面集成分别见下方第二、三批说明；备份导出与恢复文件选择复用桌面 JSON 文件选择器，取消不会保存或导入；
+备份格式、16 MB 校验、预览及只补缺失数据的合并规则沿用现有实现。
+小说缓存 TXT 与日志导出使用同一桌面保存对话框，按用户选择的位置保存 UTF-8 文本；
+取消或写入失败不报告成功。
+短剧视频、Android 系统栏等未实现通道明确报告暂不支持。
+第四批提供实验性 Arch 打包脚本与 Linux CI artifact，不提供正式 Release。
+构建溯源、安装/卸载、升级回退边界与依赖见 [LINUX.md](LINUX.md)。
+
+Arch 构建依赖：Flutter stable（目标工具链 3.50.0 / Dart 3.14.0）、Rust stable
+及 x86_64-unknown-linux-gnu target、clang、cmake、ninja、pkgconf、gtk3、libsecret。
+运行需要 GTK3、libsecret、glibc（含 iconv）、xdg-user-dirs 和图形会话，
+以及已启动且已解锁的 Secret Service（如 GNOME Keyring）。不要用 sudo 运行应用。
+媒体构建及运行还需要系统 libmpv（Arch 的 mpv 包），第三批另需 Speech Dispatcher，详见下文。
+
+```bash
+flutter pub get
+flutter analyze --no-pub
+flutter build linux --release --no-pub
+./build/linux/x64/release/bundle/fqapp
+```
+
+请运行完整 bundle，保留同目录的 data/、lib/；Rust 只从可执行文件旁的
+lib/libfqapi_core.so 加载，不依赖启动时的工作目录。不需要手改 FRB 生成文件。
+CMake 调用 Cargo --locked 构建 release 核心，首次构建需可用的 pub/Cargo 缓存或网络。
+
+本地资料沿用 path_provider/Hive 的上游目录：Hive 在用户 Documents，
+导入书籍和后端在 application support 目录。不要将日常资料目录指向测试目录。
+Linux 每个 HOME 只允许一个写者（锁位于 ~/.local/share/fqapp/.writer.lock），
+第二个进程返回 23；锁随进程退出释放，不要删除正在使用的锁文件。
+密钥服务失败不回落为明文；密钥损坏或现有加密资料无法解密时拒绝替换资料。
+请恢复原 keyring 后重试，勿通过删除密钥或资料来解决启动错误。
+Linux 密钥操作等待真实完成，避免超时后迟到写与重试产生两个不同密钥；
+若 Secret Service 卡住，需要先修复服务，再关闭并重新启动应用。
+
+隔离启动检查应同时设置新的 HOME、XDG_CONFIG_HOME、XDG_DATA_HOME、
+XDG_CACHE_HOME、XDG_RUNTIME_DIR，并使用私有 D-Bus 与临时 keyring；仅改 HOME
+仍可能连接日常会话的密钥服务。虚拟显示器的启动结果不能替代实际 GPU、
+Wayland/X11 桌面、媒体或音频验收。
+
+### Linux 实验性媒体（第二批，依赖 Linux runtime base）
+
+Linux 复用桌面 media_kit 播放器，增加锁定的 media_kit_libs_linux 1.2.1。
+需系统 libmpv（Arch 的 mpv 包）；构建时检查库存在，不下载另一套 allocator。
+Rust/C CENC 使用 PIC 并与 core 一起构建。FRB 与媒体 FFI 从可执行文件相邻的
+绝对 lib/libfqapi_core.so 加载，不依赖启动 cwd。Windows/Android 加载与代理
+策略保留；Linux 沿用 reqwest 环境路由，不新增应用代理设置语义。
+
+听书支持普通 URI 与 CENC loopback Range、暂停、seek、倍速和销毁。
+关闭窗口在首批刷盘/后端关闭后释放全部播放器；创建期间销毁会关闭迟到会话。
+Linux 视频入口仍为 unavailable，等待真实图形播放验证再开放。
+TTS、MPRIS、portal、锁屏/挂起恢复与 idle inhibition 不在本批；播放器通知和
+保亮请求无系统集成效果。合成媒体 null 输出不证明物理声卡、GPU、Wayland。
+
+离线验证：构建 core 后，以 FQAPP_MEDIA_LIBRARY 指向 bundle 中绝对 core 路径，
+运行 python3 scripts/verify_windows_media.py；它复用 Windows 实际 FFI 合成媒体
+验证，覆盖本地/HTTP CENC、导出明文字节的音视频帧一致性、随机 Range、安全
+边界及会话撤销，只写 build/。然后设置 FQAPP_TEST_MEDIA 为生成的
+build/validation/windows-media/decoded.mp4 绝对路径，运行
+flutter test --no-pub --concurrency=1 test/desktop_media_playback_test.dart，
+验证实际 libmpv 播放、暂停、seek、倍速、完成及释放。
+
+上游完整检查使用 CI；本地运行 flutter analyze --no-pub、上述定向媒体检查及
+相关构建，不运行完整 Flutter/Rust 套件。资源受限机器串行执行，
+使用 systemd scope 限制 CPU/内存及 CARGO_BUILD_JOBS=2、
+CMAKE_BUILD_PARALLEL_LEVEL=2。隔离 HOME/keyring，不读取真实账号/媒体缓存。
+
+真实 Linux engine 接线回归入口：
+`flutter build linux --release --no-pub -t test/support/linux_media_runtime.dart`。
+在私有 HOME/XDG、D-Bus、Xvfb 和虚拟音频会话内运行生成的 bundle，设置
+`FQAPP_RUNTIME_ORIGIN=http://127.0.0.1:<port>`。该本地 HTTP 服务需提供支持 Range 的
+8 秒合成 `audio.wav` 和 `encrypted.mp4`（AAC/CENC，测试 key 为
+`00112233445566778899aabbccddeeff`）。入口使用真实 LinuxPlatform、NativePlayer、
+media_kit 原生纹理插件和 bundle 内 Rust/C 核心，检查创建、实际进度、暂停、seek、
+释放后 CENC listener 撤销，再在活跃 CENC 播放中正常关窗；监督进程须检查退出码 0。
+它是独立测试 target，不由产品 main 引用。此 bundle 不是产品包；交付前重新构建默认 target。
+该测试不证明物理声卡/GPU、完整产品存储关窗链或 Windows/Android 运行通过。
+
+### Linux 系统朗读与桌面集成（第三批）
+
+在前两批上增加 Speech Dispatcher（构建必需 `speech-dispatcher` pkg-config 和 libspeechd 头文件；
+Arch 运行包 `libspeechd`、`speech-dispatcher`、中文音源如 `espeak-ng`）。
+应用只连接现有 daemon，不自动启动、安装或重配置用户服务。设置页列出真实输出
+模块；初始化选择 zh/cmn 语音，无中文语音、连接/设置失败会返回 TTS_ERROR。
+rate 以 log2 映射到 Speech Dispatcher 的 -100..100；这不是实测倍速保证。
+可选 volume 为 0..1，未设置保留 daemon 默认。pause 取消本客户端队列，
+恢复由现有朗读状态机重发当前句；start/done/cancel 按 daemon 消息 ID 映射，
+取消后旧回调不得推进正文。SSIP 操作在专用 worker，Flutter 回复/释放回主线程。
+
+Linux 听书、系统朗读使用 owner 标识更新 MPRIS，旧 owner 的清理不能移除新会话；
+D-Bus 名已被其他实例持有时报告 MPRIS_OWNER_BUSY，不替换它。
+媒体键支持显式 Play/Pause、PlayPause、上下章；有实际 timed seek handler 时才声明
+CanSeek。位置来自播放器/朗读状态，不导出封面或含凭据媒体 URL。
+Linux 视频入口仍关闭。Android 专用登录、系统栏等能力不假报成功；
+Linux reader brightness 尚不可用，返回 unsupported_platform，不伪造硬件亮度。
+
+阅读和播放的常亮需求合并为一个 GTK idle inhibitor；GTK 返回 0 时报告
+INHIBIT_UNAVAILABLE，关闭/停止释放 cookie。GTK 通过当前桌面可用后端实现；
+不保证每个 compositor 提供 portal/inhibitor。logind LockedHint 仅为提示，
+capabilities.lockEvents 恒 false；subscription 不证明锁屏可靠性。
+隐藏按现有后台播放偏好处理，suspend 即使允许后台也暂停；仅自动暂停且 owner
+未替换、用户未手动暂停的会话可恢复。服务消失不伪造 unlock/resume。
+D-Bus 连接关闭后定时重连，logind 名恢复后重订阅；缺服务可诊断。
+关闭仍先等待本地初始化和上游刷盘/后端退出，再停止媒体/TTS/idle/session，
+保留单写者锁。失去响应的第三方 daemon 仍可能延迟 SSIP 操作和关闭，需修复服务。
+
+单元门：`flutter analyze --no-pub`、`flutter test --no-pub --concurrency=1`。
+本批不改 Rust，无需重复 cargo test。native 严格编译示例：
+
+```bash
+cmake -S native/linux -B build/native-strict \
+  -DFLUTTER_LINUX_DIR="$FLUTTER_ROOT/bin/cache/artifacts/engine/linux-x64" \
+  -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror"
+cmake --build build/native-strict -j2
+flutter build linux --release --no-pub -t test/support/linux_desktop_runtime.dart
+```
+
+独立 runtime target 需私有 HOME/XDG、D-Bus、Xvfb、ALSA null 和 task-owned
+Speech Dispatcher，设置 FQAPP_DESKTOP_TEST_ROOT。监督器按该 target 的文件握手：
+初始持有 org.mpris.MediaPlayer2.fqapp，disconnect 时仅终止测试 daemon，
+reconnect 时重启并写 restarted；release-name 时释放竞争名并写 name-released；
+mpris 时查询 metadata/status/position，依次发送 Pause、Play、PlayPause、Seek
+(1000000us)、SetPosition(track/1,5000000us) 后写 controls-done；
+stale-stop 时确认 Playing 后写 stale-checked；released 时确认无 owner 后写
+released-checked。检查 PASS 标记、活跃朗读关窗退出码 0。它验证真实 channel、
+SSIP 和 D-Bus，但 null 音频/Xvfb 不证明物理音质、GPU、实际锁屏或挂起。
+测试入口不引用产品资料，不是产品包；交付前重新构建默认 target。
+
+仓库内监督器可直接复验真实 D-Bus Rate/Volume 写入、后端确认/失败回复和
+PropertiesChanged（Arch 测试依赖另需 `xorg-server-xvfb`、`dbus`、`speech-dispatcher`、`espeak-ng`）：
+
+```bash
+python test/linux_desktop_runtime_test.py
+# 需 FLUTTER_ROOT 指向同一 SDK；实际 tts.cc 在途回调与析构的 ASan 压力回归：
+python test/linux_tts_lifetime_test.py
+flutter build linux --release --no-pub -t lib/main.dart
+```
+
+GDBusInterfaceVTable 的空 set_property 是 GLib 2.38 起支持的异步属性分发方式，
+Properties.Set 会进入 method_call；不能改为同步等待 Dart 而阻塞 GTK 主线程。
+官方合同：https://docs.gtk.org/gio/struct.DBusInterfaceVTable.html 。
+TTS 回调取 active 指针并入队与析构撤销指针使用同一锁；关闭 libspeechd 前释放此锁，
+避免 spd_close 等待其回调线程时死锁。ASan 回归仅在外置编译副本插入调度钩子，
+不增加产品测试开关；它不模拟真实 daemon，须与上面的真实协议复验分别报告。
+
+第三批审查修复补充：SSIP 拒绝 CANCEL 时 pause/stop/initialize 报 TTS_ERROR 并关闭连接，
+无连接 stop 保持幂等。常亮请求串行提交，失败回滚 reader/player 意图。
+MPRIS Volume/Rate 经当前 owner 的实际播放器或 SpeechDispatcher 确认后回复 Set 并发布
+PropertiesChanged；读取来自后端设置，不使用独立音量模型。TTS 速率范围 .25..4，
+听书页 .75..2，完整音频 controller .5..3，均包含 1；SSIP 整数速率会量化。
+Rate=0 复用 Pause 路由，不向后端提交零速率，也不把 Rate 属性写成 0。
+非零速率修改先按旧速率结算位置并刷新时间锚点，避免 Position 与相对 Seek 基准跳变。
+Seek 越尾按 Next（受 CanGoNext 控制），SetPosition 越尾忽略；旧章节 seek 完成不发新章 Seeked。
+runner 在窗口子类 dispose 调用父类前释放 bridge，保留 worker join，不关闭退出诊断。
+真实协议回归目标仍为 test/support/linux_desktop_runtime.dart；拒绝 CANCEL 注入由
+私有 SSIP 代理执行，ALSA null/Xvfb 的结果不代表物理声音、compositor、锁屏或挂起验收。

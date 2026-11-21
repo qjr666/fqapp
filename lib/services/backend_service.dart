@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'backend_transport.dart';
 import 'lan_share_preferences.dart';
+import 'network_proxy_preferences.dart';
 
 /// Manages the local backend core.
 ///
@@ -136,10 +137,24 @@ class BackendService {
     final configDir = Directory('${dir.path}/config');
     await configDir.create(recursive: true);
 
-    await _copyAsset(
-      'assets/config/config.json',
-      File('${dir.path}/config/config.json'),
-    );
+    // Rebuild from bundled defaults and persisted user routing on every start;
+    // copying the asset alone would silently discard the user's proxy choice.
+    final config =
+        jsonDecode(
+              await _assets.loadString(
+                'assets/config/config.json',
+                cache: false,
+              ),
+            )
+            as Map<String, dynamic>;
+    config['network_proxy'] =
+        (Platform.isWindows || Platform.isLinux
+                ? await NetworkProxyPreferences.instance.load()
+                : const NetworkProxyConfig())
+            .toJson();
+    await File(
+      '${dir.path}/config/config.json',
+    ).writeAsString(jsonEncode(config), flush: true);
     await _copyAsset(
       'assets/config/device_pool.example.json',
       File('${dir.path}/config/device_pool.example.json'),
@@ -208,15 +223,31 @@ class BackendService {
       }
     });
     _startupTimer = timer;
+    // 启动链在走到核心之前还有一段文件准备（目录、配置、部署），那段时间核心
+    // 还没被拉起，但首页已经可能发请求了——首页不再等后端就绪。先告诉传输层
+    // 「核心即将启动」，让它把这些请求挂到核心就绪为止，而不是打到一个还没
+    // 监听的端口上（#318）。
+    final rustTransport = _transport;
+    final coreGate = rustTransport is RustBackendTransport
+        ? rustTransport
+        : null;
+    coreGate?.announceStart();
     late final Future<void> tracked;
     final operation = _startInternal(generation, clock, stopping);
-    tracked = Future.any<void>([operation, timeout.future]).whenComplete(() {
-      if (identical(_startupTimer, timer)) {
-        timer.cancel();
-        _startupTimer = null;
-      }
-      if (identical(_startFuture, tracked)) _startFuture = null;
-    });
+    tracked = Future.any<void>([operation, timeout.future])
+        .catchError((Object error) {
+          // 启动链没走到核心就失败了：挂起的请求立刻拿到失败原因，而不是
+          // 各自等到超时。
+          coreGate?.settleCore(failure: error);
+          throw error;
+        })
+        .whenComplete(() {
+          if (identical(_startupTimer, timer)) {
+            timer.cancel();
+            _startupTimer = null;
+          }
+          if (identical(_startFuture, tracked)) _startFuture = null;
+        });
     _startFuture = tracked;
     return tracked;
   }
@@ -346,7 +377,10 @@ class BackendService {
   /// are cancelled by that shutdown - the UI asks for confirmation before
   /// calling this. The caller owns the persisted preference; this method only
   /// acts on whatever [LanSharePreferences] currently says.
-  Future<void> restartForListenMode() async {
+  Future<void> restartForListenMode() => restartForConfiguration();
+
+  /// Redeploys persisted settings and retires requests owned by the old core.
+  Future<void> restartForConfiguration() async {
     await stop();
     await start();
   }

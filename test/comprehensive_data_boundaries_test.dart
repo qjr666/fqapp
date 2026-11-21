@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/main.dart' as app;
@@ -101,6 +101,8 @@ void main() {
             home: app.AppBootstrap(child: Text('local data ready')),
           ),
         );
+        // 等真实启动链走完:骨架在位时 pumpAndSettle 会一直推进到闸门放行,
+        // 有界推进等不到这里的真实 I/O(见 test/support/pump_until.dart)。
         await tester.pumpAndSettle();
 
         expect(find.text('local data ready'), findsOneWidget);

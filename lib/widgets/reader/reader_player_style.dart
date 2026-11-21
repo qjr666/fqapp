@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../../services/reader_preferences.dart';
 
@@ -11,6 +11,7 @@ extension ReaderPlayerColors on ReaderThemePreset {
     ReaderThemePreset.parchment => const Color(0xFF7E6E52),
     ReaderThemePreset.dark => const Color(0xFF333333),
     ReaderThemePreset.eink => Colors.black,
+    ReaderThemePreset.mistBlue => const Color(0xFF496A89),
   };
 
   Color get playerText => switch (this) {
@@ -26,5 +27,6 @@ extension ReaderPlayerColors on ReaderThemePreset {
     ReaderThemePreset.parchment => const Color(0xB2462E0B),
     ReaderThemePreset.dark => const Color(0xCC8A8A8A),
     ReaderThemePreset.eink => Colors.black,
+    ReaderThemePreset.mistBlue => const Color(0xB2243447),
   };
 }

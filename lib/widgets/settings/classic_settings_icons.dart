@@ -1,4 +1,4 @@
-import 'package:flutter/cupertino.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
 /// Original settings glyphs from the UI referenced by issue #288. This maps
@@ -10,6 +10,8 @@ IconData classicSettingsIcon(String title, IconData fallback) =>
       '阅读' => LucideIcons.book_open,
       '听书' => LucideIcons.headphones,
       '短剧' => LucideIcons.film,
+      '老板键' => LucideIcons.eye_off,
+      '启用老板键' => LucideIcons.eye_off,
       '数据' => LucideIcons.database,
       '服务' => LucideIcons.cpu,
       '关于' => LucideIcons.info,
@@ -19,9 +21,24 @@ IconData classicSettingsIcon(String title, IconData fallback) =>
       '正文替换' => LucideIcons.replace,
       '系统朗读' => LucideIcons.mic,
       '备份与导入' => LucideIcons.database,
+      '导出备份' => LucideIcons.hard_drive_download,
+      '按书导出 AI 资产' => LucideIcons.files,
+      '从备份文件恢复' => LucideIcons.file_input,
+      '导入番茄书架' => LucideIcons.book_open,
+      '从番茄账号读取' => LucideIcons.globe,
+      '从历史文件导入' => LucideIcons.file_input,
+      '使用已保存的书架数据' => LucideIcons.clock,
+      '运行日志' => LucideIcons.terminal,
+      '当前版本' => LucideIcons.badge_check,
+      '检查更新' => LucideIcons.square_arrow_out_up_right,
+      '开源许可' => LucideIcons.scale,
+      '源代码' => LucideIcons.code_xml,
+      '问题反馈' => LucideIcons.message_square,
+      '朗读引擎' => LucideIcons.audio_lines,
       '小说离线缓存' => LucideIcons.bookmark,
       '短剧离线缓存' => LucideIcons.clapperboard,
       '书架点书直接进入阅读' => LucideIcons.book_open,
+      '小说阅读器' => LucideIcons.book_open_check,
       '首页与搜索点书直接进入阅读' => LucideIcons.search,
       '后台听书与保活' => LucideIcons.headphones,
       '听书变速引擎' => LucideIcons.gauge,

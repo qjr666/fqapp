@@ -1,6 +1,6 @@
 import 'dart:math' as math;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../../services/chapter_text_formatter.dart';
 import '../../services/reader_preferences.dart';
@@ -25,6 +25,9 @@ class ReaderLayoutSpec {
   final double horizontalPadding;
   final double verticalPadding;
   final double paragraphSpacing;
+  final bool firstLineIndent;
+  final bool justifyText;
+  final int columns;
 
   ReaderLayoutSpec({
     required this.viewport,
@@ -34,12 +37,17 @@ class ReaderLayoutSpec {
   }) : horizontalPadding = preferences.horizontalPadding,
        verticalPadding = preferences.verticalPadding,
        paragraphSpacing = preferences.paragraphSpacing,
+       firstLineIndent = preferences.firstLineIndent,
+       justifyText = preferences.justifyText,
+       columns = preferences.pageMode == ReaderPageMode.paged
+           ? preferences.columnMode.resolveColumns(viewport)
+           : 1,
        titleAlign = preferences.titleAlignment == ReaderTitleAlignment.center
            ? TextAlign.center
            : TextAlign.start,
        bodyStyle = TextStyle(
          inherit: false,
-         color: preferences.themePreset.textColor,
+         color: preferences.effectiveTextColor,
          fontFamily: fontFamily,
          fontSize: preferences.fontSize,
          fontWeight: FontWeight.values[preferences.fontWeight ~/ 100 - 1],
@@ -49,7 +57,7 @@ class ReaderLayoutSpec {
        ),
        titleStyle = TextStyle(
          inherit: false,
-         color: preferences.themePreset.textColor,
+         color: preferences.effectiveTextColor,
          fontFamily: fontFamily,
          fontSize: preferences.titleSize,
          fontWeight: FontWeight.w600,
@@ -58,7 +66,13 @@ class ReaderLayoutSpec {
          textBaseline: TextBaseline.alphabetic,
        );
 
-  double get width => math.max(1, viewport.width - horizontalPadding * 2);
+  double get pageWidth => math.max(1, viewport.width - horizontalPadding * 2);
+  double get columnGap => columns > 1
+      ? math.min(math.max(24.0, horizontalPadding * 2), pageWidth * 0.25)
+      : 0;
+  double get width => columns > 1
+      ? math.max(1, (pageWidth - columnGap * (columns - 1)) / columns)
+      : pageWidth;
   double get pagePadding => math.min(verticalPadding, viewport.height / 4);
   double get pageHeight => math.max(1, viewport.height - pagePadding * 2);
   double get navigationHeight => math.max(48, textScaler.scale(14) * 1.4 + 24);
@@ -74,7 +88,10 @@ class ReaderLayoutSpec {
       titleAlign == other.titleAlign &&
       horizontalPadding == other.horizontalPadding &&
       verticalPadding == other.verticalPadding &&
-      paragraphSpacing == other.paragraphSpacing;
+      paragraphSpacing == other.paragraphSpacing &&
+      firstLineIndent == other.firstLineIndent &&
+      justifyText == other.justifyText &&
+      columns == other.columns;
 
   @override
   int get hashCode => Object.hash(
@@ -86,6 +103,9 @@ class ReaderLayoutSpec {
     horizontalPadding,
     verticalPadding,
     paragraphSpacing,
+    firstLineIndent,
+    justifyText,
+    columns,
   );
 }
 
@@ -313,12 +333,14 @@ class ReaderPageFragment {
   final int firstLine;
   final int lastLine;
   final double top;
+  final int column;
 
   const ReaderPageFragment({
     required this.block,
     required this.firstLine,
     required this.lastLine,
     required this.top,
+    this.column = 0,
   });
 
   double get sourceTop => block.lines[firstLine].top;
@@ -337,7 +359,14 @@ class ReaderTextPage {
 
   int get start => fragments.first.start;
   int get end => fragments.last.end;
-  double get height => fragments.last.top + fragments.last.height;
+  double get height {
+    var maxBottom = 0.0;
+    for (final fragment in fragments) {
+      final bottom = fragment.top + fragment.height;
+      if (bottom > maxBottom) maxBottom = bottom;
+    }
+    return maxBottom;
+  }
 }
 
 // Note: 两种阅读方式共用行测量，进度保存规范化正文的文字偏移；见
@@ -676,7 +705,8 @@ class ReaderChapterLayout {
     return block.start + block.lines[line].start;
   }
 
-  double scrollForTextOffset(int offset) {
+  /// Positions the line below [leadingInset] when the scroll extent allows it.
+  double scrollForTextOffset(int offset, {double leadingInset = 0}) {
     if (offset <= 0) return 0;
     if (offset >= textLength) return maxScroll;
     final block =
@@ -690,14 +720,20 @@ class ReaderChapterLayout {
       );
       return visible.isEmpty
           ? maxScroll
-          : (spec.verticalPadding + visible.first.top).clamp(0, maxScroll);
+          : (spec.verticalPadding + visible.first.top - leadingInset).clamp(
+              0,
+              maxScroll,
+            );
     }
     final line =
         block.lines[_floorIndex(
           block.lines.length,
           (index) => block.start + block.lines[index].start <= offset,
         )];
-    return (spec.verticalPadding + block.top + line.top).clamp(0, maxScroll);
+    return (spec.verticalPadding + block.top + line.top - leadingInset).clamp(
+      0,
+      maxScroll,
+    );
   }
 
   /// New positions are independent of font, page count and viewport size.
@@ -745,6 +781,7 @@ class ReaderChapterLayout {
   /// First-line indent width. Shared by [_measureBlock] and [blockPainter] so
   /// hit-testing and glyph boxes wrap exactly like the rendered text.
   static double _indentWidth(TextStyle style, ReaderLayoutSpec spec) {
+    if (!spec.firstLineIndent) return 0;
     final scale = spec.textScaler.scale(style.fontSize!) / style.fontSize!;
     return math.min(
       (style.fontSize! + (style.letterSpacing ?? 0)) * 2,
@@ -918,7 +955,11 @@ class ReaderChapterLayout {
       decorationStyle: TextDecorationStyle.solid,
       decorationThickness: 1.6,
     );
-    final align = title ? spec.titleAlign : TextAlign.justify;
+    final align = title
+        ? spec.titleAlign
+        : spec.justifyText
+        ? TextAlign.justify
+        : TextAlign.start;
     final indent = _indentWidth(style, spec);
     // The bubble rides at the very end of the paragraph's text, so it follows
     // the last line and wraps only when that line has no room left. Measuring it
@@ -1088,11 +1129,13 @@ class ReaderChapterLayout {
   ) {
     final pages = <ReaderTextPage>[];
     var fragments = <ReaderPageFragment>[];
+    var column = 0;
     var used = 0.0;
     void finishPage() {
       if (fragments.isEmpty) return;
       pages.add(ReaderTextPage(List.unmodifiable(fragments)));
       fragments = [];
+      column = 0;
       used = 0;
     }
 
@@ -1102,9 +1145,16 @@ class ReaderChapterLayout {
         final line = block.lines[i];
         if (fragments.isNotEmpty &&
             used + line.height > spec.pageHeight + .001) {
-          finishPage();
+          if (column + 1 < spec.columns) {
+            column++;
+            used = 0;
+          } else {
+            finishPage();
+          }
         }
-        if (fragments.isNotEmpty && identical(fragments.last.block, block)) {
+        if (fragments.isNotEmpty &&
+            identical(fragments.last.block, block) &&
+            fragments.last.column == column) {
           final previous = fragments.removeLast();
           fragments.add(
             ReaderPageFragment(
@@ -1112,6 +1162,7 @@ class ReaderChapterLayout {
               firstLine: previous.firstLine,
               lastLine: i,
               top: previous.top,
+              column: column,
             ),
           );
         } else {
@@ -1121,6 +1172,7 @@ class ReaderChapterLayout {
               firstLine: i,
               lastLine: i,
               top: used,
+              column: column,
             ),
           );
         }

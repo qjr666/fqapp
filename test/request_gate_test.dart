@@ -9,15 +9,21 @@ void main() {
     final gate = RequestGate();
     var sends = 0;
     final results = await Future.wait([
-      gate.run<String>('GET /a', send: () async {
-        sends++;
-        await Future<void>.delayed(const Duration(milliseconds: 10));
-        return 'a';
-      }),
-      gate.run<String>('GET /a', send: () async {
-        sends++;
-        return 'a-should-not-run';
-      }),
+      gate.run<String>(
+        'GET /a',
+        send: () async {
+          sends++;
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          return 'a';
+        },
+      ),
+      gate.run<String>(
+        'GET /a',
+        send: () async {
+          sends++;
+          return 'a-should-not-run';
+        },
+      ),
     ]);
     expect(sends, 1);
     expect(results, ['a', 'a']);
@@ -27,14 +33,20 @@ void main() {
     final gate = RequestGate();
     final sends = <String>[];
     await Future.wait([
-      gate.run<String>('GET /a', send: () async {
-        sends.add('a');
-        return 'a';
-      }),
-      gate.run<String>('GET /b', send: () async {
-        sends.add('b');
-        return 'b';
-      }),
+      gate.run<String>(
+        'GET /a',
+        send: () async {
+          sends.add('a');
+          return 'a';
+        },
+      ),
+      gate.run<String>(
+        'GET /b',
+        send: () async {
+          sends.add('b');
+          return 'b';
+        },
+      ),
     ]);
     expect(sends, unorderedEquals(['a', 'b']));
   });
@@ -173,6 +185,46 @@ void main() {
     expect(await running, 'next');
     expect(await following, 'following');
   });
+
+  test(
+    'a terminal failure is not retried: the joiner gets the same error',
+    () async {
+      final gate = RequestGate();
+      final owner = Completer<String>();
+      var joinerSends = 0;
+      final shared = gate.run<String>('GET /shared', send: () => owner.future);
+      final joined = gate.run<String>(
+        'GET /shared',
+        send: () async {
+          joinerSends++;
+          return 'retried';
+        },
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      // 先挂上期望再抛错：错误到达时必须已经有人接住。
+      final joinedExpectation = expectLater(
+        joined,
+        throwsA(
+          isA<BackendRequestAborted>()
+              .having((e) => e.message, 'message', contains('本地服务启动失败'))
+              .having((e) => e.fatal, 'fatal', isTrue),
+        ),
+      );
+      final sharedExpectation = expectLater(
+        shared,
+        throwsA(isA<BackendRequestAborted>()),
+      );
+
+      // 核心没起来是终局失败：重试只是把同一个失败再跑一遍，加入者不该重试。
+      owner.completeError(
+        BackendRequestAborted('本地服务启动失败：core down', fatal: true),
+      );
+      await joinedExpectation;
+      await sharedExpectation;
+      expect(joinerSends, 0);
+    },
+  );
 
   test('a cancelled caller never joins or sends', () async {
     final gate = RequestGate();

@@ -21,11 +21,12 @@ library;
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../models/playlet_comment.dart';
+import '../comment_emoji.dart';
 import 'playlet_danmaku_settings.dart';
 
 /// 同时出现在屏幕上的弹幕行距（本地取值；官方行距由
@@ -515,8 +516,8 @@ class _PlayletDanmakuLayerState extends State<PlayletDanmakuLayer>
             color: const Color(0x66000000),
             borderRadius: BorderRadius.circular(4),
           ),
-    child: Text(
-      entry.text,
+    child: CommentEmojiText(
+      text: entry.text,
       maxLines: 1,
       // 官方字号/透明度来自 danmaku_config（DanmakuTextSize 5 档，
       // key_alpha 默认 255）。

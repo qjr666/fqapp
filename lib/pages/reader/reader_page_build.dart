@@ -4,82 +4,243 @@ part of '../reader_page.dart';
 extension _ReaderPageBuild on _ReaderPageState {
   Widget _buildReader(BuildContext context) {
     if (!isWindowsDesktop) return _buildReaderSurface(context);
-    return LayoutBuilder(
-      builder: (context, bounds) => ColoredBox(
-        color: _effectivePreset.backgroundColor,
-        child: Row(
-          children: [
-            if (bounds.maxWidth >= 1000)
-              DesktopChapterSidebar(
-                chapters: widget.chapters,
-                currentIndex: _index,
-                onSelected: (index) => unawaited(_jumpToChapter(index)),
-              ),
-            Expanded(
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 880),
+    final preset = _effectivePreset;
+    final sidebarBg = Color.alphaBlend(
+      preset.textColor.withValues(alpha: preset.isDark ? 0.04 : 0.03),
+      _effectiveBackgroundColor,
+    );
+    final sidebarBorder = preset.textColor.withValues(alpha: 0.12);
+    return ValueListenableBuilder<bool>(
+      valueListenable: DesktopPlatform.fullscreen,
+      builder: (context, fullscreen, _) => LayoutBuilder(
+        builder: (context, bounds) {
+          const sidebarWidth = 248.0;
+          final columnMode = _displayPreferences.columnMode;
+          final automaticSpreadWithoutSidebar =
+              _paged &&
+              columnMode == ReaderColumnMode.auto &&
+              columnMode.resolveColumns(
+                    Size(bounds.maxWidth, bounds.maxHeight),
+                  ) >
+                  1;
+          final sidebarWouldDisableAutomaticSpread =
+              automaticSpreadWithoutSidebar &&
+              columnMode.resolveColumns(
+                    Size(bounds.maxWidth - sidebarWidth, bounds.maxHeight),
+                  ) ==
+                  1;
+          final showSidebar =
+              bounds.maxWidth >= 1000 &&
+              !sidebarWouldDisableAutomaticSpread &&
+              _desktopSidebarOpen &&
+              !fullscreen;
+          final viewport = Size(
+            bounds.maxWidth - (showSidebar ? sidebarWidth : 0),
+            bounds.maxHeight,
+          );
+          final wideSpread =
+              _paged &&
+              _displayPreferences.columnMode.resolveColumns(viewport) > 1;
+          return ColoredBox(
+            color: _effectiveBackgroundColor,
+            child: Row(
+              children: [
+                if (showSidebar)
+                  DesktopChapterSidebar(
+                    key: const ValueKey('reader-desktop-chapter-sidebar'),
+                    width: sidebarWidth,
+                    chapters: widget.chapters,
+                    currentIndex: _index,
+                    backgroundColor: sidebarBg,
+                    borderColor: sidebarBorder,
+                    textColor: preset.textColor,
+                    mutedColor: preset.mutedTextColor,
+                    accentColor: preset.accentColor,
+                    onCollapse: () =>
+                        _setState(() => _desktopSidebarOpen = false),
+                    onSelected: (index) => unawaited(_jumpToChapter(index)),
+                  ),
+                Expanded(
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
-                      Focus(
-                        autofocus: true,
-                        onKeyEvent: (node, event) {
-                          if (event is! KeyDownEvent ||
-                              FocusManager.instance.primaryFocus?.context
-                                      ?.findAncestorWidgetOfExactType<
-                                        EditableText
-                                      >() !=
-                                  null) {
-                            return KeyEventResult.ignored;
-                          }
-                          final key = event.logicalKey;
-                          if ([
-                            LogicalKeyboardKey.arrowRight,
-                            LogicalKeyboardKey.pageDown,
-                          ].contains(key)) {
-                            unawaited(_turnPage(1));
-                            return KeyEventResult.handled;
-                          }
-                          if ([
-                            LogicalKeyboardKey.arrowLeft,
-                            LogicalKeyboardKey.pageUp,
-                          ].contains(key)) {
-                            unawaited(_turnPage(-1));
-                            return KeyEventResult.handled;
-                          }
-                          return KeyEventResult.ignored;
-                        },
-                        child: Listener(
-                          onPointerSignal: _desktopScroll,
-                          child: _buildReaderSurface(context),
-                        ),
-                      ),
-                      Positioned.fill(
-                        child: IgnorePointer(
-                          child: ValueListenableBuilder<double>(
-                            valueListenable: DesktopPlatform.readerBrightness,
-                            builder: (_, brightness, _) => ColoredBox(
-                              color: Colors.black.withValues(
-                                alpha: 1 - brightness,
+                      Center(
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(
+                            maxWidth: wideSpread
+                                ? math.max(1440.0, bounds.maxHeight + 1)
+                                : 880,
+                          ),
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              Focus(
+                                autofocus: true,
+                                onKeyEvent: (node, event) {
+                                  if (event is! KeyDownEvent ||
+                                      FocusManager
+                                              .instance
+                                              .primaryFocus
+                                              ?.context
+                                              ?.findAncestorWidgetOfExactType<
+                                                EditableText
+                                              >() !=
+                                          null) {
+                                    return KeyEventResult.ignored;
+                                  }
+                                  final key = event.logicalKey;
+                                  if (key == LogicalKeyboardKey.f11) {
+                                    unawaited(
+                                      DesktopPlatform.instance.setFullscreen(
+                                        !fullscreen,
+                                      ),
+                                    );
+                                    return KeyEventResult.handled;
+                                  }
+                                  if (key == LogicalKeyboardKey.escape &&
+                                      fullscreen) {
+                                    unawaited(
+                                      DesktopPlatform.instance.setFullscreen(
+                                        false,
+                                      ),
+                                    );
+                                    return KeyEventResult.handled;
+                                  }
+                                  if ([
+                                    LogicalKeyboardKey.arrowRight,
+                                    LogicalKeyboardKey.pageDown,
+                                  ].contains(key)) {
+                                    unawaited(_turnPage(1));
+                                    return KeyEventResult.handled;
+                                  }
+                                  if ([
+                                    LogicalKeyboardKey.arrowLeft,
+                                    LogicalKeyboardKey.pageUp,
+                                  ].contains(key)) {
+                                    unawaited(_turnPage(-1));
+                                    return KeyEventResult.handled;
+                                  }
+                                  return KeyEventResult.ignored;
+                                },
+                                child: Listener(
+                                  onPointerSignal: _desktopScroll,
+                                  child: _buildReaderSurface(context),
+                                ),
                               ),
-                            ),
+                              Positioned.fill(
+                                child: IgnorePointer(
+                                  child: ValueListenableBuilder<double>(
+                                    valueListenable:
+                                        DesktopPlatform.readerBrightness,
+                                    builder: (_, brightness, _) => ColoredBox(
+                                      color: Colors.black.withValues(
+                                        alpha: 1 - brightness,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
+                      if (bounds.maxWidth >= 700)
+                        ValueListenableBuilder<bool>(
+                          valueListenable: _controlsVisibility,
+                          builder: (context, controls, _) {
+                            final showUtilityPill =
+                                !showSidebar || controls || fullscreen;
+                            if (!showUtilityPill) {
+                              return const SizedBox.shrink();
+                            }
+                            return Positioned(
+                              top: 12,
+                              left: 12,
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  color: sidebarBg.withValues(alpha: 0.92),
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(color: sidebarBorder),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (!fullscreen &&
+                                        bounds.maxWidth >= 1000 &&
+                                        !sidebarWouldDisableAutomaticSpread)
+                                      IconButton(
+                                        key: const Key(
+                                          'reader-desktop-sidebar-toggle',
+                                        ),
+                                        tooltip: _desktopSidebarOpen
+                                            ? '收起目录'
+                                            : '展开目录',
+                                        visualDensity: VisualDensity.compact,
+                                        constraints:
+                                            const BoxConstraints.tightFor(
+                                              width: 34,
+                                              height: 32,
+                                            ),
+                                        padding: EdgeInsets.zero,
+                                        onPressed: () => _setState(
+                                          () => _desktopSidebarOpen =
+                                              !_desktopSidebarOpen,
+                                        ),
+                                        icon: Icon(
+                                          _desktopSidebarOpen
+                                              ? LucideIcons.panel_left_close
+                                              : LucideIcons.panel_left_open,
+                                          size: 16,
+                                          color: preset.textColor,
+                                        ),
+                                      ),
+                                    IconButton(
+                                      key: const Key(
+                                        'reader-desktop-fullscreen-toggle',
+                                      ),
+                                      tooltip: fullscreen ? '退出全屏' : '全屏阅读',
+                                      visualDensity: VisualDensity.compact,
+                                      constraints:
+                                          const BoxConstraints.tightFor(
+                                            width: 34,
+                                            height: 32,
+                                          ),
+                                      padding: EdgeInsets.zero,
+                                      onPressed: () => unawaited(
+                                        DesktopPlatform.instance.setFullscreen(
+                                          !fullscreen,
+                                        ),
+                                      ),
+                                      icon: Icon(
+                                        fullscreen
+                                            ? LucideIcons.minimize_2
+                                            : LucideIcons.maximize_2,
+                                        size: 15,
+                                        color: preset.textColor,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
                     ],
                   ),
                 ),
-              ),
+              ],
             ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
 
   Widget _buildReaderSurface(BuildContext context) {
     final preset = _effectivePreset;
+    // One decision per build, from the live scope, never from the animated
+    // theme tokens. Archive keeps the Wenku8/glass chrome untouched.
+    final classic = AppUiScope.isClassic(context);
     final windowPadding = MediaQuery.paddingOf(context);
     final overlayStyle = preset.isDark
         ? SystemUiOverlayStyle.light
@@ -91,14 +252,14 @@ extension _ReaderPageBuild on _ReaderPageState {
       },
       child: AnnotatedRegion<SystemUiOverlayStyle>(
         value: overlayStyle.copyWith(
-          statusBarColor: preset.backgroundColor,
-          systemNavigationBarColor: preset.backgroundColor,
+          statusBarColor: _effectiveBackgroundColor,
+          systemNavigationBarColor: _effectiveBackgroundColor,
         ),
         child: Theme(
           data: preset.theme(Theme.of(context)),
           child: Scaffold(
             resizeToAvoidBottomInset: false,
-            backgroundColor: preset.backgroundColor,
+            backgroundColor: _effectiveBackgroundColor,
             body: Stack(
               fit: StackFit.expand,
               children: [
@@ -180,6 +341,7 @@ extension _ReaderPageBuild on _ReaderPageState {
                                     compact:
                                         _preferences.readingInfoMode ==
                                         ReaderInfoMode.compact,
+                                    showProgress: !_controlsVisible,
                                     status: _deviceStatus,
                                     progress: _chapterProgress(),
                                     chapterIndex: _index,
@@ -194,29 +356,71 @@ extension _ReaderPageBuild on _ReaderPageState {
                               : null,
                           child: SizedBox.expand(
                             key: _viewportKey,
-                            child: _buildContent(preset, windowPadding),
+                            child: AnimatedBuilder(
+                              animation: _scrollController,
+                              child: _buildContent(preset, windowPadding),
+                              builder: (context, content) => ReaderBookmarkPull(
+                                enabled:
+                                    classic &&
+                                    !_loading &&
+                                    _error == null &&
+                                    _progressReady &&
+                                    _selection == null &&
+                                    !_controlsVisible,
+                                paged: _paged,
+                                preset: preset,
+                                showSavedRibbon: !_paged,
+                                ribbonTextInset:
+                                    _chapterLayout?.spec.horizontalPadding ??
+                                    _preferences.horizontalPadding,
+                                locationKey: (
+                                  widget.bookId,
+                                  _chapter.itemId,
+                                  _paged ? _pageIndex : _textOffset,
+                                ),
+                                isBookmarked: classic && _currentPageBookmarked,
+                                onAdd: _addCurrentBookmark,
+                                onRemove: _removeVisiblePageBookmarks,
+                                child: content!,
+                              ),
+                            ),
                           ),
                         ),
                       ),
                     ],
                   ),
                 ),
-                if (!_settingsPreviewActive && !_progressPreviewActive)
-                  ReaderEdgeBlur(animation: _chrome),
-                _menuEdge(top: true, child: _buildToolbar(preset)),
+                if (!classic &&
+                    !_settingsPreviewActive &&
+                    !_progressPreviewActive)
+                  ReaderEdgeBlur(animation: _chrome)
+                // The empty slot keeps the chrome elements in place across a
+                // style switch, so the pager/menu subtree is never recreated.
+                else
+                  const SizedBox.shrink(),
+                _menuEdge(
+                  top: true,
+                  child: _buildToolbar(preset, classic: classic),
+                ),
                 Positioned(
                   bottom: 0,
                   left: 0,
                   right: 0,
                   child: AnimatedBuilder(
                     animation: _chrome,
-                    child: _buildReaderControls(preset),
+                    child: _buildReaderControls(preset, classic: classic),
                     builder: (context, child) => Offstage(
                       offstage: _chrome.value == 0 || _settingsPreviewActive,
                       child: child,
                     ),
                   ),
                 ),
+                if (classic)
+                  ReaderToast(
+                    message: _readerToastMessage,
+                    immediateDismiss: _readerToastImmediateDismiss,
+                    reduceMotion: preset.isEink || _reduceReaderMotion,
+                  ),
                 // 墨水屏软件白闪：盖全屏白帧，迫使 EPD 控制器全量刷新。
                 if (_einkFlashVisible)
                   const Positioned.fill(child: ColoredBox(color: Colors.white)),
@@ -254,123 +458,199 @@ extension _ReaderPageBuild on _ReaderPageState {
 
   /// Wenku8's transparent header rides above the progressive edge; fqapp-only
   /// actions move to a real overflow menu instead of squeezing the book title.
-  Widget _buildToolbar(ReaderThemePreset preset) => Material(
-    key: const ValueKey('reader-toolbar'),
-    color: preset.isEink || MediaQuery.highContrastOf(context)
-        ? preset.panelColor
-        : Colors.transparent,
-    child: SafeArea(
-      bottom: false,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
-        child: Row(
-          children: [
-            SizedBox(
-              width: 88,
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: GlassIconButton(
-                  key: const ValueKey('reader-back-entry'),
-                  icon: CupertinoIcons.back,
-                  label: '返回书籍',
-                  onPressed: () => Navigator.of(context).pop(),
-                ),
-              ),
-            ),
-            Expanded(
-              child: Text(
-                widget.title,
-                key: const ValueKey('reader-header-book-title'),
-                textAlign: TextAlign.center,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: preset.textColor,
-                  fontSize: 16,
-                  height: 1.25,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-            SizedBox(
-              width: 44,
-              child: GlassIconButton(
-                key: const ValueKey('reader-header-listen'),
-                icon: CupertinoIcons.headphones,
-                label: '听书',
-                onPressed: _loading || _error != null
-                    ? null
-                    : () => unawaited(_openListening(fromPage: true)),
-              ),
-            ),
-            SizedBox(
-              width: 44,
-              child: GlassMenuAnchor(
-                child: Builder(
-                  builder: (anchor) => GlassIconButton(
-                    key: const ValueKey('reader-header-more'),
-                    icon: CupertinoIcons.ellipsis,
-                    label: '更多阅读操作',
-                    onPressed: () => unawaited(_showReaderActions(anchor)),
+  /// The classic style gets its own solid, two-line header.
+  Widget _buildToolbar(ReaderThemePreset preset, {required bool classic}) =>
+      classic
+      ? _buildClassicToolbar(preset)
+      : Material(
+          key: const ValueKey('reader-toolbar'),
+          color: preset.isEink || MediaQuery.highContrastOf(context)
+              ? preset.panelColor
+              : Colors.transparent,
+          child: SafeArea(
+            bottom: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 88,
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: GlassIconButton(
+                        key: const ValueKey('reader-back-entry'),
+                        icon: CupertinoIcons.back,
+                        label: '返回书籍',
+                        onPressed: () => Navigator.of(context).pop(),
+                      ),
+                    ),
                   ),
-                ),
+                  Expanded(
+                    child: Text(
+                      widget.title,
+                      key: const ValueKey('reader-header-book-title'),
+                      textAlign: TextAlign.center,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: preset.textColor,
+                        fontSize: 16,
+                        height: 1.25,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 44,
+                    child: GlassIconButton(
+                      key: const ValueKey('reader-header-listen'),
+                      icon: CupertinoIcons.headphones,
+                      label: '听书',
+                      onPressed: _loading || _error != null
+                          ? null
+                          : () => unawaited(_openListening(fromPage: true)),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 44,
+                    child: GlassMenuAnchor(
+                      child: Builder(
+                        builder: (anchor) => GlassIconButton(
+                          key: const ValueKey('reader-header-more'),
+                          icon: CupertinoIcons.ellipsis,
+                          label: '更多阅读操作',
+                          onPressed: () =>
+                              unawaited(_showReaderActions(anchor)),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
-          ],
-        ),
-      ),
-    ),
-  );
+          ),
+        );
 
-  Future<void> _showReaderActions(BuildContext anchor) async {
+  Widget _buildClassicToolbar(ReaderThemePreset preset) {
+    // The shelf icon must follow shelf writes without rebuilding the page.
+    return ValueListenableBuilder<int>(
+      valueListenable: ShelfStore.instance.listenable,
+      builder: (context, _, _) => ReaderClassicToolbar(
+        preset: preset,
+        showCache: !widget.localOnly && !_readerBookIsImported,
+        showComments:
+            !_readerBookIsImported &&
+            !_loading &&
+            _error == null &&
+            _ideas.total > 0 &&
+            _chapterEndParagraph() != null,
+        inShelf: inShelf(_shelfEntry),
+        onBack: () => Navigator.of(context).pop(),
+        onCache: () => unawaited(_showCache()),
+        onComments: () =>
+            unawaited(_showIdeas(focusParaIndex: _chapterEndParagraph())),
+        onShelf: () => unawaited(
+          toggleShelf(context, _shelfEntry, onMessage: _showMessage),
+        ),
+        onShare: widget.localOnly || _readerBookIsImported
+            ? null
+            : () => unawaited(_shareBook()),
+        onMore: () => unawaited(_showClassicMore()),
+      ),
+    );
+  }
+
+  /// [keyPrefix] keeps the classic overflow menu's keys distinct from the
+  /// toolbar's direct entries, which stay visible while the menu is open.
+  /// [includeBookmarks] adds the classic-only 书签 entry; the archive glass
+  /// dock already exposes it directly. [includeDisplayEntries] keeps
+  /// 阅读设置/专注阅读·隐藏控件 in the menu for the archive toolbar; the
+  /// classic chrome already exposes both (底板 设置 / 点正文中央).
+  /// [compactWidth] shrinks the card to its labels for the classic reader.
+  Future<void> _showReaderActions(
+    BuildContext anchor, {
+    String keyPrefix = '',
+    bool preferBelow = false,
+    bool compactWidth = false,
+    bool includeBookmarks = false,
+    bool includeDisplayEntries = true,
+  }) async {
     _readerPanelOpen = true;
     final action = await showGlassMenu<String>(
       context: anchor,
       reduceMotion: _reduceReaderMotion,
-      builder: (menu) => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (!widget.localOnly)
+      preferBelow: preferBelow,
+      compactWidth: compactWidth,
+      builder: (menu) {
+        final column = Column(
+          mainAxisSize: MainAxisSize.min,
+          // Compact classic menus hug their widest label; stretching every row
+          // to that width keeps the icons/labels on one left edge.
+          crossAxisAlignment: compactWidth
+              ? CrossAxisAlignment.stretch
+              : CrossAxisAlignment.center,
+          children: [
+            if (!widget.localOnly && !_readerBookIsImported)
+              GlassMenuItem(
+                key: ValueKey('${keyPrefix}reader-cache'),
+                icon: CupertinoIcons.tray_arrow_down,
+                label: '缓存',
+                onPressed: () => Navigator.pop(menu, 'cache'),
+              ),
+            if (!_loading &&
+                _error == null &&
+                _ideas.total > 0 &&
+                _chapterEndParagraph() != null)
+              GlassMenuItem(
+                key: ValueKey('${keyPrefix}reader-toolbar-chapter-comments'),
+                icon: CupertinoIcons.chat_bubble,
+                label: '本章评论',
+                order: 1,
+                onPressed: () => Navigator.pop(menu, 'comments'),
+              ),
             GlassMenuItem(
-              key: const ValueKey('reader-cache'),
-              icon: CupertinoIcons.tray_arrow_down,
-              label: '缓存',
-              onPressed: () => Navigator.pop(menu, 'cache'),
+              key: ValueKey('${keyPrefix}reader-shelf-button'),
+              icon: inShelf(_shelfEntry)
+                  ? CupertinoIcons.bookmark_fill
+                  : CupertinoIcons.bookmark,
+              label: inShelf(_shelfEntry) ? '已在书架' : '加入书架',
+              order: 2,
+              onPressed: () => Navigator.pop(menu, 'shelf'),
             ),
-          if (!_loading &&
-              _error == null &&
-              _ideas.total > 0 &&
-              _chapterEndParagraph() != null)
-            GlassMenuItem(
-              key: const ValueKey('reader-toolbar-chapter-comments'),
-              icon: CupertinoIcons.chat_bubble,
-              label: '本章评论',
-              order: 1,
-              onPressed: () => Navigator.pop(menu, 'comments'),
-            ),
-          GlassMenuItem(
-            key: const ValueKey('reader-shelf-button'),
-            icon: inShelf(_shelfEntry)
-                ? CupertinoIcons.bookmark_fill
-                : CupertinoIcons.bookmark,
-            label: inShelf(_shelfEntry) ? '已在书架' : '加入书架',
-            order: 2,
-            onPressed: () => Navigator.pop(menu, 'shelf'),
-          ),
-          GlassMenuItem(
-            icon: CupertinoIcons.textformat,
-            label: '阅读设置',
-            order: 3,
-            onPressed: () => Navigator.pop(menu, 'settings'),
-          ),
-          GlassMenuItem(
-            icon: CupertinoIcons.chevron_up,
-            label: '专注阅读 · 隐藏控件',
-            order: 4,
-            onPressed: () => Navigator.pop(menu, 'hide'),
-          ),
-        ],
-      ),
+            // 经典主题把底部动作行的 书签 移到这里；档案主题的玻璃坞仍直接
+            // 提供，不重复。
+            if (includeBookmarks)
+              GlassMenuItem(
+                key: ValueKey('${keyPrefix}reader-bookmarks-entry'),
+                icon: CupertinoIcons.bookmark,
+                label: '书签',
+                order: 3,
+                onPressed: () => Navigator.pop(menu, 'bookmarks'),
+              ),
+            // 经典主题的菜单只保留动作项；阅读设置与隐藏控件分别由底板“设置”
+            // 和点击正文中央承担，菜单里不再重复。
+            if (includeDisplayEntries)
+              GlassMenuItem(
+                key: ValueKey('${keyPrefix}reader-more-settings'),
+                icon: CupertinoIcons.textformat,
+                label: '阅读设置',
+                order: 4,
+                onPressed: () => Navigator.pop(menu, 'settings'),
+              ),
+            if (includeDisplayEntries)
+              GlassMenuItem(
+                key: ValueKey('${keyPrefix}reader-more-hide'),
+                icon: CupertinoIcons.chevron_up,
+                label: '专注阅读 · 隐藏控件',
+                order: 5,
+                onPressed: () => Navigator.pop(menu, 'hide'),
+              ),
+          ],
+        );
+        // IntrinsicWidth resolves the widest row, then stretch fills exactly
+        // that width; without it stretch would take the whole 248dp cap.
+        return compactWidth ? IntrinsicWidth(child: column) : column;
+      },
     );
     if (!mounted) return;
     switch (action) {
@@ -380,6 +660,8 @@ extension _ReaderPageBuild on _ReaderPageState {
         await _showIdeas(focusParaIndex: _chapterEndParagraph());
       case 'shelf':
         await toggleShelf(context, _shelfEntry);
+      case 'bookmarks':
+        await _showBookmarks();
       case 'settings':
         await _showAppearanceSettings();
       case 'hide':
@@ -387,7 +669,10 @@ extension _ReaderPageBuild on _ReaderPageState {
     }
   }
 
-  Widget _buildReaderControls(ReaderThemePreset preset) => Column(
+  Widget _buildReaderControls(
+    ReaderThemePreset preset, {
+    required bool classic,
+  }) => Column(
     key: _bottomControlsKey,
     mainAxisSize: MainAxisSize.min,
     crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -408,36 +693,71 @@ extension _ReaderPageBuild on _ReaderPageState {
       ),
       ListenableBuilder(
         listenable: _scrollController,
-        builder: (context, _) => ReaderControls(
-          key: const ValueKey('reader-controls'),
-          preferences: _displayPreferences,
-          chapterIndex: _index,
-          chapterTitle: _chapter.title,
-          fraction: _chapterLocalFraction,
-          animation: _settingsPreviewActive
-              ? const AlwaysStoppedAnimation(0)
-              : _chrome,
-          previewing: _progressPreviewActive,
-          onPrevious: _index > 0 && !_loading ? _prev : null,
-          onNext: _index < widget.chapters.length - 1 && !_loading
-              ? _next
-              : null,
-          onPreview: _previewChapterFraction,
-          onCommitted: _commitChapterFraction,
-          onPreviewChanged: _setChapterPreview,
-          onDirectory: _showDirectory,
-          onBookmarks: _showBookmarks,
-          onNight: _toggleNightTheme,
-          onAppearance: () => _showAppearanceSettings(
-            section: ReaderSettingsSection.appearance,
-          ),
-          onOperations: () => _showAppearanceSettings(
-            section: ReaderSettingsSection.operations,
-          ),
-          onFind: _loading || !_progressReady ? null : _showFind,
-          onAi: _currentAiView?.aiEnabled == true ? _showAiPanel : null,
-          aiLabel: _currentAiView?.hasCache == true ? 'AI 已校对' : 'AI 校对',
-        ),
+        builder: (context, _) => classic
+            // The archive dock runs its own chrome layers; the classic sheet is
+            // one Material panel, so the same `_chrome` drives it from outside.
+            // `maintainSize` keeps the measured height (and the selection bar's
+            // clearance) identical while it slides, and reduce-motion/e-ink
+            // already jump `_chrome` straight to its end value.
+            ? ReaderChromeLayer(
+                key: _classicControlsKey,
+                animation: _chrome,
+                interactionThreshold: 0,
+                maintainSize: true,
+                slide: const Offset(0, 1),
+                clip: false,
+                child: ReaderClassicControls(
+                  key: const ValueKey('reader-classic-controls'),
+                  preset: preset,
+                  chapterIndex: _index,
+                  chapterCount: widget.chapters.length,
+                  chapterTitleAt: (index) => widget
+                      .chapters[index.clamp(0, widget.chapters.length - 1)]
+                      .title,
+                  onPrevious: _index > 0 && !_loading ? _prev : null,
+                  onNext: _index < widget.chapters.length - 1 && !_loading
+                      ? _next
+                      : null,
+                  onSeekEnd: (index) => unawaited(_jumpToChapter(index)),
+                  onDirectory: _showDirectory,
+                  onNight: _toggleNightTheme,
+                  onAppearance: _showAppearanceSettings,
+                  onAi: _currentAiView != null ? _showAiPanel : null,
+                  aiLabel: _currentAiView?.hasCache == true
+                      ? 'AI 已校对'
+                      : 'AI 校对',
+                ),
+              )
+            : ReaderControls(
+                key: const ValueKey('reader-controls'),
+                preferences: _displayPreferences,
+                chapterIndex: _index,
+                chapterTitle: _chapter.title,
+                fraction: _chapterLocalFraction,
+                animation: _settingsPreviewActive
+                    ? const AlwaysStoppedAnimation(0)
+                    : _chrome,
+                previewing: _progressPreviewActive,
+                onPrevious: _index > 0 && !_loading ? _prev : null,
+                onNext: _index < widget.chapters.length - 1 && !_loading
+                    ? _next
+                    : null,
+                onPreview: _previewChapterFraction,
+                onCommitted: _commitChapterFraction,
+                onPreviewChanged: _setChapterPreview,
+                onDirectory: _showDirectory,
+                onBookmarks: _showBookmarks,
+                onNight: _toggleNightTheme,
+                onAppearance: () => _showAppearanceSettings(
+                  section: ReaderSettingsSection.appearance,
+                ),
+                onOperations: () => _showAppearanceSettings(
+                  section: ReaderSettingsSection.operations,
+                ),
+                onFind: _loading || !_progressReady ? null : _showFind,
+                onAi: _currentAiView?.aiEnabled == true ? _showAiPanel : null,
+                aiLabel: _currentAiView?.hasCache == true ? 'AI 已校对' : 'AI 校对',
+              ),
       ),
     ],
   );

@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -21,6 +21,7 @@ import 'package:fqapp/services/drama_channel_preferences.dart';
 import 'package:fqapp/services/drama_mute_preferences.dart';
 import 'package:fqapp/services/player_preferences.dart';
 import 'package:fqapp/services/shelf_store.dart';
+import 'package:fqapp/services/shell_visibility.dart';
 import 'package:fqapp/services/swipe_guide_store.dart';
 import 'package:fqapp/widgets/player/playlet_danmaku_layer.dart';
 
@@ -199,6 +200,9 @@ void main() {
   // has to exist before the first build.
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
+    // shellVisibleTab 是进程级单例：别的用例 pump 过壳层会残留一个下标，
+    // 本页再直接 pump 单个页面时会被判成「隐藏」而不自动起播。每个用例开头复位。
+    resetShellVisibility();
     // 频道选择是进程级静态态：别的用例切过频道会带进本页的冷启动恢复。
     DramaChannelPreferences.reset();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -277,7 +281,7 @@ void main() {
   testWidgets('inactive keeps the feed playing, hidden pauses it', (
     tester,
   ) async {
-    final session = _Session();
+    final session = _Session()..episodeCount = 3;
     await _mount(tester, session);
     final player = session.players.single;
     expect(player.isPlaying, isTrue);
@@ -287,6 +291,13 @@ void main() {
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
     await _flush(tester);
     expect(player.isPlaying, isFalse);
+    player.emitCompleted();
+    await _flush(tester);
+    expect(
+      session.players,
+      hasLength(1),
+      reason: 'a completion while hidden must not advance playback',
+    );
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await _flush(tester);
     expect(player.isPlaying, isTrue);
@@ -630,7 +641,10 @@ void main() {
     await _mount(tester, session);
     final player = session.players.single;
 
-    await tester.pumpWidget(session.app(tickerEnabled: false));
+    // 可见性由壳层的 shellVisibleTab 广播（DramaPage 默认 shellIndex=1），
+    // 不再靠 TickerMode 翻转——后者会让整页 didChangeDependencies → 重建。
+    // 广播一个别的下标 = 本页被壳层切走。
+    shellVisibleTab.value = 0;
     await _flush(tester);
 
     expect(player.calls, contains('pause'));
@@ -638,7 +652,8 @@ void main() {
     expect(player.disposed, isFalse);
     expect(session.players, hasLength(1));
 
-    await tester.pumpWidget(session.app());
+    // 切回本页下标：恢复播放，同样不重建播放器。
+    shellVisibleTab.value = 1;
     await _flush(tester);
     expect(player.isPlaying, isTrue);
     expect(session.players, hasLength(1));
@@ -671,7 +686,15 @@ void main() {
     historyWrite.complete();
     await _flush(tester);
     await tester.tap(find.text('推荐'));
-    await _flush(tester);
+    // 切回推荐会触发横向 pager 的 260ms 到位动画，_channelScrolling 要等动画
+    // 结束的 ScrollEnd 才放行起播；单帧 _flush 只推进 ~16ms 等不到。把这段动画
+    // 时间逐帧泵过去（与真机「点选频道后最多 260ms 才恢复内联播放」一致），
+    // 并 flush 让新剧内容异步落地；到位并新建播放器即停。
+    await tester.pump();
+    for (var i = 0; i < 8 && session.players.length < 2; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+      await _flush(tester);
+    }
     expect(dramaLightPageNotifier.value, isFalse);
     expect(session.players, hasLength(2));
     expect(session.players.last.isPlaying, isTrue);

@@ -7,8 +7,13 @@
 # PowerShell is line-ending agnostic; normalize to CRLF for Windows editors.
 *.ps1 text eol=crlf
 
-# Flutter/Dart sources: normalize on checkin, native endings on checkout.
-*.dart text
+# Formatted sources use the same LF endings on every platform.
+*.dart text eol=lf
+*.rs text eol=lf
+*.cjs text eol=lf
+*.mjs text eol=lf
+scripts/**/*.js text eol=lf
+# Other source files keep native endings on checkout.
 *.kts text
 *.kt text
 *.java text
@@ -19,6 +24,13 @@
 *.yaml text
 *.yml text
 *.xml text
+
+# Flutter regenerates the plugin registrants with LF. Pin them to LF so a
+# Windows checkout (core.autocrlf=true) keeps the working tree byte-identical
+# to the tool output; otherwise every flutter command leaves them looking
+# modified even though the committed content did not change.
+linux/flutter/generated_* text eol=lf
+windows/flutter/generated_* text eol=lf
 
 # Binary assets: never mangle these.
 *.png binary

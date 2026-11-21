@@ -1,8 +1,9 @@
 import 'dart:async';
 
-import 'package:flutter/cupertino.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
+import '../services/sync/multi_device_sync_service.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
@@ -16,9 +17,12 @@ import '../services/app_style_tokens.dart';
 import '../services/book_open_preferences.dart';
 import '../services/book_updates.dart';
 import '../services/chapter_cache_store.dart';
+import '../services/shell_visibility.dart';
 import '../services/classic_shelf_layout.dart';
 import '../services/connectivity_status.dart';
+import '../services/desktop_platform.dart';
 import '../services/imported_book_store.dart';
+import '../services/haptic_preferences.dart';
 import '../services/library_store.dart';
 import '../services/media_history_store.dart';
 import '../services/reader_history.dart';
@@ -28,6 +32,7 @@ import '../services/shelf_store.dart';
 import '../services/shelf_view_store.dart';
 import '../services/update_check_gate.dart';
 import '../widgets/bookshelf_card.dart';
+import '../widgets/desktop_shell_scope.dart';
 import '../widgets/home/home_chip.dart';
 import '../widgets/home/home_design.dart';
 import '../widgets/shelf/book_collection_tiles.dart';
@@ -37,6 +42,7 @@ import '../widgets/shelf/shelf_empty.dart';
 import '../widgets/shelf/shelf_groups_sheet.dart';
 import '../widgets/shelf/shelf_performance_scope.dart';
 import '../widgets/tab_swipe_area.dart';
+import '../widgets/sliding_tab_indicator.dart';
 import '../widgets/wenku/archive_shelf.dart';
 import '../widgets/wenku/book_collection_layout.dart';
 import '../widgets/wenku/shelf_options_sheet.dart';
@@ -70,6 +76,10 @@ part 'library_shelf_widgets.dart';
 /// 顶栏一级 tab 的官方文案（amg.xml 的 SlidingTabLayout；顺序同官方
 /// 书架页：书架 / 历史 / 收藏）。官方还有「圈子」，本地无此功能不设。
 const _tabTitles = ['书架', '浏览历史', '收藏'];
+
+/// 经典主题 tab 下划线在两个标签之间滑动所需的时间。它比文字动画长，因为
+/// 下划线要走过一段看得见的距离。
+const _classicUnderlineDuration = Duration(milliseconds: 300);
 
 /// 官方分工：书架 tab 只放书籍类，追剧 / 追漫的视频类只进「收藏」tab
 /// （与短剧页收藏频道同一批 [ShelfStore] 数据）。
@@ -119,6 +129,11 @@ class LibraryPage extends StatefulWidget {
   /// [Duration.zero]，让每次可见 / 回前台都真正重查。
   final Duration updateCheckInterval;
 
+  /// 本页在壳层里的下标，用来判断 [shellVisibleTab] 是否指向自己。
+  ///
+  /// 独立页面/测试把它设成宿主的下标即可；默认按主壳层的顺序取 2。
+  final int shellIndex;
+
   const LibraryPage({
     super.key,
     this.onBrowse,
@@ -129,6 +144,7 @@ class LibraryPage extends StatefulWidget {
     this.directoryLoader,
     this.chapterCountLoader,
     this.updateCheckInterval = const Duration(minutes: 10),
+    this.shellIndex = 2,
   });
 
   @override
@@ -139,9 +155,140 @@ class LibraryPage extends StatefulWidget {
 /// （library_page_actions.dart、library_shelf_chrome.dart、
 /// library_shelf_views.dart）都 `on` 这个 mixin，从而共用同一份状态。
 mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
+  /// The anchors of the classic tab buttons, used to place the underline.
+  List<GlobalKey> _classicTabKeys = const [];
+
+  /// The measured centres of the classic tabs.
+  List<double> _classicTabCentres = const [];
+  List<double> _classicTabWidths = const [];
+
+  /// The reserved width of every classic tab.
+  ///
+  /// Every tab is measured with the *selected* typography (18sp), so the row
+  /// keeps the same geometry whichever tab is active. Measuring with the
+  /// live typography would make the active tab wider and shift every tab
+  /// after it - the row would jump on every swipe.
+  double _classicTabWidth(int index) {
+    if (index < 0 || index >= _tabTitles.length) return 0;
+    final painter = TextPainter(
+      text: TextSpan(
+        text: _tabTitles[index],
+        style: const TextStyle(
+          fontSize: 18,
+          fontWeight: FontWeight.w600,
+          letterSpacing: -.3,
+        ),
+      ),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+      maxLines: 1,
+    )..layout();
+    // 4dp of padding on each side.
+    final width = painter.width + 8;
+    painter.dispose();
+    return width;
+  }
+
+  /// Rebuild the anchors when the tab count changes.
+  void _syncClassicTabKeys() {
+    if (_classicTabKeys.length == _tabTitles.length) return;
+    _classicTabKeys = [
+      for (var index = 0; index < _tabTitles.length; index++) GlobalKey(),
+    ];
+  }
+
+  /// Measure the tabs once the layout is done.
+  void _scheduleClassicMeasure() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _measureClassicTabs();
+    });
+  }
+
+  /// Measure the classic tab buttons so the underline can sit on them.
+  ///
+  /// 宽度只跟文案 + 字体缩放有关，缓存下来：下划线宽度在横滑期间是逐帧
+  /// 求值的，每次重排全部 `TextPainter` 等于每帧做几次文本布局。
+  ///
+  /// 测量结果变了要 `setState`：标签按**实时**字号排版、下划线读的是这份
+  /// 缓存，只写字段不重建会让系统字号变化后两者一直错位（直到用户再点一次
+  /// 标签才自愈）。
+  void _measureClassicTabs() {
+    final widths = <double>[
+      for (var index = 0; index < _tabTitles.length; index++)
+        _classicTabWidth(index),
+    ];
+    if (widths.length != _tabTitles.length) return;
+    final changed = !listEquals(widths, _classicTabWidths);
+    _classicTabWidths = widths;
+    _classicTabCentres = SlidingTabStrip.centres(widths, gap: 20);
+    if (changed && mounted) setState(() {});
+  }
+
+  /// The width of the classic tab underline, centred on each tab.
+  ///
+  /// 26dp is the width the old per-tab underline used; it stays the floor so
+  /// two-character labels look unchanged, and longer labels ("浏览历史") grow
+  /// up to 40dp instead of being clipped at the old fixed 26.
+  static const double _classicIndicatorMinWidth = 26;
+  static const double _classicIndicatorMaxWidth = 40;
+
+  /// The underline width at the floating [position].
+  ///
+  /// Scales with the reserved tab widths so long labels (e.g. "浏览历史")
+  /// get a proportionally longer underline.
+  double _classicIndicatorWidth(double position) {
+    if (_tabTitles.isEmpty) return _classicIndicatorMinWidth;
+    // 测量结果由 [_measureClassicTabs] 缓存；还没测过时退回现算一次。
+    final widths = _classicTabWidths.length == _tabTitles.length
+        ? _classicTabWidths
+        : <double>[
+            for (var index = 0; index < _tabTitles.length; index++)
+              _classicTabWidth(index),
+          ];
+    return SlidingTabStrip.indicatorWidth(
+      widths: widths,
+      position: position,
+      ratio: 0.5,
+      min: _classicIndicatorMinWidth,
+      max: _classicIndicatorMaxWidth,
+    );
+  }
+
+  /// The floating tab position (selected + progress, fractional).
+  double _classicFloatingPosition(double progress) => SlidingTabStrip.position(
+    index: _tab,
+    progress: progress,
+    count: _tabTitles.length,
+  );
+
+  /// The underline's x (left edge) at the floating [position].
+  ///
+  /// Delegates to [SlidingTabStrip] for the shared position→left-edge math.
+  /// [indicatorWidth] is the full width of the underline bar.
+  double? _classicUnderlineLeftForPosition(
+    double position,
+    double indicatorWidth,
+  ) {
+    if (_classicTabCentres.isEmpty || _tabTitles.length <= 1) return null;
+    return SlidingTabStrip.indicatorLeft(
+      centres: _classicTabCentres,
+      position: position,
+      indicatorWidth: indicatorWidth,
+    );
+  }
+
   bool get _reduceMotion => MediaQuery.disableAnimationsOf(context);
 
   int _tab = 0;
+
+  /// The live horizontal swipe progress, handed from the swipe area to the
+  /// classic tab row so the underline follows the finger.
+  ///
+  /// A notifier rather than a plain field: the row is rebuilt on every frame
+  /// of the drag, and rebuilding the whole shelf page for that would drop
+  /// its scroll positions and the edit selection.
+  final ValueNotifier<double> _tabProgress = ValueNotifier<double>(0);
   bool _editing = false;
   bool _importingBook = false;
   bool _assigningCategory = false;
@@ -189,6 +336,9 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    shellVisibleTab.addListener(_onShellVisibility);
+    _syncClassicTabKeys();
+    _scheduleClassicMeasure();
     _historyChanges = LibraryStore.instance.historyListenable
       ..addListener(_storeChanged);
     _readTimeChanges = LibraryStore.instance.readTimeListenable
@@ -211,7 +361,23 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    final visible = TickerMode.valuesOf(context).enabled;
+    // 可见性由壳层的 [shellVisibleTab] 通知，不再读 `TickerMode`：后者会让
+    // 整页在每次底部切页时 `didChangeDependencies` → 重建。
+    final shown = shellVisibleTab.value;
+    _applyVisibility(shown == null || shown == widget.shellIndex);
+    // 字号（textScaler）与方向变了要重新量标签：按钮按实时字号排版，
+    // 下划线读的是这份测量缓存，不重量就会一直错位。
+    _scheduleClassicMeasure();
+  }
+
+  /// 壳层切走/切回：只补数据与刷新，不触发整页重建。
+  void _onShellVisibility() {
+    if (!mounted) return;
+    final shown = shellVisibleTab.value;
+    _applyVisibility(shown == null || shown == widget.shellIndex);
+  }
+
+  void _applyVisibility(bool visible) {
     if (_visible == visible) return;
     _visible = visible;
     // Catch up once when returning from another tab or an opaque route.
@@ -353,6 +519,7 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
         ShelfIdentity.contentKeyFor(
           entry['kind']?.toString() ?? 'book',
           historyContentId(entry),
+          source: historySource(entry),
         ): entry,
     };
     setState(() {
@@ -418,6 +585,7 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    shellVisibleTab.removeListener(_onShellVisibility);
     _historyChanges.removeListener(_storeChanged);
     _readTimeChanges.removeListener(_storeChanged);
     _shelfChanges.removeListener(_storeChanged);
@@ -443,10 +611,50 @@ class _LibraryPageState extends State<LibraryPage>
   @override
   Widget build(BuildContext context) {
     final classic = AppStyleTokens.of(context).isClassic;
+    final inDesktopFrame =
+        isWindowsDesktop && DesktopShellScope.hasFrameOf(context);
     final topInset = featurePadding(context).top;
+    final archiveContent = ShelfPerformanceScope(
+      shelf3d: ShelfViewStore.instance.state.shelf3d,
+      child: Column(
+        children: [
+          if (inDesktopFrame)
+            _desktopArchiveHeader(context)
+          else ...[
+            Padding(
+              padding: EdgeInsets.fromLTRB(24, topInset, 24, 0),
+              child: _editing ? _editBar(context) : _tabSegments(context),
+            ),
+            const SizedBox(height: 8),
+          ],
+          Expanded(
+            child: TabSwipeArea(
+              index: _tab,
+              count: _tabTitles.length,
+              onSelect: _selectTab,
+              onProgress: (value) {
+                if (_tabProgress.value != value) {
+                  _tabProgress.value = value;
+                }
+              },
+              // 编辑态里横向拖动留给列表自身（多选/滑动删除的起手）。
+              enabled: !_editing,
+              child: RefreshIndicator(
+                onRefresh: () async {
+                  await _refreshUpdates(force: true);
+                  await MultiDeviceSyncService.instance.sync();
+                },
+                child: _content(context),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
     return PopScope<Object?>(
       // 编辑态拦下系统返回 / 侧滑：先退出编辑态，而不是把整页 pop 掉。
-      // 书架页是 RootShell 里 LazyIndexedStack 的一个 child、不是独立路由，
+      // 书架页是 RootShell 保活容器（移动端 Stack+Offstage / 桌面
+      // LazyIndexedStack）的一个 child、不是独立路由，
       // 不拦的话返回事件会一路冒泡到根路由 —— 表现就是「侧滑直接退出应用」。
       canPop: !_editing,
       onPopInvokedWithResult: (didPop, _) {
@@ -454,36 +662,16 @@ class _LibraryPageState extends State<LibraryPage>
       },
       child: classic
           ? _classicPage(context)
+          : inDesktopFrame
+          ? Scaffold(
+              backgroundColor: HomePalette.of(context).canvas,
+              bottomNavigationBar: _editing ? _editBottomBar(context) : null,
+              body: archiveContent,
+            )
           : WenkuPage(
               header: _header(context),
               bottomNavigationBar: _editing ? _editBottomBar(context) : null,
-              child: ShelfPerformanceScope(
-                shelf3d: ShelfViewStore.instance.state.shelf3d,
-                child: Column(
-                  children: [
-                    Padding(
-                      padding: EdgeInsets.fromLTRB(24, topInset, 24, 0),
-                      child: _editing
-                          ? _editBar(context)
-                          : _tabSegments(context),
-                    ),
-                    const SizedBox(height: 8),
-                    Expanded(
-                      child: TabSwipeArea(
-                        index: _tab,
-                        count: _tabTitles.length,
-                        onSelect: _selectTab,
-                        // 编辑态里横向拖动留给列表自身（多选/滑动删除的起手）。
-                        enabled: !_editing,
-                        child: RefreshIndicator(
-                          onRefresh: () => _refreshUpdates(force: true),
-                          child: _content(context),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+              child: archiveContent,
             ),
     );
   }

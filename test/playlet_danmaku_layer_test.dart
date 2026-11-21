@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:fqapp/models/playlet_comment.dart';
@@ -536,6 +536,40 @@ void main() {
       await tester.pump();
       expect(plate(), isNull);
       expect(find.text('前方高能'), findsOneWidget);
+    });
+
+    testWidgets('renders bracket emoji tokens as images inside a bubble', (
+      tester,
+    ) async {
+      final position = ValueNotifier<Duration>(Duration.zero);
+      addTearDown(position.dispose);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Center(
+            child: SizedBox(
+              width: 400,
+              height: 300,
+              child: PlayletDanmakuLayer(
+                entries: [danmaku('emoji', 0, '冲[赞]')],
+                position: position,
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final emoji = tester
+          .widgetList<Image>(find.byType(Image))
+          .where(
+            (image) =>
+                (image.image as AssetImage).assetName ==
+                'assets/images/emoji/emoji_32.webp',
+          );
+      expect(emoji, isNotEmpty);
+      expect(find.textContaining('[赞]'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
     });
   });
 }

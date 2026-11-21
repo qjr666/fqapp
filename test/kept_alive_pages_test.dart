@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive_ce/hive.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -46,7 +46,7 @@ void main() {
           builder: (context, value, child) => LazyIndexedStack(
             index: value,
             children: const [
-              LibraryPage(),
+              LibraryPage(shellIndex: 0),
               ReadingStatisticsPage(),
               SizedBox.expand(child: Text('其他页面')),
             ],

@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../../services/app_theme.dart';
 import '../../services/reader_preferences.dart';
@@ -29,6 +29,7 @@ extension ReaderThemeColors on ReaderThemePreset {
     ReaderThemePreset.parchment => '纸张',
     ReaderThemePreset.dark => '夜间',
     ReaderThemePreset.eink => '墨水屏',
+    ReaderThemePreset.mistBlue => '雾蓝',
   };
 
   Color get backgroundColor => switch (this) {
@@ -37,6 +38,7 @@ extension ReaderThemeColors on ReaderThemePreset {
     ReaderThemePreset.parchment => const Color(0xFFF3E4C2),
     ReaderThemePreset.dark => isOled ? Colors.black : const Color(0xFF171717),
     ReaderThemePreset.eink => Colors.white,
+    ReaderThemePreset.mistBlue => const Color(0xFFD8E4F0),
   };
 
   Color get textColor => switch (this) {
@@ -45,9 +47,11 @@ extension ReaderThemeColors on ReaderThemePreset {
     ReaderThemePreset.parchment => const Color(0xFF493D2B),
     ReaderThemePreset.dark => const Color(0xFFD2D2D2),
     ReaderThemePreset.eink => Colors.black,
+    ReaderThemePreset.mistBlue => const Color(0xFF243447),
   };
 
   Color get accentColor => switch (this) {
+    ReaderThemePreset.mistBlue => const Color(0xFF3D668C),
     ReaderThemePreset.eyeCare => const Color(0xFF4F6F52),
     ReaderThemePreset.dark => const Color(0xFFE9AD82),
     ReaderThemePreset.eink => Colors.black,
@@ -65,6 +69,7 @@ extension ReaderThemeColors on ReaderThemePreset {
   /// 的 b4e-b4i 资源表):light #FA6725、parchment(纸) #CC8114、eyeCare(绿)
   /// #65992E;官方另有蓝色主题 #3D85CC,我们暂无对应预设。夜间走同一橙。
   Color get selectionAccentColor => switch (this) {
+    ReaderThemePreset.mistBlue => const Color(0xFF3D85CC),
     ReaderThemePreset.parchment => const Color(0xFFCC8114),
     ReaderThemePreset.eyeCare => const Color(0xFF65992E),
     ReaderThemePreset.eink => Colors.black,
@@ -205,6 +210,8 @@ extension ReaderThemeColors on ReaderThemePreset {
     return base.copyWith(
       colorScheme: scheme,
       scaffoldBackgroundColor: backgroundColor,
+      // Chip 的半透明选中色绘在默认 Material 画布上，底色也须跟随阅读预设。
+      canvasColor: backgroundColor,
       textTheme: base.textTheme.apply(
         bodyColor: textColor,
         displayColor: textColor,
@@ -229,6 +236,46 @@ extension ReaderThemeColors on ReaderThemePreset {
         prefixIconColor: mutedTextColor,
         suffixIconColor: mutedTextColor,
       ),
+      // 阅读明暗独立于软件主题，chip 子主题中的具体色值也须跟随阅读预设。
+      chipTheme: base.chipTheme.copyWith(
+        backgroundColor: fieldColor,
+        // ChoiceChip（笔记筛选 / 搜索排序）选中背景读 secondarySelectedColor，
+        // FilterChip 选中读 selectedColor，两个字段都要覆盖。
+        selectedColor: accentColor.withValues(alpha: 0.12),
+        secondarySelectedColor: accentColor.withValues(alpha: 0.12),
+        labelStyle: (base.chipTheme.labelStyle ?? const TextStyle()).copyWith(
+          color: textColor,
+        ),
+      ),
+      // 与 chipTheme 同一类泄漏：base 的 dialog / card / popup 子主题在构造时
+      // 就按软件明暗解析好了具体色值，copyWith 只换 colorScheme 不会重算它们，
+      // 深色软件 + 浅色阅读时弹出的对话框标题 / 卡片 / 菜单仍会漏出深色。这里
+      // 一并补全，让阅读弹层配色自成一套。SnackBar 反过来保持跟随软件（深色
+      // 吐司在白底阅读上才看得见），故意不覆盖。
+      dialogTheme: base.dialogTheme.copyWith(
+        backgroundColor: sheetColor,
+        surfaceTintColor: Colors.transparent,
+        titleTextStyle: (base.dialogTheme.titleTextStyle ?? const TextStyle())
+            .copyWith(color: textColor),
+        contentTextStyle:
+            (base.dialogTheme.contentTextStyle ?? const TextStyle()).copyWith(
+              color: mutedTextColor,
+            ),
+      ),
+      cardTheme: base.cardTheme.copyWith(
+        color: panelColor,
+        surfaceTintColor: Colors.transparent,
+      ),
+      popupMenuTheme: base.popupMenuTheme.copyWith(
+        color: panelColor,
+        surfaceTintColor: Colors.transparent,
+      ),
+      // Divider 优先读 dividerTheme.color，只设 dividerColor 会被它盖住。
+      dividerTheme: DividerThemeData(
+        color: borderColor,
+        thickness: 0.6,
+        space: 1,
+      ),
       dividerColor: borderColor,
       sliderTheme: base.sliderTheme.copyWith(
         activeTrackColor: accentColor,
@@ -243,5 +290,23 @@ extension ReaderThemeColors on ReaderThemePreset {
         dragHandleColor: mutedTextColor.withValues(alpha: 0.3),
       ),
     );
+  }
+}
+
+extension ReaderPreferencesThemeColors on ReaderPreferences {
+  Color get effectiveBackgroundColor =>
+      customBackgroundColor == null || themePreset.isEink || themePreset.isOled
+      ? themePreset.backgroundColor
+      : Color(customBackgroundColor!);
+
+  Color get effectiveTextColor {
+    if (customBackgroundColor == null ||
+        themePreset.isEink ||
+        themePreset.isOled) {
+      return themePreset.textColor;
+    }
+    return effectiveBackgroundColor.computeLuminance() > 0.179
+        ? Colors.black
+        : Colors.white;
   }
 }
