@@ -98,6 +98,12 @@ mixin _ReaderPageFields on State<ReaderPage> {
   /// 完成的 finally。
   bool _pageFollowPending = false;
 
+  /// 段落锚落位确认：段落跳转是异步换算毫秒的，发送时记下当时的
+  /// `AudioPlaybackScope.paragraphSeekEpoch`，之后几拍里等它变化才把跟随
+  /// 接回来。`-1` 表示没有待确认的跳转。
+  int _paragraphSeekEpoch = -1;
+  int _paragraphLandingTicks = 0;
+
   /// 滚动模式「停稳」去抖：拖动和滚轮会连着来，每一拍都 seek 一次会让播放
   /// 一顿一顿。落定后 [_pageFollowPending] 才被消费。
   Timer? _pageFollowSettleTimer;

@@ -49,6 +49,10 @@ class _AudioPlaybackController extends ChangeNotifier
   bool _hasPlayed = false;
   int _generation = 0;
   int _seekGeneration = 0;
+  /// 段落锚定跳转**成功落位**的次数。阅读页用它在翻页后确认「这次跳转真的
+  /// 发生了」，只有确认过才把跟随接回来；换算失败时它不变，跟随就不会拿着
+  /// 没动过的位置把页面拉回上一页。
+  int paragraphSeekEpoch = 0;
   Completer<void>? _trackCancellation;
   static const _trackRetryAttempts = 3;
   static const _trackRetryDelay = Duration(milliseconds: 200);
@@ -1447,6 +1451,45 @@ class _AudioPlaybackController extends ChangeNotifier
   void _previewSeek(double position) {
     _cancelAdvanceCountdown(this);
     _seekPreview.value = position;
+  }
+
+  /// 段落锚定的**就地**跳转：同一个音频章内只改播放位置，不重开本章。
+  ///
+  /// 换章必须走 [_openChapter]（新音源、新播放器）；同章重开则是灾难：释放
+  /// 播放器、重取音源会断音几百毫秒，`_position` 还会先被清成 0 等锚点换算
+  /// 成功再 seek。换算失败时位置就一直停在 0，阅读页的 10Hz 跟随据此算页，
+  /// 会把用户刚翻过去的页面拉回章首。
+  ///
+  /// 换算不出毫秒时保持原状：错位的时间轴比不跳更糟。
+  Future<bool> seekToParagraph({int? paraIndex, required int ordinal}) async {
+    final player = _player;
+    if (_closed || !_ready || player == null) return false;
+    final generation = _generation;
+    var track = _timeTrack;
+    if (track.isEmpty) {
+      // 本章时间轴还没到手（刚开章、或反向跟随先进来）：只补这一次请求，
+      // 不碰播放器。同章的重复请求会被 ApiClient 的 share 合并。
+      final itemId = _chapters[_index].itemId;
+      try {
+        track = await _loadTimePoints(itemId, _toneId);
+      } catch (_) {
+        return false;
+      }
+      if (!_current(generation, player)) return false;
+      _timeTrack = track;
+      _timeTrackReady = true;
+      _publishReadAlong();
+    }
+    final ms = startMsForParagraph(
+      track,
+      paraIndex: paraIndex,
+      ordinal: ordinal,
+    );
+    if (ms == null) return false;
+    await _seekTo(Duration(milliseconds: ms));
+    if (!_current(generation, player)) return false;
+    paragraphSeekEpoch++;
+    return true;
   }
 
   Future<void> _seekTo(Duration position) async {

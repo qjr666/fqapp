@@ -65,6 +65,16 @@ class AudioPlaybackScope extends StatefulWidget {
     return owner?.seekActive(position) ?? false;
   }
 
+  /// 段落锚定跳转**成功落位**的次数（见 [jumpToParagraph]）。
+  ///
+  /// 段落锚要异步换算毫秒，[jumpToParagraph] 只能同步回答「已受理」。阅读页
+  /// 翻页后用它确认这次跳转真的发生了：确认过才把跟随接回来，否则换算失败时
+  /// 跟随会拿着没动过的位置把页面拉回上一页。
+  static int paragraphSeekEpoch(BuildContext context) {
+    final owner = context.findAncestorStateOfType<_AudioPlaybackScopeState>();
+    return owner?.paragraphSeekEpoch ?? 0;
+  }
+
   /// 阅读页那枚「暂停播放 / 继续播放」胶囊：切换这本书的播放状态。
   ///
   /// 对应官方 `ReaderPlayerButton`（`ajo.xml` 的 `TextView j53`）。没有正在
@@ -209,6 +219,9 @@ class _AudioPlaybackScopeState extends State<AudioPlaybackScope>
     unawaited(session._seekTo(position));
     return true;
   }
+
+  /// 见 [_AudioPlaybackController.seekToParagraph]。
+  int get paragraphSeekEpoch => _session?.paragraphSeekEpoch ?? 0;
 
   /// 阅读页的书 id 是否属于这个会话：音频书自己的 id，或时间轴别名到的
   /// 原著（真人讲书的「边听边读」打开原著后仍要能控制播放）。

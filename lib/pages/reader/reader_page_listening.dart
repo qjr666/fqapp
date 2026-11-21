@@ -131,14 +131,42 @@ extension _ReaderPageListening on _ReaderPageState {
       );
     } else if (anchor.textId != null) {
       final paragraph = _paragraphAnchor(anchor.textId!);
+      // 段落锚要异步换算毫秒：记下当前代次，等落位后再接回跟随。这里不能
+      // 立刻接 —— 换算失败时音频没动，接回只会按原位算页，把刚翻过去的
+      // 页面又拉回来。
+      final epoch = AudioPlaybackScope.paragraphSeekEpoch(context);
       moved = AudioPlaybackScope.jumpToParagraph(
         context,
         _chapter.itemId,
         paraIndex: paragraph.paraIndex,
         ordinal: paragraph.ordinal,
       );
+      if (moved) {
+        _paragraphSeekEpoch = epoch;
+        _paragraphLandingTicks = 0;
+        return;
+      }
     }
     if (moved) _resumeFollowFromPage();
+  }
+
+  /// 等段落跳转真的落位，再把跟随接回来。
+  ///
+  /// 最多等 30 拍（≈3 秒，够一次 `/timepoints` 往返）。超时就不接，交给
+  /// [_listenFollowPausedUntil] 的闩锁按原规则恢复：没落位却接回，只会让
+  /// 页面被拉回朗读处。
+  void _confirmParagraphLanding() {
+    if (_paragraphSeekEpoch < 0) return;
+    if (AudioPlaybackScope.paragraphSeekEpoch(context) != _paragraphSeekEpoch) {
+      _paragraphSeekEpoch = -1;
+      _paragraphLandingTicks = 0;
+      _resumeFollowFromPage();
+      return;
+    }
+    if (++_paragraphLandingTicks > 30) {
+      _paragraphSeekEpoch = -1;
+      _paragraphLandingTicks = 0;
+    }
   }
 
   /// 页面成了主导：把跟随接回来，之后的翻页仍由音频接着推。
@@ -349,6 +377,7 @@ extension _ReaderPageListening on _ReaderPageState {
   void _followPollTick() {
     if (!mounted || !_routeCurrent || !_appActive) return;
     final session = ListeningSession.instance;
+    _confirmParagraphLanding();
     // 用户接管过、闩锁已过 → 重新接回跟随。这一步必须在下面的
     // [followArmed] 闸门**之前**：接管时 followArmed 被清成了 false，
     // 而 15 秒闩锁过期救不回来（那个检查排在后面，永远先卡在 followArmed）。

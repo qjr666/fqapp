@@ -571,6 +571,14 @@ abstract final class ReaderAudioBridge {
       (c) => c.itemId == audioChapterId,
     );
     if (index < 0) return false;
+    // 同章翻页就地 seek：重开整章会断音，还会把位置清成 0，让跟随按 0 算页
+    // 把用户刚翻过去的页面拉回章首。
+    if (index == session._index) {
+      unawaited(
+        session.seekToParagraph(paraIndex: paraIndex, ordinal: ordinal),
+      );
+      return true;
+    }
     unawaited(
       session._openChapter(
         index,
