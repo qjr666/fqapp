@@ -138,7 +138,33 @@ extension _ReaderPageListening on _ReaderPageState {
     _followPageByAnchor(_chapter.itemId, anchor.offset, anchor.textId);
   }
 
-  /// 翻页跟随的第 ② 层：字幕轨里「本页第一个字」落在哪一句，就从那句起播。
+  /// 当前「页」在正文里的字符区间：分页模式取排版好的那一页，滚动模式取视口
+  /// 首字符起、多留一段的余量（滚动没有页边界）。
+  ///
+  /// 翻页跟随与双击跳读都按它取「本页第一句」。页首常被上一页的句子切成两半，
+  /// 按字符位置查到的自然是那句（起点在页外）—— 播起来就从上一页最后一句开
+  /// 始了。改成取「起点落在本页」的第一句，落点才在用户眼前。
+  ({int start, int end})? _pageOffsetRange() {
+    final layout = _chapterLayout;
+    if (layout == null || layout.pages.isEmpty) return null;
+    if (_paged) {
+      final page = layout.pages[_pageIndex.clamp(0, layout.pages.length - 1)];
+      return (start: page.start, end: page.end);
+    }
+    final offset = _textOffset.clamp(0, layout.textLength);
+    for (var i = 0; i < layout.blocks.length; i++) {
+      if (offset >= layout.blocks[i].end) continue;
+      return (
+        start: offset,
+        end: i + 1 < layout.blocks.length
+            ? layout.blocks[i + 1].end
+            : layout.blocks[i].end,
+      );
+    }
+    return (start: offset, end: layout.textLength);
+  }
+
+  /// 翻页跟随的第 ② 层：字幕轨里「本页第一句」从哪毫秒开始，就从那里起播。
   ///
   /// 与双击跳读同源（见 [_seekToTappedSentence]）。返回是否已经定位成功。
   bool _followPageByTrack(String chapterId, int offset) {
@@ -150,7 +176,13 @@ extension _ReaderPageListening on _ReaderPageState {
     if (layout == null) return false;
     _ensureCueIndex(layout);
     if (_cueIndex.isEmpty) return false;
-    final span = _cueIndex.spanAtChar(offset);
+    // 「本页第一句」：起点落在本页区间里的第一片。整页只有一句（这句从上一页
+    // 起头）时查不到，退回按字符查 —— 不动比不跟好，那句本来就是眼前这句。
+    final range = _pageOffsetRange();
+    final span = (range == null
+            ? null
+            : _cueIndex.firstSpanIn(range.start, range.end)) ??
+        _cueIndex.spanAtChar(offset);
     if (span == null) return false;
     // 已经停在这句附近：只把跟随接回去，别重复 seek 一次。
     if ((session.position.inMilliseconds - span.startMs).abs() < 800) {
@@ -674,12 +706,27 @@ extension _ReaderPageListening on _ReaderPageState {
       if (!mounted || !identical(_chapterLayout, layout)) return;
       _ensureCueIndex(layout);
     }
-    // 本段第一个「从段内起」的字幕子片：既是第 ② 层的 seek 位置，也是三层
-    // 共用的首选点亮区间。
-    final startSpan = _cueIndex.firstSpanIn(tappedBlock.start, tappedBlock.end);
+    // 本段第一个「本页起头」的字幕子片：既是第 ② 层的 seek 位置，也是三层
+    // 共用的首选点亮区间。页首那段若从上一页续下来，它的首句起头在页外，直接
+    // 按段首取会跳回上一页最后一句 —— 下界先夹到页首。整段的首句都在页外时顺
+    // 延到本页第一句，落点仍在这一页。
+    final range = _pageOffsetRange();
+    final pageStart = range?.start;
+    final lower = pageStart != null && pageStart > tappedBlock.start
+        ? pageStart
+        : tappedBlock.start;
+    final clippedToPage = lower > tappedBlock.start;
+    final startSpan =
+        _cueIndex.firstSpanIn(lower, tappedBlock.end) ??
+        (range == null
+            ? null
+            : _cueIndex.firstSpanIn(range.start, range.end)) ??
+        _cueIndex.spanAtCharIn(lower, tappedBlock.start, tappedBlock.end);
     final target = _highlightSpanFor(tappedBlock, anchor, startSpan);
-    // ① 段落自带 <span start_time>
-    if (anchor != null &&
+    // ① 段落自带 <span start_time>。段首被夹到页首时不再用它：它指的是上一页
+    // 那段的开头，正是「双击又跳回上一页」的来源。
+    if (!clippedToPage &&
+        anchor != null &&
         anchor.startMs != null &&
         AudioPlaybackScope.jumpToChapter(
           context,
