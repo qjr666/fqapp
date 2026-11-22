@@ -122,32 +122,74 @@ extension _ReaderPageListening on _ReaderPageState {
       _resumeFollowFromPage();
       return;
     }
-    var moved = false;
+    // ① 段落自带 `<span start_time>`：直接按毫秒 seek。
     if (anchor.startMs != null) {
-      moved = AudioPlaybackScope.jumpToChapter(
+      if (AudioPlaybackScope.jumpToChapter(
         context,
         _chapter.itemId,
         Duration(milliseconds: anchor.startMs!),
-      );
-    } else if (anchor.textId != null) {
-      final paragraph = _paragraphAnchor(anchor.textId!);
-      // 段落锚要异步换算毫秒：记下当前代次，等落位后再接回跟随。这里不能
-      // 立刻接 —— 换算失败时音频没动，接回只会按原位算页，把刚翻过去的
-      // 页面又拉回来。
-      final epoch = AudioPlaybackScope.paragraphSeekEpoch(context);
-      moved = AudioPlaybackScope.jumpToParagraph(
-        context,
-        _chapter.itemId,
-        paraIndex: paragraph.paraIndex,
-        ordinal: paragraph.ordinal,
-      );
-      if (moved) {
-        _paragraphSeekEpoch = epoch;
-        _paragraphLandingTicks = 0;
-        return;
+      )) {
+        _resumeFollowFromPage();
       }
+      return;
     }
-    if (moved) _resumeFollowFromPage();
+    // ② 字幕轨（与双击跳读同一套锚点）→ ③ `/timepoints` 段号。升级版官方
+    // 音轨没有 `/timepoints`、只有 `/timeline` 字幕；只走段落锚会静默不动。
+    _followPageByAnchor(_chapter.itemId, anchor.offset, anchor.textId);
+  }
+
+  /// 翻页跟随的第 ② 层：字幕轨里「本页第一个字」落在哪一句，就从那句起播。
+  ///
+  /// 与双击跳读同源（见 [_seekToTappedSentence]）。返回是否已经定位成功。
+  bool _followPageByTrack(String chapterId, int offset) {
+    final session = ListeningSession.instance;
+    // 跨章换章还没落定：起播位置由 [_jumpToChapter] 负责，这里再去开一次章
+    // 只会和它抢同一个会话。
+    if (!session.matchesChapter(chapterId)) return false;
+    final layout = _chapterLayout;
+    if (layout == null) return false;
+    _ensureCueIndex(layout);
+    if (_cueIndex.isEmpty) return false;
+    final span = _cueIndex.spanAtChar(offset);
+    if (span == null) return false;
+    // 已经停在这句附近：只把跟随接回去，别重复 seek 一次。
+    if ((session.position.inMilliseconds - span.startMs).abs() < 800) {
+      _resumeFollowFromPage();
+      return true;
+    }
+    if (!AudioPlaybackScope.jumpToChapter(
+      context,
+      chapterId,
+      span.startPosition,
+    )) {
+      return false;
+    }
+    _resumeFollowFromPage();
+    return true;
+  }
+
+  /// 字幕轨优先、段落锚兜底：字幕能定位到句，`/timepoints` 只能定位到段。
+  void _followPageByAnchor(String chapterId, int? offset, int? textId) {
+    if (offset != null && _followPageByTrack(chapterId, offset)) return;
+    if (!mounted || _chapter.itemId != chapterId) return;
+    _settleParagraphAnchor(textId);
+  }
+
+  /// 第 ③ 层：`/timepoints` 的段号锚。段落跳转是异步换算毫秒的，等会话确认
+  /// 落位后再接回跟随（见 [_confirmParagraphLanding]）。
+  void _settleParagraphAnchor(int? textId) {
+    if (textId == null) return;
+    final paragraph = _paragraphAnchor(textId);
+    final epoch = AudioPlaybackScope.paragraphSeekEpoch(context);
+    final moved = AudioPlaybackScope.jumpToParagraph(
+      context,
+      _chapter.itemId,
+      paraIndex: paragraph.paraIndex,
+      ordinal: paragraph.ordinal,
+    );
+    if (!moved) return;
+    _paragraphSeekEpoch = epoch;
+    _paragraphLandingTicks = 0;
   }
 
   /// 等段落跳转真的落位，再把跟随接回来。

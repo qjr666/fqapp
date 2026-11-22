@@ -335,10 +335,14 @@ extension _ReaderPageListeningLaunch on _ReaderPageState {
   ///
   /// 时间取 [ReaderContentBlock.startMs]（章节自带的 `<span start_time>`），
   /// 与「从本段听」同源。没有时间轴的章返回 startMs 为 null，调用方退回续播。
-  ({int? startMs, int? textId}) _currentPageAnchor() {
+  ///
+  /// [offset] 是本页第一个正文字符的绝对下标，与 `CueIndex` 同一坐标系。
+  /// 正文没有 `<span start_time>`、`/timepoints` 也为空的音轨只剩字幕轨可用，
+  /// 靠它查出「本页第一句」从第几毫秒开始。
+  ({int? startMs, int? textId, int? offset}) _currentPageAnchor() {
     final layout = _chapterLayout;
     if (layout == null || layout.pages.isEmpty) {
-      return (startMs: null, textId: null);
+      return (startMs: null, textId: null, offset: null);
     }
     // 滚动模式没有「页」：[ReaderChapterLayout.pages] 是进入本章时算好的排版
     // 网格，`_pageIndex` 之后不再更新（滚动只改 `_textOffset`）。继续按
@@ -349,21 +353,27 @@ extension _ReaderPageListeningLaunch on _ReaderPageState {
       for (final block in layout.blocks) {
         if (block.isTitle || block.isImage || block.text.isEmpty) continue;
         if (offset < block.start + block.text.length) {
-          return (startMs: block.startMs, textId: block.textId);
+          return (startMs: block.startMs, textId: block.textId, offset: offset);
         }
       }
-      return (startMs: null, textId: null);
+      return (startMs: null, textId: null, offset: null);
     }
     final page = layout.pages[_pageIndex.clamp(0, layout.pages.length - 1)];
-    ({int? startMs, int? textId})? carried;
+    ({int? startMs, int? textId, int? offset})? carried;
     for (final fragment in page.fragments) {
       final block = fragment.block;
       if (block.isTitle || block.isImage || block.text.isEmpty) continue;
-      final anchor = (startMs: block.startMs, textId: block.textId);
+      // [offset] 是本页第一个正文字符的绝对下标：字幕轨按它反查「本页第一句」，
+      // 不看段首 —— 页首若是上一页续下来的段落，段首在上一页。
+      final anchor = (
+        startMs: block.startMs,
+        textId: block.textId,
+        offset: fragment.start,
+      );
       if (fragment.firstLine == 0) return anchor;
       carried ??= anchor;
     }
-    return carried ?? (startMs: null, textId: null);
+    return carried ?? (startMs: null, textId: null, offset: null);
   }
 
   /// The spoken start of the paragraph identified by [textId], plus the keys
