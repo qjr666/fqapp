@@ -716,30 +716,53 @@ class _AudioPlaybackController extends ChangeNotifier
           completed ??
           (position == null && sameChapter && saved?['completed'] == true);
       final itemId = _chapters[index].itemId;
-      final source = await _loadSourceWithRetry(itemId);
+      var source = await _loadSourceWithRetry(itemId);
       if (!_current(generation)) return;
       // 新音源到手、旧音频撑完整个取流窗口后才释放播放器。
       released = _releasePlayer();
-      final uri = Uri.tryParse(source.url);
-      // 离线命中给的是 `file://<path>`：本地文件桥不经 HTTP，没有 host。
-      final isLocalFile = uri != null && uri.scheme == 'file';
-      if (source.itemId != itemId ||
-          uri == null ||
-          !(isLocalFile || const ['https', 'http'].contains(uri.scheme)) ||
-          (!isLocalFile && uri.host.isEmpty)) {
-        throw const FormatException('Invalid audio source');
+      // 这一章交给播放器的地址可能已经不能用了：上游签名过了有效期，或本地
+      // 缓存文件的密钥对不上（核心回 503 JSON，播放器把 JSON 当媒体，几十毫秒
+      // 内就判死）。两种都靠「重新解析音源」治好 —— 重启 App 之所以能放，正是
+      // 因为它清掉了进程内的音源缓存。所以建播放器失败时丢掉该章缓存、重取一
+      // 次再建；只重试一次，且只对网络源（本地文件与注入 loader 重取没意义）。
+      late final NativePlayer player;
+      for (var attempt = 0; ; attempt++) {
+        final uri = Uri.tryParse(source.url);
+        // 离线命中给的是 `file://<path>`：本地文件桥不经 HTTP，没有 host。
+        final isLocalFile = uri != null && uri.scheme == 'file';
+        if (source.itemId != itemId ||
+            uri == null ||
+            !(isLocalFile || const ['https', 'http'].contains(uri.scheme)) ||
+            (!isLocalFile && uri.host.isEmpty)) {
+          throw const FormatException('Invalid audio source');
+        }
+        await released;
+        if (!_current(generation)) return;
+        final opened = candidate =
+            request.playerFactory?.call() ?? NativePlayer(audioOnly: true);
+        _player = opened;
+        try {
+          await opened.create(source.url, source.keyHex);
+          if (!_current(generation, opened)) {
+            await opened.dispose();
+            return;
+          }
+          if (opened.lastError case final Object error) throw error;
+          player = opened;
+          break;
+        } catch (error) {
+          if (!_current(generation)) {
+            await opened.dispose();
+            return;
+          }
+          await opened.dispose();
+          if (identical(_player, opened)) _player = null;
+          if (attempt >= 1 || !_canRefreshSource(source)) rethrow;
+          _dropCachedSource(itemId);
+          source = await _loadSourceWithRetry(itemId);
+          if (!_current(generation)) return;
+        }
       }
-      await released;
-      if (!_current(generation)) return;
-      final player = candidate =
-          request.playerFactory?.call() ?? NativePlayer(audioOnly: true);
-      _player = player;
-      await player.create(source.url, source.keyHex);
-      if (!_current(generation, player)) {
-        await player.dispose();
-        return;
-      }
-      if (player.lastError case final Object error) throw error;
       _subscribe(player, generation);
       await player.setRate(_rate);
       if (!_current(generation, player)) return;
@@ -894,6 +917,25 @@ class _AudioPlaybackController extends ChangeNotifier
       _audioSourceCache.remove(_audioSourceCache.keys.first);
     }
     return result;
+  }
+
+  /// 丢掉一章的音源缓存，下次取源重新向核心解析。
+  ///
+  /// 音源缓存没有有效期，也不参与失败清理：一个已经失效的地址（上游签名过
+  /// 期）或一份密钥对不上的本地缓存会被反复复用，用户看到的就是「点多少次都
+  /// 放不出来，重启 App 才好」。失败路径必须把它摘掉。
+  void _dropCachedSource(String itemId) {
+    _audioSourceCache.remove('$itemId|$_toneId');
+  }
+
+  /// 建播放器失败后，重新取源是否有意义。
+  ///
+  /// 只有网络地址值得重取：离线命中给的是本地文件，重取还是同一个文件；注入
+  /// 的 loader 是测试缝，重取会改变它被调用的次数。
+  bool _canRefreshSource(AudioSource source) {
+    if (request.sourceLoader != null) return false;
+    final uri = Uri.tryParse(source.url);
+    return uri != null && uri.scheme != 'file';
   }
 
   /// 默认音色与换音色回退共用同一套重试策略。每次尝试最多等 30 秒；超时、
@@ -1348,6 +1390,11 @@ class _AudioPlaybackController extends ChangeNotifier
     _listenTime.stop();
     unawaited(_persistProgress());
     unawaited(_releasePlayer());
+    // 刚失败的这一章，音源可能已经失效（上游签名过期，或本地缓存文件的密钥
+    // 对不上）。摘掉缓存，用户再点一次播放就会重新解析，不必重启 App。
+    if (_chapters.isNotEmpty && _index < _chapters.length) {
+      _dropCachedSource(_chapters[_index].itemId);
+    }
     _update(() {
       _loading = false;
       _wantPlay = false;
